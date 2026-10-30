@@ -116,9 +116,19 @@ class Store:
             raise StorageError(f"cannot open store: {error}") from error
 
     @contextmanager
-    def _transaction(self, *, write=False):
+    def _transaction(self, *, write=False, deadline=None):
         """Bound admission and SQLite waits; rollback any unsuccessful operation."""
-        deadline = time.monotonic() + self.timeout
+        local_deadline = time.monotonic() + self.timeout
+        if deadline is not None:
+            try:
+                valid_deadline = (type(deadline) in (int, float)
+                                  and math.isfinite(deadline))
+                if not valid_deadline:
+                    raise ValueError("deadline must be a finite monotonic timestamp")
+                local_deadline = min(local_deadline, deadline)
+            except OverflowError as error:
+                raise ValueError("deadline is outside the supported numeric range") from error
+        deadline = local_deadline
         with self._condition:
             while self._active >= self.capacity and not self._closed:
                 remaining = deadline - time.monotonic()
@@ -175,14 +185,14 @@ class Store:
             raise StaleEpochError(actual)
         return actual
 
-    def current_context(self):
-        with self._transaction() as db:
+    def current_context(self, *, deadline=None):
+        with self._transaction(deadline=deadline) as db:
             return self._read_context(db)
 
-    def read_local(self, key, *, context):
+    def read_local(self, key, *, context, deadline=None):
         try:
             _key(key)
-            with self._transaction() as db:
+            with self._transaction(deadline=deadline) as db:
                 actual = self._check_context(db, context)
                 row = db.execute("SELECT kind,number,writer,value FROM records WHERE key=?", (key,)).fetchone()
                 record = None if row is None else self._decode(row)
@@ -194,12 +204,12 @@ class Store:
         except (sqlite3.Error, StorageError, ValueError, TypeError, KeyError) as error:
             return ReadResult(S.ERROR, None, self._context, str(error))
 
-    def install_if_newer(self, key, record, *, context):
+    def install_if_newer(self, key, record, *, context, deadline=None):
         try:
             _key(key)
             if not isinstance(record, Record):
                 raise ValueError("record required")
-            with self._transaction(write=True) as db:
+            with self._transaction(write=True, deadline=deadline) as db:
                 actual = self._check_context(db, context)
                 if record.version.kind != _kind(actual):
                     raise ValueError("version kind disagrees with mode")

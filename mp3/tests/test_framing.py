@@ -2,10 +2,14 @@
 
 import socket
 import struct
+import threading
+import time
 import unittest
 
 from mp3.config import MAX_VALUE_BYTES
-from mp3.framing import recv_exact, recv_frame, send_frame
+from mp3.framing import (
+    recv_exact, recv_frame, recv_frame_deadline, send_frame, send_frame_deadline,
+)
 
 
 class FragmentSocket:
@@ -83,3 +87,34 @@ class FramingTests(unittest.TestCase):
             self.assertEqual(recv_frame(right, max_bytes=10), b"\x00\xff")
             with self.assertRaises(socket.timeout):
                 recv_frame(right, max_bytes=10)
+
+    def test_deadline_frame_round_trip_and_slow_fragment_total_bound(self):
+        left, right = socket.socketpair()
+        with left, right:
+            send_frame_deadline(left, b"\x00\xffpayload", max_bytes=32,
+                                deadline=time.monotonic() + 1)
+            self.assertEqual(recv_frame_deadline(right, max_bytes=32,
+                                                 deadline=time.monotonic() + 1),
+                             b"\x00\xffpayload")
+
+        left, right = socket.socketpair()
+
+        def trickle():
+            try:
+                left.sendall(struct.pack("!I", 4))
+                for byte in b"slow":
+                    left.sendall(bytes((byte,)))
+                    time.sleep(0.07)
+            except OSError:
+                pass
+            finally:
+                left.close()
+
+        sender = threading.Thread(target=trickle, daemon=True)
+        sender.start()
+        started = time.monotonic()
+        with right:
+            with self.assertRaises((TimeoutError, socket.timeout)):
+                recv_frame_deadline(right, max_bytes=16, deadline=started + 0.16)
+        sender.join(timeout=1)
+        self.assertLess(time.monotonic() - started, 0.4)

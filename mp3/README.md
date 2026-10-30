@@ -1,11 +1,11 @@
 # CS 425 MP3: distributed key-value store
 
-**Batches 1 and 2 are locally implemented and tested. Distributed KV operations
-remain unfinished.** The foundation includes local SQLite WAL/FULL storage,
-fixed SHA-256 ring ownership, and a restart-aware membership service. KV RPC,
-coordinators, consistency protocols, read repair, command integration and mode
-changes remain future work. The October 21 specification in [SPEC.md](SPEC.md) is
-authoritative.
+**Batches 1–3 are implemented and locally tested. Distributed client-facing KV
+operations remain unfinished.** The foundation includes local SQLite WAL/FULL
+storage, fixed SHA-256 ring ownership, restart-aware membership, and a bounded
+single-replica KV TCP request/response service. Quorum coordinators, consistency
+protocols, read repair, operational command integration and mode changes remain
+future work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
 
 Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [KEY_DECISIONS.md](KEY_DECISIONS.md), [AGENTS.md](AGENTS.md), and
@@ -20,7 +20,10 @@ mp3/
   config.py                    constants and local example inventory parser
   models.py                    local result and storage domain types
   storage.py                   local SQLite WAL/FULL store and version allocation
-  framing.py                   bounded four-byte length-prefixed raw-byte frames
+  framing.py                   legacy-compatible and total-deadline byte framing
+  rpc.py                       strict C5 request/response codecs and one-call client
+  replica.py                   bounded local READ_LOCAL/INSTALL_IF_NEWER service
+  eventlog.py                  structured logs and local replica event lines
   ring.py                      ten-node manifest, SHA-256 IDs and five owners
   membership.py                retained suspicion, TCP gossip and restart recovery
   legacy_membership.py         byte-identical MP2 reference; not the MP3 service
@@ -41,11 +44,11 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite has 71 tests. It uses temporary SQLite directories, fake clocks,
-subprocesses killed with SIGKILL, and temporary loopback membership listeners. It
-contacts no university VM. The verified results and limits are recorded in the
-implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to real
-VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
+The suite currently has 106 tests. It uses temporary SQLite directories, fake
+clocks, subprocesses killed with SIGKILL, and temporary loopback membership and KV
+listeners. It contacts no university VM. The verified results and limits are recorded
+in the implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
+real VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
 
 ## Commands currently working
 
@@ -116,23 +119,41 @@ These facilities have only local test evidence, not ten-VM validation.
 
 The storage engine uses a separate SQLite connection per operation, WAL and
 `synchronous=FULL`, bounded admission (default 8), and a five-second local transaction
-budget. It preserves present empty values separately from missing keys. It provides
-no distributed quorum, KV RPC, Strong tag allocator, or mode-switching API.
+budget. It preserves present empty values separately from missing keys. A replica
+request passes its absolute service deadline into local storage so admission and
+SQLite lock waits do not get a fresh budget.
+
+## Single-replica RPC foundation
+
+`mp3.rpc.ReplicaClient.call_replica(target, request, deadline=...)` opens one TCP
+connection, sends one validated READ_LOCAL or INSTALL_IF_NEWER request, and validates
+one response against the request, manifest, target and expected membership generation.
+The framing is binary-safe through 1 MiB and uses bounded JSON metadata. Calls do not
+retry automatically; transport failure after a write may have been sent is marked as
+an unknown completion. Fixed manifest KV hostnames are resolved when the client is
+initialized; each call tries up to eight numeric addresses under its remaining
+absolute deadline. `mp3.replica.ReplicaService` serves these operations using a
+bounded worker pool and queue, then reads or durably installs against that VM's local
+SQLite database. These are local replica primitives: they do not compute quorum
+results, replicate to other owners, or make CLI PUT/GET operational.
+
+Receipt and response events print the required local timestamp line and can append
+structured records when a logger is configured. Full MP1 distributed log-query
+integration remains future work.
 
 ## Logs and MP1
 
-No KV service starts or operation logs are created at CLI import/startup. The
-JSON-lines formatter is available for explicit local setup; required KV receipt and
-response events and MP1 log-query integration remain future work under KD-17. MP1
+No KV service starts at CLI import/startup. `ReplicaService` prints/logs receipt and
+response events when explicitly started by a caller. MP1
 uses `machine.<vm>.log` and port 65432; framing interoperability tests do not prove
 end-to-end MP1 queries against MP3 logs. MP1 and MP2 source remain unchanged.
 
 ## What remains
 
-Batch 3 will add KV TCP RPC and replica request handling. Later work implements
-Strong ABD, Eventual-noRR, Eventual-RR/read repair, mode switching, all command
-integration, ten-VM correctness, benchmarks, report, deployment and demo readiness.
+Later work implements Strong ABD, Eventual-noRR, Eventual-RR/read repair, mode
+switching, all command integration, ten-VM correctness, benchmarks, report,
+deployment and demo readiness.
 No deployment/reset script exists. VM inventory, interpreter versions and port
 availability are unverified. Obtain explicit authorization before VM access,
-deployment or remote fault tests. This workspace has no Git metadata; do not
-initialize history, commit or push.
+deployment or remote fault tests. The private review-repository workflow is documented
+in `AGENTS.md`; the professor's course repository remains separate.

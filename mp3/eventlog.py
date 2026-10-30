@@ -1,14 +1,19 @@
-"""Opt-in local JSON-lines formatting prototype (KD-17, final schema pending).
+"""Opt-in JSON-lines logging and local replica events (KD-17).
 
 No handlers are installed at import time. This is not a durability mechanism.
-Do not log value bytes. Future replicas must emit GET/PUT receipt AND response
-events to file and console; no distributed operation runs in Phase 0.
+Do not log value bytes. Batch 3 replica handlers emit local GET/PUT receipt and
+response events; full distributed operation and MP1 query integration remain pending.
 """
 
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
+import threading
+
+
+_REPLICA_EVENT_LOCK = threading.Lock()
 
 
 class JsonFormatter(logging.Formatter):
@@ -38,3 +43,29 @@ def configure_logging(logger: logging.Logger, path: str | Path, *, stream) -> No
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+
+def log_replica_event(logger: logging.Logger | None, phase: str, operation: str,
+                      key: str, *, node_id: str, request_id: str,
+                      stream=None) -> str:
+    """Print the required receipt/response line and append a structured log event.
+
+    `phase` is `received` or `responded`; operation is `get` or `put`. Control
+    characters in keys are escaped so one key cannot forge extra terminal lines.
+    Pass an append-only logger configured by `configure_logging` for machine logs.
+    """
+    if phase not in ("received", "responded") or operation not in ("get", "put"):
+        raise ValueError("invalid replica event kind")
+    if not isinstance(key, str) or not isinstance(request_id, str):
+        raise TypeError("key and request_id must be text")
+    safe_key = "".join(
+        f"\\x{ord(char):02x}" if ord(char) < 32 or ord(char) == 127 else char
+        for char in key)
+    timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+    line = f"{timestamp}: {phase}{operation} {safe_key}"
+    with _REPLICA_EVENT_LOCK:
+        if logger is not None:
+            logger.info(f"{phase}{operation} {safe_key}",
+                        extra={"node_id": node_id, "request_id": request_id})
+        print(line, file=stream if stream is not None else sys.stdout, flush=True)
+    return line

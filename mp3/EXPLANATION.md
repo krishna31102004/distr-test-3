@@ -1,11 +1,11 @@
-# Understanding MP3 and its verified Batch 1/2 foundations
+# Understanding MP3 and its verified Batch 1–3 foundations
 
-This guide describes the actual files. Batch 1's local durable SQLite store and
-Batch 2's deterministic ring and membership service are implemented and locally
-verified. **Distributed key-value operations are still pending**: there is no KV
-RPC, coordinator, quorum, consistency protocol, read repair, or mode-switch service.
-Approved contracts and evidence are in IMPLEMENTATION_PLAN.md and KEY_DECISIONS.md.
-A local replica read/install is not a distributed GET/PUT.
+This guide describes the actual files. Batch 1's local durable SQLite store, Batch 2's
+fixed ring and membership service, and Batch 3's single-replica TCP RPC path are
+implemented and locally reviewed. **Distributed client-facing GET/PUT is still
+pending**: no coordinator, quorum, consistency protocol, read repair, or mode-switch
+service exists. Approved contracts and evidence are in IMPLEMENTATION_PLAN.md and
+KEY_DECISIONS.md. A local replica read/install is not a distributed GET/PUT.
 
 ## The system we will build
 
@@ -155,13 +155,13 @@ tested against power loss, remote filesystems, or VM storage.
 | `_key` | string → None; strict UTF-8 encodability check, preserving empty/NUL/newline keys | local read/install and recovery validation | I; C1/C3 |
 | `_kind` | Context → `strong` or `eventual`; both Eventual modes share a version kind | Store read/install validation | I; C3/C4 |
 | `Store.__init__` | path and optional explicit epoch-1 bootstrap, vm_id, timeout and capacity → open recovered Store or StorageError; takes process lock, refuses implicit creation/overwrite, checks SQLite integrity, schema/identity/context/metadata and every record | `open_store`, tests | I; C2/C3; local bootstrap/recovery |
-| `Store._transaction` | write flag → context-managed SQLite connection; bounded admission, per-connection WAL/FULL, progress/deadline checks, `BEGIN` or `BEGIN IMMEDIATE`, commit on success and close/rollback on failure | all storage methods | I; C3/C6 local budget |
+| `Store._transaction` | write flag and optional absolute monotonic deadline → context-managed SQLite connection; uses the earlier of local timeout and caller deadline across admission, WAL/FULL setup, lock waits, progress checks and pre-commit check; commits on success and closes/rolls back on failure | storage methods and replica RPC | I; C3/C6 |
 | `Store._read_context` | DB connection → Context from persisted epoch/mode | startup and context guard | I; C3 |
 | `Store._decode` | one SQLite record row → validated Record; parses canonical number and validates tag/value | startup scan and local read/install | I; C3/C4 |
 | `Store._check_context` | DB connection and caller Context → actual Context or StaleEpochError; compares exact persisted epoch and mode inside the active transaction | local read/install and allocator | I; C3/KD-16 boundary only |
-| `Store.current_context` | no args → persisted Context in a snapshot transaction | tests/future local admission | I; C3 |
-| `Store.read_local` | key and keyword Context → ReadResult; atomically checks context and reads one row, returns NOT_FOUND or FOUND (including empty bytes), STALE_EPOCH or ERROR | tests; future local replica handler | I; local read only, no quorum |
-| `Store.install_if_newer` | key, Record and keyword Context → InstallResult; validates exact context and kind, compares under one short `BEGIN IMMEDIATE`, installs a higher tag, otherwise returns UNCHANGED, SUPERSEDED, or VERSION_CONFLICT with stored-version evidence; commits before durable success | tests; future replica handler | I; local conditional install only, C3 |
+| `Store.current_context` | optional absolute monotonic deadline → persisted Context in a snapshot transaction using the earlier local/caller deadline | tests and ReplicaService stale-context response | I; C3/C6 |
+| `Store.read_local` | key, keyword Context and optional absolute deadline → ReadResult; atomically checks context and reads one row, returns NOT_FOUND or FOUND (including empty bytes), STALE_EPOCH or ERROR | tests, ReplicaService | I; local read only, no quorum |
+| `Store.install_if_newer` | key, Record, keyword Context and optional absolute deadline → InstallResult; validates exact context and kind, compares under one short `BEGIN IMMEDIATE`, installs a higher tag, otherwise returns UNCHANGED, SUPERSEDED, or VERSION_CONFLICT with stored-version evidence; commits before durable success | tests, ReplicaService | I; local conditional install only, C3/C6 |
 | `Store.start_incarnation` | no args → next persisted positive generation; commits increment before return; caller must invoke once per boot before serving | tests; future startup admission | I; C2 local restart foundation |
 | `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; future Eventual coordinator | I; C4 eventual only, no Strong allocation |
 | `Store.close`, `__enter__`, `__exit__` | close stops new admissions, waits for active bounded operations, releases process lock; context-manager methods return self/None and call close | tests and future owner | I; C2/C6 local lifecycle |
@@ -180,15 +180,12 @@ directories; they are not a power-loss or distributed durability certification.
 Derived from our MP1/MP2 `protocol.py`; see the reuse audit for attribution. A frame
 starts with four bytes containing the unsigned network-order length, followed by
 exactly that many payload bytes. A zero header means a valid empty payload. This
-module understands neither keys nor versions. It adds explicit caps and bytearray
-accumulation without the original global traffic counters. Callers must configure
-finite socket timeouts and connection ownership. It neither opens sockets nor
-changes their timeouts. A per-recv inactivity timeout alone cannot bound a frame
-when a peer keeps trickling fragments. This utility does not enforce an overall
-operation budget: future RPC needs monotonic deadline-aware IO or an approved API
-extension that checks remaining time throughout reads/writes (KD-08).
-After errors/timeouts close the connection to avoid reading
-a remainder as the next message. Final transport/schema/caps are KD-06/07/08.
+module understands neither keys nor versions. The legacy functions retain their
+original MP1/MP2-compatible framing behavior. Batch 3 adds deadline-aware exact
+reads, writes and frame helpers. These set the socket timeout to the remaining
+absolute monotonic budget before each blocking operation, so trickled bytes do not
+reset the total budget. The RPC layer owns its separate JSON/raw-value envelope and
+closes a connection after malformed or incomplete messages.
 
 | Function | Inputs → output; internal behavior | Actual callers / components | Status |
 |---|---|---|---|
@@ -196,10 +193,76 @@ a remainder as the next message. Final transport/schema/caps are KD-06/07/08.
 | `recv_exact` | socket-like object, nonnegative size → bytes; loops partial reads into bytearray, EOF raises ConnectionError, socket timeout propagates; zero returns b'' | recv_frame, FramingTests; sock.recv | I |
 | `send_frame` | socket, bytes, explicit max_bytes → None; cap/type checks before any write, then header and payload sendall | smoke.send, FramingTests, ReuseTests; HEADER, _validate_limit | I |
 | `recv_frame` | socket, explicit max_bytes → bytes; reads header exactly, rejects excessive length before body, then reads full body | smoke, FramingTests, ReuseTests; recv_exact, HEADER | I |
+| `_remaining` | finite monotonic deadline → seconds remaining or TimeoutError; rejects expired deadlines | deadline-aware helpers | I; KD-08/C6 |
+| `recv_exact_deadline` | socket, byte count, absolute deadline → bytes; repeats partial reads but recomputes the same deadline each time | RPC codecs, deadline framing tests | I; KD-08/C6 |
+| `send_all_deadline` | socket, bytes, absolute deadline → None; applies remaining budget before sendall | RPC codecs | I; KD-08/C6 |
+| `recv_frame_deadline`, `send_frame_deadline` | socket/payload, cap, deadline → received bytes or None; compatibility framing with a total deadline | available utility; RPC uses the same lower-level helpers for its two-length envelope | I; KD-08/C6 |
 
 No header bit pattern is intrinsically malformed beyond a caller's cap: all four-
 byte unsigned lengths are representable. Truncated headers/bodies are errors. A
-full RPC cap must exceed legal value size by its approved metadata overhead.
+full RPC cap includes the approved metadata overhead; see `rpc.py` below.
+
+### `rpc.py`
+
+This module defines one replica request and one response per TCP connection. It does
+not gather replica sets or implement Strong/Eventual protocols. The envelope is an
+outer four-byte length, an inner four-byte JSON length, UTF-8 JSON metadata, then
+unchanged value bytes. Caps are 16,384 metadata bytes, 1 MiB value bytes and 1,064,964
+outer payload bytes. Validation rejects duplicate JSON keys, extra/missing fields,
+wrong schema/identities, noncanonical values, contradictory status fields and trailing
+bytes before a replica operation can reach storage.
+
+| Function/type | Purpose, input → output, behavior and callers | Status |
+|---|---|---|
+| `RpcOperation`, `RpcStatus`, `RpcOutcomeKind` | Enumerate the two local replica operations, response statuses and client outcome categories | I; C5 |
+| `RpcProtocolError` | Marks malformed or contradictory wire messages; raised by validators/codecs | I; C5 |
+| `_is_int`, `_validate_request_id`, `_validate_vm_id`, `_parse_decimal`, `_format_decimal` | Validate exact JSON integer types, lowercase UUID4, VM labels and canonical decimal strings; avoid Python's decimal digit limit on large versions | I; C5 |
+| `_version_from_wire`, `_version_to_wire` | Convert nullable `{kind, number, writer_id}` to/from `Version`, checking mode kind and manifest writer identity | I; C3–C5 |
+| `_unique_object`, `_reject_json_constant`, `_decode_json`, `_encode_json` | Parse strict UTF-8 JSON with duplicate-key/nonfinite-number rejection and enforce the metadata cap | I; C5 |
+| `_mode`, `_operation`, `_status` | Convert exact wire strings to approved enums; unknown names fail closed | I; C5 |
+| `ReplicaRequest.__post_init__`, `.value_len`, `._validate_version_kind`, `.validate_manifest`, `.to_metadata`, `.from_metadata` | Validate request identity, operation-specific version/value shape, phase=`local`, and manifest; convert strict fields to/from metadata | I; C5 |
+| `ReplicaResponse.__post_init__`, `.value_len`, `.validate_for`, `.to_metadata`, `.from_metadata` | Check status evidence and bind one response to the request, target, manifest, generation, context and operation | I; C3/C5 |
+| `RpcOutcome` | Carries outcome kind, optional validated response, bounded error text and whether an INSTALL may have completed without acknowledgment | I; C5/C6 |
+| `new_request` | Manifest, sender/generation, target, context, op/key and optional record → fresh UUID4 `ReplicaRequest` | I; C5 |
+| `_encode_payload`, `encode_request`, `encode_response` | Valid metadata/body → capped `JSON length + JSON + bytes` payload after manifest/schema checks | I; C5 |
+| `_recv_payload`, `_require_eof`, `receive_request`, `receive_response` | Socket/deadline → validated metadata/body/request/response; checks both declared lengths before body reads and rejects truncation/trailing bytes | I; C5/C6 |
+| `send_request`, `send_response` | Socket plus validated type/manifest/deadline → send exactly one outer frame under one absolute deadline | I; C5/C6 |
+| `_request_error` | Outcome kind and error → bounded error-only result | I; C5 |
+| `ReplicaClient.__init__` | Manifest and matching `MembershipTable` → reusable per-node RPC client; resolves fixed KV endpoints once, caps cached candidates at eight, preserves resolution errors as per-target outcomes | I; C1/C2/C5 |
+| `ReplicaClient._connect` | Node and absolute deadline → connected socket; tries cached numeric candidates using the remaining budget before each attempt, without blocking DNS in the operation | I; C5/C6 |
+| `ReplicaClient.call_replica` | Prescribed Node, request and absolute deadline → one response or typed outcome; snapshots expected generation, performs one connection/no retry, checks response evidence and flags uncertain post-send completion | I; C5/C6; no quorum collection |
+
+`READ_LOCAL` returns FOUND with actual version and raw bytes, or NOT_FOUND with no
+record; empty bytes remain FOUND. INSTALL returns the version actually stored.
+For example, trying to install v6 when v7 is present returns SUPERSEDED/stored_version
+v7. Whether that evidence qualifies a later quorum remains a protocol decision.
+
+### `replica.py`
+
+`ReplicaService` accepts requests at the manifest's KV endpoint using a fixed worker
+pool and bounded queue (defaults 32 active and 64 queued). It verifies the complete
+request and sender generation before storage dispatch, and delegates only local
+READ_LOCAL or INSTALL_IF_NEWER. It does not schedule replication or repair.
+
+| Function/type | Purpose, input → output, behavior and callers | Status |
+|---|---|---|
+| `ShutdownReport` | Number of unfinished requests and whether handlers joined after bounded shutdown | I; C6 |
+| `ReplicaService.__init__` | Store, manifest, membership and worker/deadline limits → service; validates shared identities and positive finite bounds | I; C5/C6 |
+| `.address` | Started service → bound host/port, including an ephemeral test port | I; local tests |
+| `.start` | None → listener and fixed workers; refuses missing generation; binds only configured KV endpoint | I; C2/C5 |
+| `._accept_loop` | Accept sockets, assign one accepted-request deadline, reserve bounded queue capacity or return bounded OVERLOADED | I; C6 |
+| `._worker`, `._finish` | Consume accepted requests and release sockets/outstanding count in `finally` | I; C6 |
+| `._error_response`, `._reply_overloaded` | Validated request or bounded overload connection → explicit non-durable ERROR response; malformed identity cannot be trusted | I; C5/C6 |
+| `._validate_identity` | Request → None or INVALID_REQUEST reason; checks manifest, target, sender membership and current sender generation | I; C2/C5 |
+| `._emit` | Request and receive/respond phase → professor terminal line plus optional structured log; key control chars escaped, values omitted | I; KD-17 primitive only |
+| `._process` | Valid request and absolute deadline → mapped storage response; passes same deadline to storage so admission and SQLite lock waits cannot restart the RPC budget | I; C3/C5/C6 |
+| `._handle` | Socket and deadline → fully validates, logs receipt, dispatches once, sends actual response only within the deadline, then closes | I; C5/C6 |
+| `.stop` | Optional finite shutdown budget → `ShutdownReport`; stops admission, closes sockets and counts unfinished work | I; C6 |
+
+The deadline passed into SQLite bounds queue admission, lock waits, transaction work
+and the pre-commit check. An OS/filesystem call that itself blocks cannot be cancelled
+by Python, so a client-side timeout after a send still may have an unknown write
+outcome. Membership gossip uses a separate service and capacity.
 
 ### `ring.py`
 
@@ -273,18 +336,22 @@ changes. The full membership network runs locally in tests only at this stage.
 
 ### `eventlog.py`
 
-Opt-in logging prototype; no handlers installed at import. JSON is escaped into one
-physical line, making a newline inside an event parseable and grep-compatible.
-These testable utilities do not yet provide required real operation events or MP1
-query integration. No values should be logged. File flushes are not KV durability.
+Opt-in JSON-lines logging plus the Batch 3 local replica event hook; no handlers are
+installed at import. JSON is escaped into one physical line, making a newline inside
+an event parseable and grep-compatible. `log_replica_event` prints the prescribed
+local timestamp and received/responded GET/PUT line and optionally appends a structured
+record. This is not full operation tracing or MP1 query integration. No values are
+logged. File flushes are not KV durability.
 
 | Function/method | Inputs → output; internal behavior | Actual callers / components | Status / decisions |
 |---|---|---|---|
 | `JsonFormatter.format` | LogRecord → JSON string with UTC timestamp, level, event, optional node_id/request_id; escapes Unicode/newlines | logging handlers created by configure_logging; datetime/json | I prototype; KD-17 |
 | `configure_logging` | fresh Logger, path, keyword stream → None; refuses existing handlers, appends UTF-8 file+console with formatter, INFO level, no propagation; caller closes/removes handlers | LogTests; standard logging/pathlib | I prototype; KD-17 |
+| `log_replica_event` | logger or None, phase, operation, key, node/request IDs and optional stream → printed line; escapes key control characters, logs structured fields when given a configured logger, never logs value bytes | `ReplicaService._emit`, loopback logging tests | I; KD-17 replica primitive only |
 
-Final schema must add actual key/version/mode/phase/replica/outcome/reachability and
-repair details where required. Current utility is not a claimed complete trace.
+Required distributed operation reachability, returned-version and repair details are
+still future protocol/MP1-adapter work; the local RPC event hook alone is not a claimed
+complete trace.
 
 ### `pending.py`
 
@@ -404,6 +471,35 @@ uses real network hosts. `FramingTests` uses send_frame/recv_frame/recv_exact.
 | `test_send_rejects_before_any_write` | Oversized outbound bytes → no header/body emitted |
 | `test_bad_limits_and_types` | Invalid cap/size/bool/text payload → ValueError/TypeError |
 | `test_real_socket_pair_and_timeout` | Local pair with finite deadlines → binary transfer then propagated timeout |
+| `test_deadline_frame_round_trip_and_slow_fragment_total_bound` | Deadline helper socketpair with one-byte trickle → exact bytes or total timeout |
+
+### `tests/test_rpc.py` — C5 wire schema and response evidence
+
+`RpcCodecTests` uses in-memory sockets and deterministic ten-node manifests. It
+does not contact remote machines.
+
+| Test methods | Coverage |
+|---|---|
+| `test_request_round_trip_preserves_unicode_empty_nul_and_raw_bytes`, `test_full_one_mib_response_round_trip_is_binary_safe`, `test_found_empty_value_is_not_not_found` | Unicode/empty/NUL keys, arbitrary bytes, 1 MiB payload and presence semantics |
+| `test_exact_json_and_outer_payload_limits`, `test_oversized_outer_and_json_lengths_rejected_before_body_read` | Exact caps and rejection before body allocation/read |
+| `test_canonical_schema_and_decimal_fields`, `test_very_large_canonical_version_round_trips_within_metadata_cap` | Required field names, canonical numbers and large version strings |
+| `test_rejects_wrong_uuid_schema_fields_and_integer_coercions`, `test_rejects_bad_version_kind_writer_and_request_combinations`, `test_duplicate_json_fields_and_malformed_utf8_are_rejected` | Fail-closed metadata validation |
+| `test_truncated_body_and_trailing_bytes_fail_closed`, `test_response_contradictory_status_and_stored_version_evidence_rejected` | Exact frame boundary and response evidence rules |
+
+### `tests/test_replica.py` — actual loopback service/client integration
+
+These tests create two logical VM identities with temporary SQLite files and TCP
+loopback listeners. The process-recovery test kills only its own child process.
+
+| Test methods | Coverage |
+|---|---|
+| `test_actual_tcp_read_install_outcomes_and_empty_vs_missing`, `test_actual_tcp_unicode_nul_key_and_full_binary_value`, `test_client_connect_uses_cached_addresses_and_shared_candidate_deadline` | Real vm01→vm04 requests reach the replica's Store; cached candidates avoid DNS and per-address retries share the same budget |
+| `test_stale_epoch_returns_current_context_and_does_not_mutate`, `test_zero_epoch_returns_stale_context_under_request_deadline`, `test_invalid_sender_generation_and_wrong_target_do_not_mutate`, `test_wrong_manifest_is_closed_before_storage_mutation` | Epoch (including invalid zero epoch), manifest, target and sender-generation fencing before DB mutation |
+| `test_committed_write_with_lost_ack_is_reported_unknown`, `test_client_timeout_after_commit_marks_completion_unknown`, `test_connection_refused_is_unreachable_not_not_found`, `test_lost_response_after_send_is_unknown_error` | Network errors and client-visible uncertainty remain distinct from NOT_FOUND |
+| `test_nonfinite_and_unrepresentable_deadlines_return_outcomes`, `test_service_receive_deadline_bounds_slow_fragmented_header`, `test_slow_fragmented_response_cannot_reset_total_deadline`, `test_storage_lock_wait_uses_service_deadline_and_cannot_commit_late` | Absolute deadlines cover slow traffic, socket numeric edge cases and SQLite lock waits |
+| `test_full_worker_and_queue_returns_explicit_overloaded`, `test_concurrent_clients_progress_for_distinct_and_same_keys`, `test_membership_gossip_uses_separate_service_while_kv_load_runs`, `test_shutdown_is_bounded_and_joins_worker_threads` | Bounded admission, concurrent requests, membership capacity isolation and cleanup |
+| `test_receipt_and_response_terminal_lines_do_not_log_values` | Required local log lines, escaped keys and no raw-value logging |
+| `test_tcp_install_survives_kill9_and_process_restart` | Local child process SIGKILL/restart preserves committed bytes and increments generation |
 
 ### `tests/test_foundations.py` — ring/config/results/logs
 
@@ -490,13 +586,13 @@ membership class, socketpair framing, pathlib, importlib and mock.patch clocks.
 
 ## Pending components have no imaginary implementation
 
-Local storage and Eventual allocation exist as described above. There are no
-RPC-service, hashing-construction, Strong/Eventual coordinator, repair, mode manager,
-benchmark, plotting or deployment implementations yet. Their proposed
-responsibilities/contracts/dependencies are in the plan and KD-01..18, and all
-operation entrypoints terminate at `pending.execute`. Add source files only when
-their responsibility and approved decisions justify them; document every meaningful
-function here when implemented. No fabricated benchmark/report content exists.
+Local storage, fixed hashing/membership and single-replica KV RPC exist as described
+above. There is no Strong/Eventual coordinator, quorum collection, all-owner PUT
+fanout, read repair, mode manager, benchmark, plotting or deployment implementation.
+The CLI operation entrypoints still terminate at `pending.execute`; the RPC API is a
+library foundation and does not make those commands operational. Later responsibilities
+and decision gates are in the plan and KD-01..18. No fabricated benchmark/report
+content exists.
 
 Final Batch 1 refinements: timeout rejects booleans; decimal encoding/decoding
 roundtrips a 2**15000 Strong counter without changing global Python limits.

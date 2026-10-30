@@ -1,15 +1,17 @@
 # MP3 implementation plan — shared by Krishna, Juhi, Codex and Claude Code
 
 Prepared October 22, 2026; roadmap reconciled with the local October 21 specification.
-**Current gate: Step 2 Batches 1 and 2 are implemented and locally reviewed; Batch 3
-KV RPC remains pending.** Read AGENTS.md and KEY_DECISIONS.md before work. Krishna's
+**Current gate: Step 2 Batches 1–3 are implemented and independently reviewed on the
+Batch 3 feature branch. Coordinator protocols remain pending.** Read AGENTS.md and
+KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
-completed so far is local storage/versioning plus fixed ring and membership/recovery;
-it does not include distributed KV RPC or consistency protocols. At bootstrap the
+completed so far is local storage/versioning, fixed ring/membership/recovery, and
+single-replica KV RPC; it does not include distributed consistency protocols. At bootstrap the
 snapshot lacked Git metadata, MP3, agent instructions and the specification; these
 now exist, and `mp3/SPEC.md` is authoritative.
 MP1/MP2 remain read-only references. No university VM was contacted and no dependency
-was installed. This roadmap update is planning only and authorizes no implementation.
+was installed. This roadmap records the current gates; it does not authorize future
+protocol batches or VM operations on its own.
 
 ## Objective, authority, and boundaries
 
@@ -32,8 +34,8 @@ Evaluation: demo 60%, report 30%, code quality 10%.
 
 Follow the steps in order; use the detailed checklist, audit and task table below
 for specifics. Approvals are entry gates before implementation, not extra phases.
-Step 2 Batches 1 and 2 are complete locally; Batch 3 RPC and shared integration
-remain. Steps 3–6 are future work. Task statuses below reflect verified local work.
+Step 2 Batches 1–3 are complete locally; multi-owner coordinator integration and
+Steps 3–6 remain future work. Task statuses below reflect verified local work.
 KD direction approvals and C1–C6 contract approvals remain recorded; deferred protocol
 decisions remain pending.
 
@@ -64,9 +66,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
 - **Work / owners:** The shared C1–C6 contracts were approved by Krishna. Juhi's
   Batch 1 local storage/version foundation and Krishna's Batch 2 hash/ring and
   membership/recovery foundation are independently implemented and locally verified.
-  Ownership is unchanged. **Next in parallel:** Krishna completes bounded KV RPC
-  (N-01); Juhi continues protocol-ready version foundations (V-01) as agreed.
-  Jointly integrate storage/RPC contracts before either coordinator.
+  Krishna's bounded KV RPC replica service/client (N-01) is now implemented and
+  locally reviewed; its calls use the approved store and membership boundaries.
+  Ownership is unchanged. **Next:** jointly integrate the tested common foundation;
+  then Krishna and Juhi can build their separately owned coordinators against it.
 - **Decisions already approved for these foundations:** KD-02/03/04/05/06/07/09/14/15
   and the applicable C1–C6 contracts. KD-01's VM runtime compatibility, KD-08's
   protocol-specific qualifications, KD-10's Strong allocation and KD-16's full
@@ -74,10 +77,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
 - **Can wait:** KD-11/12 until Step 3; KD-13, full KD-16 and final KD-17 until
   Step 4; KD-18 until Step 6. Do not implement ABD, Eventual protocols, repair,
   mode switching or command integration as part of this step update.
-- **Verified local evidence:** Batch 1 store/version tests and Batch 2 ring,
-  membership, local TCP gossip, stale-generation and recovery tests are listed in the
-  execution evidence below. KV RPC, integrated network storage, cross-VM convergence,
-  and real ten-VM behavior remain unverified and are not the Step 2 exit gate yet.
+- **Verified local evidence:** Batch 1 store/version tests, Batch 2 ring/membership
+  and recovery tests, and Batch 3 TCP replica read/install tests are listed below.
+  Loopback network-to-SQLite behavior is verified; ten-VM operation, multi-owner
+  coordination, cross-VM consistency and real-cluster convergence remain unverified.
 
 ### Step 3 — Build Strong and Eventual-noRR in parallel
 
@@ -139,9 +142,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
   12-point report, submission receipts and full demo rehearsal are complete by the
   required dates. No results are inferred from unit tests or invented.
 
-**Current task gate:** Batch 1 storage/versioning and Batch 2 ring/membership are
-implemented and locally reviewed. Step 2 remains in progress until Batch 3 RPC and
-shared integration are complete. The accepted KD directions must not be reopened
+**Current task gate:** Batches 1–3 provide the locally reviewed storage/version,
+ring/membership, and single-replica RPC foundations. The shared foundation has been
+integrated for one remote replica read/install; multi-owner protocols and coordinator
+integration remain future work. The accepted KD directions must not be reopened
 without a concrete specification conflict or serious correctness issue. Defer KD-11/12
 to Step 3, KD-13/full KD-16/final KD-17 to Step 4, and KD-18 to Step 6.
 
@@ -161,9 +165,9 @@ do not imply ten-VM verification. The batch evidence section records exact comma
 | [x] | MP2 membership concepts adapted for MP3 failure detection | M-01 | Fake-clock suspicion, local TCP gossip and generation recovery; ten-VM convergence not tested |
 | [x] | Failed nodes retained; same ring ID on local restart | M-01 | Local repeated SIGKILL/restart retains Store data and ring manifest position |
 | [ ] | PUT replaces; GET latest appropriate value or NOT_FOUND | S-01, A-01, E-01 | Per-mode histories, absent/empty/racing cases |
-| [x] | Raw framing accepts arbitrary bytes and a 1 MiB payload, including empty | P0-02 | `FramingTests`; no full RPC envelope claim |
+| [x] | RPC framing accepts arbitrary bytes and a 1 MiB payload, including empty | N-01 | Codec and loopback replica tests; no ten-VM claim |
 | [x] | Local result distinguishes OK empty bytes from NOT_FOUND | P0-03 | `DomainTests`; no distributed read claim |
-| [ ] | RPC/storage preserve full 1 MiB value plus metadata | N-01, S-01 | End-to-end binary digest/readback tests |
+| [x] | RPC/storage preserve full 1 MiB value plus metadata | N-01, S-01 | Loopback vm01→vm04 SQLite install/readback with arbitrary bytes |
 | [ ] | Concurrent same-key operations; no global operation lock | S-01, A-01, E-01 | Barrier races; unrelated-key progress |
 | [ ] | Strong per-key multi-writer linearizability; majority 3 | A-01 | Query/install phases, GET writeback; checked concurrent histories |
 | [ ] | Strong handles delays, partitions, phase crashes and restart | F-01 | Adversarial schedules + restart durability |
@@ -179,7 +183,7 @@ do not imply ten-VM verification. The batch evidence section records exact comma
 | [ ] | Recover durable state before serving; local storage libraries allowed, distributed replication/quorum/repair libraries forbidden | S-01, N-01 | Startup admission test; dependency/provenance review |
 | [ ] | Strong↔Eventual clears KV+versions; Eventual↔Eventual may preserve | C-02 | Switch matrix incl. offline/delayed request cases |
 | [ ] | Membership/ring IDs survive all mode switches | C-02, M-01 | Before/after manifest/ID comparison |
-| [ ] | Requests bounded; failed quorum returns error/timeout, never false absence | N-01, A-01, E-01 | Unreachable/slow replicas within operation deadline |
+| [ ] | Single-replica RPC request bounded; failures never become NOT_FOUND | N-01 | Unreachable, slow-fragment and expired-deadline tests; quorum-level error policy remains A-01/E-01 |
 | [ ] | Delayed/concurrent writes cannot decrease version ordering | S-01, F-01 | Atomic compare/install races and old-generation traffic |
 | [x] | All eight required command syntaxes validated; unfinished calls guarded | P0-04 | `CliTests`; every distributed command NOT_IMPLEMENTED |
 | [ ] | Operational put/get/ls/liststore/getfromreplica/list_mem_ids/multiput/mode | C-01, C-02 | Demo transcript incl. file IO and spec completion text |
@@ -241,12 +245,10 @@ owners; `liststore` consumes actual local storage.
   `RingNode(node_id, position)` values with already-computed nonnegative integers.
   Returns clockwise distinct owners including wraparound, independent of input order.
   Fails on insufficient nodes/collisions; no hash, virtual nodes or live filtering.
-- `send_frame/recv_frame(..., max_bytes=...)` exchange length-prefixed raw bytes.
-  Caller provides finite socket timeout, explicit envelope cap, connection ownership
-  and closure after framing errors; there is no RPC schema or peer authentication.
-  This utility does not enforce a total request budget: fragmented slow-trickle
-  reads can outlast a per-recv inactivity timeout. Future RPC must enforce an overall
-  monotonic deadline throughout IO via deadline-aware IO/an approved API extension.
+- Legacy `send_frame/recv_frame(..., max_bytes=...)` exchange length-prefixed raw
+  bytes and remain compatible with MP1/MP2 framing. New `*_deadline` helpers enforce
+  a total monotonic IO deadline. `rpc.py` uses the helpers with the C5 JSON/raw-byte
+  envelope and exact connection closure; this is not the MP1 query protocol.
 - `Command(name, args)` and `OperationResult(status, message, value)` are local types,
   not final wire responses. Only OK can carry bytes. Empty bytes are not missing data.
 - `parse_command(line)` returns a normalized validated Command. `pending.execute`
@@ -463,17 +465,29 @@ as encoded, not only the raw-key limit. On framing/JSON failure close connection
 where a fully validated request identity exists, send bounded ERROR instead.
 No request is dispatched or mutates state until validation completes.
 
-`call_replica(target: Node, request: Request, *, deadline: float) -> RpcOutcome`
-returns validated response, TIMEOUT, or ERROR (including unreachable/reset). Deadline
-is local absolute monotonic time, never sent as a comparable remote clock value.
-Before every connect/read/write/queue wait use remaining budget; per-recv inactivity
-timeouts alone are insufficient. Proposed default overall operation budget=5s,
-including admission and foreground phases; nested foreground RPCs never reset it.
-This is the client wait budget, not the post-success propagation lifetime; reserved
-Eventual PUT sends use the independent bounded C6 background deadline. Replica serving has
-its own bounded receive/service budget; cancellation cannot undo a committed write.
+`ReplicaClient.call_replica(target: Node, request: Request, *, deadline: float) ->
+RpcOutcome` returns a response or a typed TIMEOUT, UNREACHABLE, INVALID_RESPONSE,
+OVERLOADED or ERROR outcome. Deadline is a finite local absolute monotonic timestamp,
+never sent as a comparable remote clock value. It covers connection, send, receive
+and response validation; no automatic retry occurs. Fixed manifest KV endpoints are
+resolved during client initialization, and up to eight numeric addresses are tried
+using the remaining call deadline; DNS is not performed inside `call_replica`.
+Resolution occurs during client initialization, outside an operation deadline. The
+initial client budget is 5s and nested foreground RPCs must reuse it. This is the client wait budget, not the
+post-success propagation lifetime; Eventual PUT sends are not implemented here and
+must use an independently bounded C6 continuation. `RpcOutcome.completion_unknown`
+records that an INSTALL may have reached or committed at the replica before a
+timeout/reset; callers must not misreport that as confirmed failure or success.
+Replica service has its own finite accepted-request deadline, and passes that same
+absolute deadline into Store admission, SQLite lock waits and pre-commit checks.
+If an underlying OS/filesystem call itself stalls, Python cannot preempt it; an
+unacknowledged write may therefore have an unknown outcome. The client wait still
+ends at its own deadline.
 
-Qualification checks request_id, manifest, key via outstanding-request binding,
+`call_replica` validates one bound response; it does not collect or count a quorum.
+Future coordinators count by stable replica vm_id from the prescribed five, never by
+number of sockets, replies or restart generations. Duplicate responses count once.
+The per-call qualification checks request_id, manifest, key via outstanding-request binding,
 op/phase, target/sender, expected replica generation, exact context, status and
 op-specific version evidence. Validate READ version/presence/body against its status,
 with stored_version=null. Validate INSTALL stored_version against requested version:
@@ -685,7 +699,7 @@ is the initial agreement from the prompt; coordinate before cross-owner edits.
 | I-01 | Joint | Agree Step 2 storage/version/RPC/identity contracts; review extensions before Steps 3/4 | DR-02; KD-02/03/06/08/09/10/14/15; KD-16 interface boundary | Written schemas, examples and shared contract-test plan | COMPLETE |
 | M-01 | Krishna | Membership adaptation and restart recovery | I-01; KD-03/04/05/07/14 | Fake-clock suspicion, retained owners, newer generation recovery, stale gossip, local TCP recovery | VERIFIED |
 | R-01 | Krishna | Hash/ring construction and routing | I-01; KD-02/03 | SHA-256 vectors, canonical manifest, cross-process five-owner selection, failed-owner stability | VERIFIED |
-| N-01 | Krishna | Concurrent bounded RPC services | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, deadline and distinct-response tests | NOT_STARTED |
+| N-01 | Krishna | Concurrent bounded single-replica RPC client/service | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, total deadlines, response binding, overload and loopback store integration | VERIFIED |
 | S-01 | Juhi | Persistent atomic monotonic store (local Batch 1 verified; VM evidence in F-01) | I-01; KD-09/10/15 and KD-16 interface boundary (full switch in C-02) | Temporary crash/restart, value+tag atomicity, conditional install | VERIFIED |
 | V-01 | Juhi; Krishna reviews Strong tags | Shared version foundations in Step 2; protocol-specific allocation in Step 3 | I-01; KD-03/10 first; KD-11 before Strong allocation | Same-process concurrency, rollback, restart, tag immutability | IN_PROGRESS |
 | A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01; KD-11 | Adversarial multi-writer/read-writeback linearizability histories | BLOCKED_BY_DECISION |
@@ -952,3 +966,55 @@ assert ring-ID ordering and compare complete snapshots before/after the invalid 
   an in-progress test edit; the rerun on settled files passed. No source edits were
   made by the reviewer. The existing MP1/MP2 interop and byte-identical legacy-copy
   tests passed in the full suite. No VM or ten-node deployment was tested.
+
+## Batch 3 execution evidence — October 30, 2026
+
+Krishna authorized the bounded C5/C6 single-replica RPC batch only. N-01 is now
+VERIFIED for the client primitive, KV replica service, bounded admission, storage
+integration and tested local restart path. This does not implement quorum collection,
+distributed client-facing GET/PUT, consistency protocols or all-owner replication.
+
+`rpc.py` implements strict schema-v1 request/response validation, canonical UUID4 and
+decimal metadata, JSON duplicate-key rejection, the approved 4-byte outer frame plus
+4-byte metadata length, JSON metadata and raw bytes, metadata/value/outer caps, and
+response binding to the request and expected replica generation. `ReplicaClient` makes
+one TCP call without retries and returns typed outcomes; a timeout or reset after a
+send can be marked `completion_unknown`. `replica.py` admits a fixed number of request
+workers and a bounded queue, validates before dispatch, calls `read_local` or
+`install_if_newer`, and replies only with the actual storage result. `framing.py` keeps
+the old MP1/MP2-compatible helpers and adds total-deadline socket helpers. `eventlog.py`
+prints escaped required receipt/response terminal lines and emits structured local
+events without logging value bytes.
+
+The first independent review ran **102 tests** successfully and found: storage lock
+waits could exceed the RPC deadline and commit late; nonfinite/oversized RPC deadlines
+could escape as `OverflowError`; and implementation docs/status were stale. The main
+added deadline propagation from the service into SQLite admission/lock/commit checks,
+returns explicit outcomes for nonfinite/out-of-range client deadlines, adds regression
+tests for both issues, and synchronized docs. The reviewer reproduced the lock-wait
+case before the fix; the new regression holds a SQLite writer lock, proves the request
+finishes within its shorter service budget, and confirms the row remains absent after
+the lock is released.
+
+Final verification on the settled implementation:
+
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **106 tests passed in
+  6.580s**.
+- Independent GPT-6 Luna/high reviewer: the same full-suite command — **106 tests
+  passed in 6.605s**.
+- Main focused command `python3 -B -m unittest mp3.tests.test_rpc mp3.tests.test_replica
+  mp3.tests.test_storage -v` — **51 tests passed in 5.603s**.
+- `python3 -B -m mp3 --smoke` — exit 0, “Phase 0 smoke OK: framing, inventory,
+  successors; KV NOT_IMPLEMENTED” (CLI operations remain guarded).
+- `python3 -B -m mp3 --help` — exit 0; lists the command syntax and pending status.
+- `python3 -B -m py_compile mp3/rpc.py mp3/replica.py mp3/framing.py mp3/storage.py
+  mp3/eventlog.py` — exit 0.
+
+The lock-contention regression verifies a request with a shorter service deadline
+does not commit after the external SQLite writer lock is released. A separate
+connection test verifies `call_replica` uses cached numeric addresses, tries
+candidates under the same remaining deadline, and performs no DNS lookup inside the
+call. Endpoint DNS resolution occurs once during client setup, outside any operation
+deadline. Local loopback and process tests do not constitute ten-VM evidence. The
+reviewer made no edits and reported no remaining source correctness issue; the
+identified deadline issues and documentation nits were corrected.

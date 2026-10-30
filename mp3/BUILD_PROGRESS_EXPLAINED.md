@@ -124,12 +124,122 @@ runs.
 
 ### What Batch 2 does not implement yet
 
-Full distributed PUT/GET, general KV RPC networking, Strong ABD, Eventual consistency,
-read repair, mode switching, and the eight complete demo commands are still future
-work. The TCP service in this batch carries membership gossip only.
+Full distributed PUT/GET, Strong ABD, Eventual consistency, read repair, mode
+switching, and the eight complete demo commands are still future work. The TCP
+service in this batch carries membership gossip only.
+
+## Batch 3 — TCP Networking and Remote Replica Requests
+
+### What exactly is Batch 3?
+
+Batch 3 teaches one computer to send a small request to one other computer and get
+back that replica's local answer. This kind of request-and-response message is called
+**RPC**, short for remote procedure call. It lets VM1 ask VM4 to read or conditionally
+save a key using VM4's own durable SQLite database.
+
+This is a building block. It does not yet decide how many of the five replicas must
+answer or which version a distributed GET/PUT should return.
+
+### How does a remote read work?
+
+Suppose the future coordinator wants `GET photo` and VM4 is one of the five prescribed
+owners. It sends `READ_LOCAL("photo")` to VM4. VM4 checks the request, reads its local
+database, and replies with `FOUND` and the stored version/value, `NOT_FOUND`, or an
+explicit error. A saved empty byte string is `FOUND` with zero bytes; it is not the
+same as a missing key.
+
+```text
+VM1 (caller)                            VM4 (replica)
+    |                                        |
+    |--- READ_LOCAL("photo", request ID) -->|
+    |                                        |-- read SQLite
+    |<-- FOUND(version, raw bytes) ----------|
+    |                                        |
+```
+
+The same mechanism sends `INSTALL_IF_NEWER`. For example, if VM4 has v7 and receives
+an install request for v6, it keeps v7 and replies `SUPERSEDED` with
+`stored_version=v7`. A durable successful reply is only made after storage commits.
+
+### Why the network rules matter
+
+Values are arbitrary bytes, so JSON is used only for metadata. The value travels as
+unchanged bytes after the metadata. Length prefixes tell the receiver exactly how
+many bytes to read. Explicit size caps prevent a peer from declaring an enormous
+message. A fresh request ID lets the caller match the response to its own request.
+
+Each RPC call uses one absolute timer from the time `call_replica()` starts. The
+client resolves the fixed manifest endpoints during setup, before an operation starts;
+then it tries up to eight numeric address candidates and spends only the remaining
+call budget on each connection attempt and each send/receive. A peer sending a few
+bytes very slowly cannot restart that timer after each byte. If a VM is down, the
+caller gets an unreachable/error/timeout outcome, never a fake `NOT_FOUND`. If the
+connection is lost after an install may have committed, the client marks the
+completion uncertain: the write might be on disk even though its acknowledgment did
+not arrive.
+
+The replica service has a fixed worker count and a bounded waiting queue. If that
+capacity is full, a well-formed caller receives `OVERLOADED`; the service does not
+create unlimited threads. KV service capacity is separate from membership gossip.
+
+### What Batch 3 actually implemented
+
+**Implementation status: complete and independently reviewed for local behavior.**
+The GPT-6 Luna/high reviewer inspected the endpoint-resolution fix and independently
+ran the full 106-test suite.
+
+- `mp3/rpc.py` defines the request/response schema, strict JSON validation, binary
+  framing limits, send/receive functions, typed RPC outcomes, and
+  `ReplicaClient.call_replica()` for exactly one target and one connection.
+- `mp3/replica.py` defines `ReplicaService`, which accepts bounded work, checks
+  identity/manifest/generation, and calls the local `read_local()` or
+  `install_if_newer()` storage function.
+- `mp3/framing.py` keeps its MP1/MP2-compatible frame helpers and adds total-deadline
+  reads/writes for fragmented network messages.
+- `mp3/storage.py` lets the replica service pass its same absolute deadline through
+  storage admission and SQLite lock waits. A regression test holds a SQLite writer
+  lock, verifies the shorter RPC deadline stops the request, then releases the lock
+  and checks that the expired install did not appear.
+- `mp3/eventlog.py` prints required local `receivedget`/`respondedget` and
+  `receivedput`/`respondedput` lines when the service processes a valid local request.
+  It avoids printing the value bytes.
+
+Tests created two logical VM identities on loopback. A real TCP request from logical
+VM1 reached logical VM4's Store and returned its actual read/install result. The
+process test also killed a disposable local replica with SIGKILL, reopened its same
+database, and successfully read the committed value after its generation advanced.
+These are local-process/loopback checks, not tests on ten university VMs.
+
+The main agent ran:
+
+```text
+python3 -B -m unittest discover -s mp3/tests -v — 106 passed (6.580s)
+python3 -B -m mp3 --smoke — exit 0
+python3 -B -m mp3 --help — exit 0
+python3 -B -m py_compile mp3/rpc.py mp3/replica.py mp3/framing.py mp3/storage.py mp3/eventlog.py — exit 0
+```
+
+The independent reviewer reran the full suite: **106 passed (6.605s)**. The focused
+RPC/replica/storage suite passed **51 tests (5.603s)** on the main agent. The first
+review found a real deadline bug: SQLite could wait beyond the RPC deadline and commit
+later. That path now shares the request's deadline. The review also found that
+infinite or enormous client deadlines could raise an uncaught overflow; those now
+return an explicit error outcome and have regression tests. A later review noticed
+that hostname DNS lookup in Python's standard `create_connection` could occur outside
+the call deadline. `ReplicaClient` now resolves the fixed KV endpoints during setup
+and tries cached numeric addresses under one remaining call deadline; a loopback test
+verifies that an operation does not invoke DNS or `create_connection`.
+
+### What Batch 3 does not implement yet
+
+It does not collect R/W replies, count quorum acknowledgments, send a distributed
+PUT/GET to all five owners, implement Strong ABD, Eventual-noRR, Eventual-RR, read
+repair, full mode switching, or make the eight CLI commands operational. The API is
+only the one-replica foundation. A blocked or timed out request is not a distributed
+key result.
 
 ### What comes next?
 
-Batch 3 is **TCP RPC networking for key-value requests**. It will let a coordinator
-ask remote replicas to read or install a value. The consistency protocols and command
-integration come after that shared network foundation.
+Batch 4 will build on this complete local foundation: its coordinator can use the
+replica RPC to contact prescribed owners, while applying the approved consistency
+protocol rules. CLI integration and remaining steps stay in their planned order.
