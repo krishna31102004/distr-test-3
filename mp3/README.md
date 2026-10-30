@@ -44,7 +44,7 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 106 tests. It uses temporary SQLite directories, fake
+The suite currently has 114 tests. It uses temporary SQLite directories, fake
 clocks, subprocesses killed with SIGKILL, and temporary loopback membership and KV
 listeners. It contacts no university VM. The verified results and limits are recorded
 in the implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to

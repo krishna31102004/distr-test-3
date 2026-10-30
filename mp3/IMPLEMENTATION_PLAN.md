@@ -477,7 +477,11 @@ initial client budget is 5s and nested foreground RPCs must reuse it. This is th
 post-success propagation lifetime; Eventual PUT sends are not implemented here and
 must use an independently bounded C6 continuation. `RpcOutcome.completion_unknown`
 records that an INSTALL may have reached or committed at the replica before a
-timeout/reset; callers must not misreport that as confirmed failure or success.
+timeout/reset, including expiration after a response is received and validated or an
+INSTALL `STORAGE_ERROR`; callers must not misreport that as confirmed failure or
+success. The send boundary is marked only after the deadline check, so expiration
+before the first possible transmission remains definite non-transmission. Read-only
+RPC failures do not set this write-completion flag.
 Replica service has its own finite accepted-request deadline, and passes that same
 absolute deadline into Store admission, SQLite lock waits and pre-commit checks.
 If an underlying OS/filesystem call itself stalls, Python cannot preempt it; an
@@ -1018,3 +1022,36 @@ call. Endpoint DNS resolution occurs once during client setup, outside any opera
 deadline. Local loopback and process tests do not constitute ten-VM evidence. The
 reviewer made no edits and reported no remaining source correctness issue; the
 identified deadline issues and documentation nits were corrected.
+
+### Batch 3 final shutdown/deadline corrections — October 30, 2026
+
+The post-Batch-3 review found that bounded sentinel insertion could leave idle workers
+blocked when the worker count exceeded queue capacity. Workers now observe the stop
+event while polling the bounded queue. Graceful stop drains accepted work; forced
+stop closes and accounts for queued work, interrupts active sockets, and reports the
+original unfinished count and whether workers joined. Handler and close exceptions
+no longer skip queue accounting or silently shrink the pool.
+
+The client now marks possible request transmission immediately before `sendall`,
+after checking the same absolute deadline. Thus a timeout before the first send has
+`completion_unknown=False`; expiration after a validated reply remains TIMEOUT (not
+an on-time acknowledgment) with `completion_unknown=True`. INSTALL `STORAGE_ERROR`
+responses also preserve uncertainty because they provide no durable-success evidence
+and may follow an ambiguous storage failure. Read-only RPC errors do not set the
+write-completion flag. No automatic retries were added.
+
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **114 tests passed in
+  12.527s**; `python3 -B -m mp3 --smoke` and `python3 -B -m mp3 --help` exited 0.
+- Independent GPT-6 Luna/high reviewer: the settled full suite — **114 tests passed
+  in 11.812s**; smoke/help, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` passed. Reviewer made no source changes and found no remaining
+  blocking defects. Its first follow-up run overlapped the final READ assertion edit
+  and was rerun successfully on the settled tree.
+- New tests cover idle workers with workers > queue capacity, graceful draining,
+  forced full-queue shutdown/accounting, repeated start/stop without handler leaks,
+  worker survival after an exception, deterministic post-validation timeout, definite
+  pre-send expiration, and INSTALL storage-error uncertainty.
+
+Evidence is local and uses loopback sockets, temporary storage and a deterministic
+clock seam. No university VM, Batch 4 code, or Strong/Eventual coordinator was tested
+or implemented.

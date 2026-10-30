@@ -79,11 +79,18 @@ def recv_exact_deadline(sock, size: int, *, deadline: float) -> bytes:
     return bytes(data)
 
 
-def send_all_deadline(sock, data: bytes, *, deadline: float) -> None:
-    """Send bytes using the remaining portion of a single absolute deadline."""
+def send_all_deadline(sock, data: bytes, *, deadline: float, before_send=None) -> None:
+    """Send bytes under one deadline, optionally noting the send boundary.
+
+    ``before_send`` runs after the deadline is checked and immediately before
+    ``sendall``. RPC uses it to distinguish a timeout before any possible request
+    transmission from an uncertain outcome after transmission could have begun.
+    """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
     sock.settimeout(_remaining(deadline))
+    if before_send is not None:
+        before_send()
     sock.sendall(data)
 
 

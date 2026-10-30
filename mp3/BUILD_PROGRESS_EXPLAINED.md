@@ -243,3 +243,38 @@ key result.
 Batch 4 will build on this complete local foundation: its coordinator can use the
 replica RPC to contact prescribed owners, while applying the approved consistency
 protocol rules. CLI integration and remaining steps stay in their planned order.
+
+### Batch 3 final shutdown and timeout corrections — October 30, 2026
+
+A final review found two edge cases. First, a queue with room for only one waiting
+request could not hold shutdown markers for four idle workers. The workers now check
+a shared stop signal while waiting on the bounded queue. During a normal stop, they
+finish every accepted request, including queued work. If the shutdown time limit is
+reached, queued requests are closed and counted as incomplete, active sockets are
+interrupted, and the report says whether every worker actually joined. A request
+handler exception no longer kills that worker or skips queue bookkeeping.
+
+Second, the client could receive a valid write response but notice that the deadline
+had expired while validating it. The client now returns TIMEOUT, so that late response
+does not count as an on-time acknowledgment, and marks the write's completion as
+uncertain. It also keeps uncertainty for INSTALL storage errors. If the deadline ends
+before the first send can start, the client reports that no request was transmitted.
+The network helper marks this boundary immediately before `sendall`, after checking
+the deadline. No retries were added.
+
+**Final verification after review:** the main agent ran
+`python3 -B -m unittest discover -s mp3/tests -v` — **114 passed in 12.527s** — and
+both `python3 -B -m mp3 --smoke` and `python3 -B -m mp3 --help` exited successfully.
+The independent GPT-6 Luna/high reviewer reran the settled suite — **114 passed in
+11.812s** —
+and also passed smoke, help, `python3 -B -m compileall -q mp3`, and `git diff --check`.
+The eight new tests cover worker shutdown with a one-slot queue, graceful and forced
+shutdown, worker exceptions and repeated stops, plus deterministic before-send and
+after-response deadline cases and ambiguous storage errors. A lost READ_LOCAL reply
+does not set write-completion uncertainty; the test verifies that boundary too. These
+checks used local
+processes, loopback sockets and temporary storage; no university VM was tested.
+
+Batch 3 is complete with these corrections. Distributed PUT/GET, Strong ABD,
+Eventual-noRR, Eventual-RR, read repair, complete CLI operations and Batch 4 are still
+unimplemented.

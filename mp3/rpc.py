@@ -599,8 +599,9 @@ def send_response(sock: socket.socket, response: ReplicaResponse, manifest: Mani
     send_all_deadline(sock, payload, deadline=deadline)
 
 
-def _request_error(kind: RpcOutcomeKind, error: BaseException | str) -> RpcOutcome:
-    return RpcOutcome(kind, None, str(error)[:MAX_ERROR_BYTES])
+def _request_error(kind: RpcOutcomeKind, error: BaseException | str, *,
+                   completion_unknown: bool = False) -> RpcOutcome:
+    return RpcOutcome(kind, None, str(error)[:MAX_ERROR_BYTES], completion_unknown)
 
 
 class ReplicaClient:
@@ -691,38 +692,54 @@ class ReplicaClient:
             return _request_error(RpcOutcomeKind.ERROR, error)
 
         connected = False
-        request_may_have_been_sent = False
+        install_may_have_been_sent = False
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return _request_error(RpcOutcomeKind.TIMEOUT, "operation deadline expired")
             with self._connect(target, deadline=deadline) as sock:
                 connected = True
-                request_may_have_been_sent = True
-                send_all_deadline(sock, HEADER.pack(len(payload)), deadline=deadline)
-                send_all_deadline(sock, payload, deadline=deadline)
+                def note_possible_transmission() -> None:
+                    nonlocal install_may_have_been_sent
+                    if request.op == RpcOperation.INSTALL_IF_NEWER:
+                        install_may_have_been_sent = True
+
+                send_all_deadline(sock, HEADER.pack(len(payload)), deadline=deadline,
+                                  before_send=note_possible_transmission)
+                send_all_deadline(sock, payload, deadline=deadline,
+                                  before_send=note_possible_transmission)
                 sock.shutdown(socket.SHUT_WR)
                 response = receive_response(sock, self.manifest, deadline=deadline)
             response.validate_for(request, target, self.manifest, expected_generation)
             if time.monotonic() >= deadline:
-                return _request_error(RpcOutcomeKind.TIMEOUT, "operation deadline expired during validation")
+                return _request_error(
+                    RpcOutcomeKind.TIMEOUT,
+                    "operation deadline expired during response validation",
+                    completion_unknown=install_may_have_been_sent,
+                )
             if response.status == RpcStatus.ERROR and response.error.startswith("OVERLOADED"):
                 return RpcOutcome(RpcOutcomeKind.OVERLOADED, response, response.error)
-            return RpcOutcome(RpcOutcomeKind.RESPONSE, response)
+            completion_unknown = (
+                request.op == RpcOperation.INSTALL_IF_NEWER
+                and response.status == RpcStatus.ERROR
+                and response.error == "STORAGE_ERROR"
+            )
+            return RpcOutcome(RpcOutcomeKind.RESPONSE, response,
+                              completion_unknown=completion_unknown)
         except (socket.timeout, TimeoutError) as error:
             return RpcOutcome(RpcOutcomeKind.TIMEOUT, None,
                               str(error or "operation deadline expired")[:MAX_ERROR_BYTES],
-                              request_may_have_been_sent)
+                              install_may_have_been_sent)
         except RpcProtocolError as error:
             return RpcOutcome(RpcOutcomeKind.INVALID_RESPONSE, None,
-                              str(error)[:MAX_ERROR_BYTES], request_may_have_been_sent)
+                              str(error)[:MAX_ERROR_BYTES], install_may_have_been_sent)
         except (ConnectionRefusedError, socket.gaierror, OSError) as error:
             kind = RpcOutcomeKind.ERROR if connected else RpcOutcomeKind.UNREACHABLE
             return RpcOutcome(kind, None, str(error)[:MAX_ERROR_BYTES],
-                              request_may_have_been_sent)
+                              install_may_have_been_sent)
         except OverflowError as error:
             return RpcOutcome(RpcOutcomeKind.ERROR, None,
-                              str(error)[:MAX_ERROR_BYTES], request_may_have_been_sent)
+                              str(error)[:MAX_ERROR_BYTES], install_may_have_been_sent)
         except (ValueError, TypeError) as error:
             return RpcOutcome(RpcOutcomeKind.INVALID_RESPONSE, None,
-                              str(error)[:MAX_ERROR_BYTES], request_may_have_been_sent)
+                              str(error)[:MAX_ERROR_BYTES], install_may_have_been_sent)

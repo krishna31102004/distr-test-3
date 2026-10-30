@@ -129,11 +129,6 @@ class ReplicaService:
         except Exception:
             self._stop.set()
             listener.close()
-            for _ in self._workers:
-                try:
-                    self._queue.put_nowait(None)
-                except queue.Full:
-                    break
             for worker in self._workers:
                 worker.join(timeout=0.5)
             raise
@@ -172,20 +167,44 @@ class ReplicaService:
 
     def _worker(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                # Shutdown is signaled out of band so every idle worker can wake
+                # even when the bounded queue is smaller than the worker pool.
+                if self._stop.is_set():
+                    return
+                continue
             if item is None:
                 self._queue.task_done()
                 return
             connection, deadline = item
             try:
                 self._handle(connection, deadline)
+            except Exception:
+                # A bug in one request must not silently shrink the fixed pool.
+                # The accepted connection and queue accounting are still released.
+                if self.logger is not None:
+                    try:
+                        self.logger.exception(
+                            "replica request handler failed",
+                            extra={"node_id": self.membership.self_id,
+                                   "request_id": None})
+                    except Exception:
+                        pass
             finally:
-                self._finish(connection)
-                self._queue.task_done()
+                try:
+                    self._finish(connection)
+                finally:
+                    self._queue.task_done()
 
     def _finish(self, connection: socket.socket) -> None:
         try:
             connection.close()
+        except OSError:
+            # Closing a reset peer can report a socket error; it must not leak
+            # admission accounting or terminate a fixed worker.
+            pass
         finally:
             with self._condition:
                 self._connections.discard(connection)
@@ -368,19 +387,6 @@ class ReplicaService:
             while self._outstanding and time.monotonic() < shutdown_deadline:
                 self._condition.wait(shutdown_deadline - time.monotonic())
             incomplete = self._outstanding
-            if incomplete:
-                connections = tuple(self._connections)
-            else:
-                connections = ()
-        for connection in connections:
-            try:
-                connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                connection.close()
-            except OSError:
-                pass
 
         if incomplete:
             # Drop only accepted-but-unstarted work after an explicit forced stop;
@@ -395,15 +401,22 @@ class ReplicaService:
                     self._finish(connection)
                 self._queue.task_done()
 
-        for _ in self._workers:
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:
-                break
+            # Queued sockets were closed by _finish above. Shutdown the remaining
+            # active sockets to interrupt bounded network IO; each worker remains
+            # their sole owner for final close/accounting in its finally block.
+            with self._condition:
+                active_connections = tuple(self._connections)
+            for connection in active_connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
         for worker in self._workers:
             worker.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
         joined = all(not worker.is_alive() for worker in self._workers)
-        self._workers.clear()
+        if joined:
+            self._workers.clear()
         self._last_shutdown = ShutdownReport(incomplete, joined)
         if incomplete and self.logger is not None:
             self.logger.warning("replica shutdown left requests incomplete",

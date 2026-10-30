@@ -195,7 +195,7 @@ closes a connection after malformed or incomplete messages.
 | `recv_frame` | socket, explicit max_bytes → bytes; reads header exactly, rejects excessive length before body, then reads full body | smoke, FramingTests, ReuseTests; recv_exact, HEADER | I |
 | `_remaining` | finite monotonic deadline → seconds remaining or TimeoutError; rejects expired deadlines | deadline-aware helpers | I; KD-08/C6 |
 | `recv_exact_deadline` | socket, byte count, absolute deadline → bytes; repeats partial reads but recomputes the same deadline each time | RPC codecs, deadline framing tests | I; KD-08/C6 |
-| `send_all_deadline` | socket, bytes, absolute deadline → None; applies remaining budget before sendall | RPC codecs | I; KD-08/C6 |
+| `send_all_deadline` | socket, bytes, absolute deadline, optional `before_send` callback → None; applies remaining budget before calling the callback immediately before `sendall` | RPC codecs; callback lets the client mark possible transmission only after the deadline check | I; KD-08/C6 |
 | `recv_frame_deadline`, `send_frame_deadline` | socket/payload, cap, deadline → received bytes or None; compatibility framing with a total deadline | available utility; RPC uses the same lower-level helpers for its two-length envelope | I; KD-08/C6 |
 
 No header bit pattern is intrinsically malformed beyond a caller's cap: all four-
@@ -222,7 +222,7 @@ bytes before a replica operation can reach storage.
 | `_mode`, `_operation`, `_status` | Convert exact wire strings to approved enums; unknown names fail closed | I; C5 |
 | `ReplicaRequest.__post_init__`, `.value_len`, `._validate_version_kind`, `.validate_manifest`, `.to_metadata`, `.from_metadata` | Validate request identity, operation-specific version/value shape, phase=`local`, and manifest; convert strict fields to/from metadata | I; C5 |
 | `ReplicaResponse.__post_init__`, `.value_len`, `.validate_for`, `.to_metadata`, `.from_metadata` | Check status evidence and bind one response to the request, target, manifest, generation, context and operation | I; C3/C5 |
-| `RpcOutcome` | Carries outcome kind, optional validated response, bounded error text and whether an INSTALL may have completed without acknowledgment | I; C5/C6 |
+| `RpcOutcome` | Carries outcome kind, optional validated response, bounded error text and whether an INSTALL may have completed without acknowledgment; read-only failures never set the write-completion flag | I; C5/C6 |
 | `new_request` | Manifest, sender/generation, target, context, op/key and optional record → fresh UUID4 `ReplicaRequest` | I; C5 |
 | `_encode_payload`, `encode_request`, `encode_response` | Valid metadata/body → capped `JSON length + JSON + bytes` payload after manifest/schema checks | I; C5 |
 | `_recv_payload`, `_require_eof`, `receive_request`, `receive_response` | Socket/deadline → validated metadata/body/request/response; checks both declared lengths before body reads and rejects truncation/trailing bytes | I; C5/C6 |
@@ -230,7 +230,7 @@ bytes before a replica operation can reach storage.
 | `_request_error` | Outcome kind and error → bounded error-only result | I; C5 |
 | `ReplicaClient.__init__` | Manifest and matching `MembershipTable` → reusable per-node RPC client; resolves fixed KV endpoints once, caps cached candidates at eight, preserves resolution errors as per-target outcomes | I; C1/C2/C5 |
 | `ReplicaClient._connect` | Node and absolute deadline → connected socket; tries cached numeric candidates using the remaining budget before each attempt, without blocking DNS in the operation | I; C5/C6 |
-| `ReplicaClient.call_replica` | Prescribed Node, request and absolute deadline → one response or typed outcome; snapshots expected generation, performs one connection/no retry, checks response evidence and flags uncertain post-send completion | I; C5/C6; no quorum collection |
+| `ReplicaClient.call_replica` | Prescribed Node, request and absolute deadline → one response or typed outcome; snapshots expected generation, performs one connection/no retry, checks response evidence and marks INSTALL completion uncertain after possible transmission, including late validation and STORAGE_ERROR | I; C5/C6; no quorum collection |
 
 `READ_LOCAL` returns FOUND with actual version and raw bytes, or NOT_FOUND with no
 record; empty bytes remain FOUND. INSTALL returns the version actually stored.
@@ -251,18 +251,27 @@ READ_LOCAL or INSTALL_IF_NEWER. It does not schedule replication or repair.
 | `.address` | Started service → bound host/port, including an ephemeral test port | I; local tests |
 | `.start` | None → listener and fixed workers; refuses missing generation; binds only configured KV endpoint | I; C2/C5 |
 | `._accept_loop` | Accept sockets, assign one accepted-request deadline, reserve bounded queue capacity or return bounded OVERLOADED | I; C6 |
-| `._worker`, `._finish` | Consume accepted requests and release sockets/outstanding count in `finally` | I; C6 |
+| `._worker`, `._finish` | Polls the bounded queue so stop wakes idle workers even when worker count exceeds queue capacity; drains accepted work on graceful stop, preserves task accounting on handler/close errors, and releases sockets/outstanding count in `finally` | I; C6 |
 | `._error_response`, `._reply_overloaded` | Validated request or bounded overload connection → explicit non-durable ERROR response; malformed identity cannot be trusted | I; C5/C6 |
 | `._validate_identity` | Request → None or INVALID_REQUEST reason; checks manifest, target, sender membership and current sender generation | I; C2/C5 |
 | `._emit` | Request and receive/respond phase → professor terminal line plus optional structured log; key control chars escaped, values omitted | I; KD-17 primitive only |
 | `._process` | Valid request and absolute deadline → mapped storage response; passes same deadline to storage so admission and SQLite lock waits cannot restart the RPC budget | I; C3/C5/C6 |
 | `._handle` | Socket and deadline → fully validates, logs receipt, dispatches once, sends actual response only within the deadline, then closes | I; C5/C6 |
-| `.stop` | Optional finite shutdown budget → `ShutdownReport`; stops admission, closes sockets and counts unfinished work | I; C6 |
+| `.stop` | Optional finite shutdown budget → `ShutdownReport`; stops admission, drains within the grace budget, drops and counts queued requests only on forced stop, interrupts active sockets, and reports unfinished work and whether workers joined | I; C6 |
 
 The deadline passed into SQLite bounds queue admission, lock waits, transaction work
 and the pre-commit check. An OS/filesystem call that itself blocks cannot be cancelled
 by Python, so a client-side timeout after a send still may have an unknown write
 outcome. Membership gossip uses a separate service and capacity.
+
+`tests/test_replica.py` adds regressions for four idle workers with a one-slot queue,
+graceful draining of four active plus one queued request, forced shutdown with a full
+queue, repeated start/stop without worker leaks, and a handler exception that must not
+shrink the pool. RPC tests use a controlled monotonic clock to prove that a deadline
+expiring after a validated INSTALL response returns TIMEOUT with
+`completion_unknown=True`; a separate send-boundary test proves expiration before
+`sendall` remains definite non-transmission. A valid INSTALL `STORAGE_ERROR` response
+also preserves uncertainty because the client has no durable commit evidence.
 
 ### `ring.py`
 
@@ -495,9 +504,9 @@ loopback listeners. The process-recovery test kills only its own child process.
 |---|---|
 | `test_actual_tcp_read_install_outcomes_and_empty_vs_missing`, `test_actual_tcp_unicode_nul_key_and_full_binary_value`, `test_client_connect_uses_cached_addresses_and_shared_candidate_deadline` | Real vm01→vm04 requests reach the replica's Store; cached candidates avoid DNS and per-address retries share the same budget |
 | `test_stale_epoch_returns_current_context_and_does_not_mutate`, `test_zero_epoch_returns_stale_context_under_request_deadline`, `test_invalid_sender_generation_and_wrong_target_do_not_mutate`, `test_wrong_manifest_is_closed_before_storage_mutation` | Epoch (including invalid zero epoch), manifest, target and sender-generation fencing before DB mutation |
-| `test_committed_write_with_lost_ack_is_reported_unknown`, `test_client_timeout_after_commit_marks_completion_unknown`, `test_connection_refused_is_unreachable_not_not_found`, `test_lost_response_after_send_is_unknown_error` | Network errors and client-visible uncertainty remain distinct from NOT_FOUND |
+| `test_committed_write_with_lost_ack_is_reported_unknown`, `test_client_timeout_after_commit_marks_completion_unknown`, `test_deadline_after_validated_install_response_is_unknown`, `test_storage_error_install_response_preserves_uncertain_completion`, `test_expired_deadline_before_send_is_definite_nontransmission`, `test_expiry_after_connect_before_first_send_is_definite_nontransmission`, `test_connection_refused_is_unreachable_not_not_found`, `test_lost_response_after_send_is_unknown_error` | Network errors and client-visible uncertainty remain distinct from NOT_FOUND; a controlled clock checks both sides of the send boundary and a late validated response |
 | `test_nonfinite_and_unrepresentable_deadlines_return_outcomes`, `test_service_receive_deadline_bounds_slow_fragmented_header`, `test_slow_fragmented_response_cannot_reset_total_deadline`, `test_storage_lock_wait_uses_service_deadline_and_cannot_commit_late` | Absolute deadlines cover slow traffic, socket numeric edge cases and SQLite lock waits |
-| `test_full_worker_and_queue_returns_explicit_overloaded`, `test_concurrent_clients_progress_for_distinct_and_same_keys`, `test_membership_gossip_uses_separate_service_while_kv_load_runs`, `test_shutdown_is_bounded_and_joins_worker_threads` | Bounded admission, concurrent requests, membership capacity isolation and cleanup |
+| `test_full_worker_and_queue_returns_explicit_overloaded`, `test_concurrent_clients_progress_for_distinct_and_same_keys`, `test_membership_gossip_uses_separate_service_while_kv_load_runs`, `test_shutdown_is_bounded_and_joins_worker_threads`, `test_four_idle_workers_exit_with_queue_capacity_one`, `test_graceful_shutdown_drains_active_workers_and_queued_work`, `test_forced_shutdown_accounts_full_queue_and_active_request`, `test_unexpected_handler_exception_does_not_kill_worker` | Bounded admission, concurrent requests, membership capacity isolation, queue-capacity-independent worker shutdown, accepted-work accounting, forced stop and handler survival |
 | `test_receipt_and_response_terminal_lines_do_not_log_values` | Required local log lines, escaped keys and no raw-value logging |
 | `test_tcp_install_survives_kill9_and_process_restart` | Local child process SIGKILL/restart preserves committed bytes and increments generation |
 

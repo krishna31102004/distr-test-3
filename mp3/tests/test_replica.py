@@ -321,6 +321,149 @@ class ReplicaIntegrationTests(RpcEnvironment):
         self.assertFalse(any(thread.name.startswith("mp3-kv-handler-vm04")
                              for thread in threading.enumerate()))
 
+    def test_four_idle_workers_exit_with_queue_capacity_one(self):
+        self.service.stop(timeout=2)
+        for _ in range(3):
+            service = ReplicaService(self.store, self.manifest, self.replica_table,
+                                     workers=4, max_pending=1)
+            service.start()
+            report = service.stop(timeout=2)
+            self.assertEqual(report.incomplete_requests, 0)
+            self.assertTrue(report.workers_joined)
+            self.assertFalse(any(thread.name.startswith("mp3-kv-handler-vm04")
+                                 for thread in threading.enumerate()))
+
+    def test_graceful_shutdown_drains_active_workers_and_queued_work(self):
+        self.service.stop(timeout=2)
+        service = ReplicaService(self.store, self.manifest, self.replica_table,
+                                 workers=4, max_pending=1, request_timeout=4)
+        self.service = service
+        self.addCleanup(service.stop)
+        service.start()
+
+        entered = threading.Condition()
+        active = [0]
+        all_workers_active = threading.Event()
+        release_workers = threading.Event()
+        self.addCleanup(release_workers.set)
+
+        def hold_request(_connection, _deadline):
+            with entered:
+                active[0] += 1
+                if active[0] == 4:
+                    all_workers_active.set()
+                entered.notify_all()
+            if not release_workers.wait(5):
+                raise AssertionError("test did not release worker gate")
+
+        service._handle = hold_request
+        clients = []
+        self.addCleanup(lambda: [client.close() for client in clients])
+        for expected_active in range(1, 5):
+            clients.append(socket.create_connection(
+                (self.target.kv.host, self.target.kv.port), timeout=1))
+            deadline = time.monotonic() + 1
+            while active[0] < expected_active and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertGreaterEqual(active[0], expected_active)
+        clients.append(socket.create_connection((self.target.kv.host, self.target.kv.port), timeout=1))
+        self.assertTrue(all_workers_active.wait(1))
+        deadline = time.monotonic() + 1
+        while (service._outstanding != 5 or service._queue.qsize() != 1) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual((service._outstanding, service._queue.qsize()), (5, 1))
+
+        result = []
+        stopped = threading.Event()
+
+        def stop_service():
+            result.append(service.stop(timeout=2))
+            stopped.set()
+
+        stopper = threading.Thread(target=stop_service)
+        stopper.start()
+        deadline = time.monotonic() + 1
+        while not service._stop.is_set() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        release_workers.set()
+        self.assertTrue(stopped.wait(3))
+        stopper.join(timeout=1)
+        self.assertEqual(result[0].incomplete_requests, 0)
+        self.assertTrue(result[0].workers_joined)
+        self.assertEqual(service._queue.unfinished_tasks, 0)
+        self.assertFalse(any(thread.name.startswith("mp3-kv-handler-vm04")
+                             for thread in threading.enumerate()))
+
+    def test_forced_shutdown_accounts_full_queue_and_active_request(self):
+        self.service.stop(timeout=2)
+        service = ReplicaService(self.store, self.manifest, self.replica_table,
+                                 workers=1, max_pending=1, request_timeout=4)
+        self.service = service
+        self.addCleanup(service.stop)
+        service.start()
+
+        entered = threading.Event()
+        release_worker = threading.Event()
+        self.addCleanup(release_worker.set)
+
+        def hold_request(_connection, _deadline):
+            entered.set()
+            release_worker.wait(3)
+
+        service._handle = hold_request
+        clients = [socket.create_connection((self.target.kv.host, self.target.kv.port), timeout=1)]
+        self.addCleanup(lambda: [client.close() for client in clients])
+        self.assertTrue(entered.wait(1))
+        clients.append(socket.create_connection((self.target.kv.host, self.target.kv.port), timeout=1))
+        deadline = time.monotonic() + 1
+        while (service._outstanding != 2 or service._queue.qsize() != 1) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual((service._outstanding, service._queue.qsize()), (2, 1))
+        workers = tuple(service._workers)
+
+        report = service.stop(timeout=0.05)
+        self.assertEqual(report.incomplete_requests, 2)
+        self.assertFalse(report.workers_joined)
+        self.assertEqual(service._queue.qsize(), 0)
+        self.assertEqual(service._queue.unfinished_tasks, 1)  # active worker owns the last task
+
+        release_worker.set()
+        for worker in workers:
+            worker.join(timeout=1)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(service._queue.unfinished_tasks, 0)
+
+    def test_unexpected_handler_exception_does_not_kill_worker(self):
+        self.service.stop(timeout=2)
+        service = ReplicaService(self.store, self.manifest, self.replica_table,
+                                 workers=1, max_pending=1)
+        self.service = service
+        self.addCleanup(service.stop)
+        service.start()
+        original_handle = service._handle
+        calls = []
+
+        def fail_once(connection, deadline):
+            calls.append(None)
+            if len(calls) == 1:
+                raise RuntimeError("injected handler bug")
+            return original_handle(connection, deadline)
+
+        service._handle = fail_once
+        failed_connection = socket.create_connection(
+            (self.target.kv.host, self.target.kv.port), timeout=1)
+        self.assertEqual(failed_connection.recv(1), b"")
+        failed_connection.close()
+        deadline = time.monotonic() + 1
+        while service._outstanding and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        outcome = self.call(self.make_request(RpcOperation.READ_LOCAL, "after-handler-error"))
+        self.assertEqual(outcome.kind, RpcOutcomeKind.RESPONSE, outcome.error)
+        self.assertEqual(outcome.response.status, RpcStatus.NOT_FOUND)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(service._workers[0].is_alive())
+
     def test_full_worker_and_queue_returns_explicit_overloaded(self):
         self.service.stop(timeout=2)
         self.service = ReplicaService(self.store, self.manifest, self.replica_table,
@@ -414,6 +557,114 @@ class RpcFailureTests(unittest.TestCase):
                                           deadline=time.monotonic() + 0.5)
         self.assertEqual(result.kind, RpcOutcomeKind.UNREACHABLE)
         self.assertIsNone(result.response)
+        self.assertFalse(result.completion_unknown)
+
+    def test_expired_deadline_before_send_is_definite_nontransmission(self):
+        result = self.client.call_replica(self.target, self.request(), deadline=0)
+        self.assertEqual(result.kind, RpcOutcomeKind.TIMEOUT)
+        self.assertFalse(result.completion_unknown)
+
+    def test_deadline_after_validated_install_response_is_unknown(self):
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=CTX.mode,
+            op=RpcOperation.INSTALL_IF_NEWER, key="late-valid-response",
+            version=Version("eventual", 9, "vm01/1"), value=b"write")
+        response = ReplicaResponse(
+            request.request_id, self.manifest.fingerprint, "vm04", 1, "vm01", 1,
+            CTX.mode, RpcOperation.INSTALL_IF_NEWER, "local", RpcStatus.INSTALLED,
+            False, stored_version=request.version, durable=True)
+
+        class ConnectedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def shutdown(self, _how):
+                return None
+
+        # First four monotonic readings leave the operation live through send and
+        # response validation. The fifth reading expires only the final deadline
+        # check, without sleeps or scheduler-dependent timing.
+        with patch("mp3.rpc.time.monotonic", side_effect=(0, 0, 0, 0, 2)), \
+                patch.object(self.client, "_connect", return_value=ConnectedSocket()), \
+                patch("mp3.rpc.send_all_deadline") as sent, \
+                patch("mp3.rpc.receive_response", return_value=response):
+            sent.side_effect = lambda _sock, _data, *, before_send=None, **_kwargs: before_send()
+            outcome = self.client.call_replica(self.target, request, deadline=1)
+
+        self.assertEqual(outcome.kind, RpcOutcomeKind.TIMEOUT)
+        self.assertIsNone(outcome.response)
+        self.assertTrue(outcome.completion_unknown)
+        self.assertEqual(sent.call_count, 2)
+
+    def test_expiry_after_connect_before_first_send_is_definite_nontransmission(self):
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=CTX.mode,
+            op=RpcOperation.INSTALL_IF_NEWER, key="not-transmitted",
+            version=Version("eventual", 10, "vm01/1"), value=b"write")
+
+        class ConnectedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout):
+                return None
+
+            def sendall(self, _data):
+                self.fail("sendall must not run after the deadline expires")
+
+            def fail(self, message):
+                raise AssertionError(message)
+
+        # call_replica performs four monotonic checks before send_all_deadline's
+        # own remaining-budget check. The helper expires before invoking the
+        # before_send callback, so no request bytes could have been transmitted.
+        with patch("mp3.rpc.time.monotonic", side_effect=(0, 0, 0, 0, 2)), \
+                patch.object(self.client, "_connect", return_value=ConnectedSocket()):
+            outcome = self.client.call_replica(self.target, request, deadline=1)
+
+        self.assertEqual(outcome.kind, RpcOutcomeKind.TIMEOUT)
+        self.assertFalse(outcome.completion_unknown)
+
+    def test_storage_error_install_response_preserves_uncertain_completion(self):
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=CTX.mode,
+            op=RpcOperation.INSTALL_IF_NEWER, key="ambiguous-storage-error",
+            version=Version("eventual", 11, "vm01/1"), value=b"write")
+        response = ReplicaResponse(
+            request.request_id, self.manifest.fingerprint, "vm04", 1, "vm01", 1,
+            CTX.mode, RpcOperation.INSTALL_IF_NEWER, "local", RpcStatus.ERROR,
+            False, durable=False, error="STORAGE_ERROR")
+
+        class ConnectedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def shutdown(self, _how):
+                return None
+
+        with patch("mp3.rpc.time.monotonic", side_effect=(0, 0, 0, 0, 0)), \
+                patch.object(self.client, "_connect", return_value=ConnectedSocket()), \
+                patch("mp3.rpc.send_all_deadline",
+                      side_effect=lambda _sock, _data, *, before_send=None, **_kwargs:
+                      before_send()), \
+                patch("mp3.rpc.receive_response", return_value=response):
+            outcome = self.client.call_replica(self.target, request, deadline=1)
+
+        self.assertEqual(outcome.kind, RpcOutcomeKind.RESPONSE)
+        self.assertEqual(outcome.response.status, RpcStatus.ERROR)
+        self.assertTrue(outcome.completion_unknown)
 
     def test_nonfinite_and_unrepresentable_deadlines_return_outcomes(self):
         request = self.request()
@@ -455,6 +706,7 @@ class RpcFailureTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(result.kind, RpcOutcomeKind.ERROR)
         self.assertIsNone(result.response)
+        self.assertFalse(result.completion_unknown)  # This request is READ_LOCAL.
 
     def test_wrong_request_id_and_wrong_generation_in_responses_are_invalid(self):
         def responder(request_id, generation):
@@ -478,7 +730,7 @@ class RpcFailureTests(unittest.TestCase):
             self.assertFalse(errors)
             self.assertEqual(result.kind, RpcOutcomeKind.INVALID_RESPONSE)
             if generation != 1:
-                self.assertTrue(result.completion_unknown)
+                self.assertFalse(result.completion_unknown)  # Invalid READ has no write effect.
 
     def test_slow_fragmented_response_cannot_reset_total_deadline(self):
         def trickle(connection, request):
