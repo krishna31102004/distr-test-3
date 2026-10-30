@@ -1,12 +1,13 @@
 # MP3 implementation plan — shared by Krishna, Juhi, Codex and Claude Code
 
 Prepared October 22, 2026; roadmap reconciled with the local October 21 specification.
-**Current gate: Step 2 Batches 1–3 are implemented and independently reviewed on the
-Batch 3 feature branch. Coordinator protocols remain pending.** Read AGENTS.md and
+**Current gate: Step 2 Batches 1–4 local foundation is VERIFIED and independently
+reviewed on the Batch 4 feature branch. This is not ten-VM deployment verification.
+Coordinator protocols remain pending.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
-completed so far is local storage/versioning, fixed ring/membership/recovery, and
-single-replica KV RPC; it does not include distributed consistency protocols. At bootstrap the
+completed so far is local storage/versioning, fixed ring/membership/recovery,
+single-replica KV RPC, and their integrated local node runtime; it does not include distributed consistency protocols. At bootstrap the
 snapshot lacked Git metadata, MP3, agent instructions and the specification; these
 now exist, and `mp3/SPEC.md` is authoritative.
 MP1/MP2 remain read-only references. No university VM was contacted and no dependency
@@ -34,8 +35,8 @@ Evaluation: demo 60%, report 30%, code quality 10%.
 
 Follow the steps in order; use the detailed checklist, audit and task table below
 for specifics. Approvals are entry gates before implementation, not extra phases.
-Step 2 Batches 1–3 are complete locally; multi-owner coordinator integration and
-Steps 3–6 remain future work. Task statuses below reflect verified local work.
+Step 2 Batches 1–4 are complete for the local foundation; ten-VM validation, multi-owner
+coordinator integration, and Steps 3–6 remain future work. Task statuses below reflect verified local work.
 KD direction approvals and C1–C6 contract approvals remain recorded; deferred protocol
 decisions remain pending.
 
@@ -67,9 +68,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
   Batch 1 local storage/version foundation and Krishna's Batch 2 hash/ring and
   membership/recovery foundation are independently implemented and locally verified.
   Krishna's bounded KV RPC replica service/client (N-01) is now implemented and
-  locally reviewed; its calls use the approved store and membership boundaries.
-  Ownership is unchanged. **Next:** jointly integrate the tested common foundation;
-  then Krishna and Juhi can build their separately owned coordinators against it.
+  locally reviewed. Batch 4's joint `NodeRuntime` now starts and stops those foundations
+  in order, without implementing a multi-owner coordinator. Ownership is unchanged.
+  **Next:** obtain the deferred Step 3 protocol decisions, then Krishna and Juhi can
+  build their separately owned coordinators against this integrated local foundation.
 - **Decisions already approved for these foundations:** KD-02/03/04/05/06/07/09/14/15
   and the applicable C1–C6 contracts. KD-01's VM runtime compatibility, KD-08's
   protocol-specific qualifications, KD-10's Strong allocation and KD-16's full
@@ -77,10 +79,12 @@ are approved as C1/C2 contracts; their implementations remain future work.
 - **Can wait:** KD-11/12 until Step 3; KD-13, full KD-16 and final KD-17 until
   Step 4; KD-18 until Step 6. Do not implement ABD, Eventual protocols, repair,
   mode switching or command integration as part of this step update.
-- **Verified local evidence:** Batch 1 store/version tests, Batch 2 ring/membership
-  and recovery tests, and Batch 3 TCP replica read/install tests are listed below.
-  Loopback network-to-SQLite behavior is verified; ten-VM operation, multi-owner
-  coordination, cross-VM consistency and real-cluster convergence remain unverified.
+- **Verified local evidence:** Batch 1 store/version, Batch 2 ring/membership, Batch 3
+  TCP replica read/install, and Batch 4 lifecycle integration tests are listed below.
+  Three logical VMs communicated over real loopback sockets; a disposable subprocess
+  was SIGKILLed and restarted with its value and stable identity preserved. Ten-VM
+  operation, multi-owner coordination, cross-VM consistency and real-cluster convergence
+  remain unverified.
 
 ### Step 3 — Build Strong and Eventual-noRR in parallel
 
@@ -142,10 +146,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
   12-point report, submission receipts and full demo rehearsal are complete by the
   required dates. No results are inferred from unit tests or invented.
 
-**Current task gate:** Batches 1–3 provide the locally reviewed storage/version,
-ring/membership, and single-replica RPC foundations. The shared foundation has been
-integrated for one remote replica read/install; multi-owner protocols and coordinator
-integration remain future work. The accepted KD directions must not be reopened
+**Current task gate:** Batches 1–4 provide the locally reviewed storage/version,
+ring/membership, single-replica RPC, and integrated local node lifecycle foundations.
+The shared foundation can start one node and perform one remote replica read/install;
+multi-owner protocols and coordinator integration remain future work. The accepted KD directions must not be reopened
 without a concrete specification conflict or serious correctness issue. Defer KD-11/12
 to Step 3, KD-13/full KD-16/final KD-17 to Step 4, and KD-18 to Step 6.
 
@@ -157,7 +161,7 @@ do not imply ten-VM verification. The batch evidence section records exact comma
 
 | Check | Requirement / boundary | Task | Acceptance evidence required |
 |---|---|---|---|
-| [ ] | Ten VMs; each acts as client/server | M-01, N-01, C-01 | Requests originated/served on every VM |
+| [ ] | Ten VMs; each acts as client/server | M-01, N-01, C-01 | Requests originated/served on every VM; Batch 4 is loopback only |
 | [x] | N=5; deterministic consistent hashing | R-01 | SHA-256 vectors plus cross-process, input-order and five-owner tests; no real cluster yet |
 | [x] | Select five distinct successors from supplied IDs, including wraparound | R-01 | `RingTests` and `RingMembershipTests`; exact equality is inclusive for Manifest.owners |
 | [x] | First five owners fixed after setup; no all-key replica map | R-01 | Failed/suspected status leaves local prescribed owners unchanged |
@@ -179,8 +183,8 @@ do not imply ten-VM verification. The batch evidence section records exact comma
 | [ ] | RR returns after R, then compares all reachable replies | E-02 | Client completion precedes late higher reply |
 | [ ] | RR finds max, repairs stale/missing reachable copies, logs evidence | E-02, L-01 | Higher-late-version and racing-write repair traces |
 | [ ] | Values AND version metadata durable before every qualifying write ack | S-01 | kill -9 at commit/ack boundaries |
-| [ ] | Restart preserves disk contents | S-01, F-01 | Restart without data deletion, readback of bytes/tags |
-| [ ] | Recover durable state before serving; local storage libraries allowed, distributed replication/quorum/repair libraries forbidden | S-01, N-01 | Startup admission test; dependency/provenance review |
+| [x] | Local process restart preserves disk contents | S-01, I-02 | Disposable SIGKILL/restart reads committed bytes and version; no VM claim |
+| [x] | Recover local durable state before serving; local storage libraries allowed, distributed replication/quorum/repair libraries forbidden | S-01, I-02 | Explicit recovery and generation-before-listener startup tests; distributed recovery remains untested |
 | [ ] | Strong↔Eventual clears KV+versions; Eventual↔Eventual may preserve | C-02 | Switch matrix incl. offline/delayed request cases |
 | [ ] | Membership/ring IDs survive all mode switches | C-02, M-01 | Before/after manifest/ID comparison |
 | [ ] | Single-replica RPC request bounded; failures never become NOT_FOUND | N-01 | Unreachable, slow-fragment and expired-deadline tests; quorum-level error policy remains A-01/E-01 |
@@ -701,6 +705,7 @@ is the initial agreement from the prompt; coordinate before cross-owner edits.
 | DR-01 | Joint | Check Piazza submission/demo notices; local SPEC.md reviewed; AI assistance permitted | Remaining submission/demo notices required | Record remaining notices; retain spec-correct checklist | NOT_STARTED |
 | DR-02 | Joint | Approve/reject decisions in the roadmap's staged reviews, starting with Step 2 tonight | Local SPEC.md; next-step decision group | Actual approval fields and agreed invariants; no need to approve all 18 tonight | BLOCKED_BY_DECISION |
 | I-01 | Joint | Agree Step 2 storage/version/RPC/identity contracts; review extensions before Steps 3/4 | DR-02; KD-02/03/06/08/09/10/14/15; KD-16 interface boundary | Written schemas, examples and shared contract-test plan | COMPLETE |
+| I-02 | Joint | Integrate Store, fixed Manifest, MembershipRuntime, ReplicaService and ReplicaClient in one local node lifecycle | I-01; M-01/R-01/N-01/S-01; approved C1–C6; KD-16 local epoch fence only | Three-node loopback gossip/RPC, explicit bootstrap/recovery, SIGKILL generation recovery, bounded shutdown/rollback, all local suite checks | VERIFIED |
 | M-01 | Krishna | Membership adaptation and restart recovery | I-01; KD-03/04/05/07/14 | Fake-clock suspicion, retained owners, newer generation recovery, stale gossip, local TCP recovery | VERIFIED |
 | R-01 | Krishna | Hash/ring construction and routing | I-01; KD-02/03 | SHA-256 vectors, canonical manifest, cross-process five-owner selection, failed-owner stability | VERIFIED |
 | N-01 | Krishna | Concurrent bounded single-replica RPC client/service | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, total deadlines, response binding, overload and loopback store integration | VERIFIED |
@@ -1055,3 +1060,44 @@ write-completion flag. No automatic retries were added.
 Evidence is local and uses loopback sockets, temporary storage and a deterministic
 clock seam. No university VM, Batch 4 code, or Strong/Eventual coordinator was tested
 or implemented.
+
+## Batch 4 execution evidence — October 30, 2026
+
+`NodeRuntime` in `node.py` now connects the existing validated Manifest, local SQLite
+Store, MembershipRuntime, ReplicaService and ReplicaClient. Startup requires explicit
+bootstrap or recovery, verifies the persisted Store/context, advances restart
+generation exactly once through MembershipRuntime, then opens membership and KV
+listeners before setting local readiness. `python3 -B -m mp3.node` is a separate
+diagnostic entrypoint. It supports local node lifecycle and one-replica RPC only; it
+does not enable client-facing distributed PUT/GET or any of the eight commands.
+
+Local integration starts three logical VMs on real loopback sockets. It verifies
+gossip and consistent owner lists, remote READ_LOCAL and INSTALL_IF_NEWER against the
+target's real SQLite Store, empty versus missing values, a full 1 MiB binary value,
+concurrent requests while gossip proceeds, and a disposable VM06 subprocess SIGKILL
+and recovery on the same database. The recovered process retains its VM/ring identity,
+advances its durable generation, serves the committed value after peers converge, and
+rejects stale request/response/gossip evidence. Fixed owners do not change. Injected
+gossip and KV accept-thread startup failures verify listener and Store cleanup. A
+forced-shutdown regression verifies the initial incomplete report, retries after work
+exits, then joins workers and closes/reopens the database. No real VM was contacted.
+
+Independent review found two defects: retrying after an initially non-clean forced
+shutdown could leave the Store lock open permanently, and a gossip thread start error
+could make cleanup try to join an unstarted thread before closing the listener. The
+main agent fixed both, added regressions, and also checked KV accept-thread start
+rollback. Shutdown reports now refresh after retry, and cleanup preserves the original
+startup exception. The reviewer made no code changes and found no remaining issue.
+
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **127 tests passed in
+  15.013s**. The three focused shutdown/startup regressions passed separately in
+  **0.758s**.
+- Independent GPT-6 Luna/high reviewer: full suite — **127 tests passed in 14.830s**.
+- Main and reviewer: `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m compileall -q mp3`, and `git diff --check` — all exited 0.
+
+The Step 2 **local foundation gate is VERIFIED** for Batches 1–4. This says the
+individual components start together and pass local loopback/process acceptance tests;
+it does not establish ten-VM deployment readiness, real-cluster convergence, multi-owner
+protocol correctness, or demo-command readiness. Step 3 still requires its deferred
+Strong and Eventual design decisions before those coordinators are implemented.

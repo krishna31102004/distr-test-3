@@ -238,11 +238,11 @@ repair, full mode switching, or make the eight CLI commands operational. The API
 only the one-replica foundation. A blocked or timed out request is not a distributed
 key result.
 
-### What comes next?
+### What came next after Batch 3?
 
-Batch 4 will build on this complete local foundation: its coordinator can use the
-replica RPC to contact prescribed owners, while applying the approved consistency
-protocol rules. CLI integration and remaining steps stay in their planned order.
+At the time of the Batch 3 handoff, Batch 4 was planned to connect the tested
+components into one node runtime. That integration is now described in the Batch 4
+section below. It still does not coordinate requests across all prescribed owners.
 
 ### Batch 3 final shutdown and timeout corrections — October 30, 2026
 
@@ -276,5 +276,127 @@ checks used local
 processes, loopback sockets and temporary storage; no university VM was tested.
 
 Batch 3 is complete with these corrections. Distributed PUT/GET, Strong ABD,
-Eventual-noRR, Eventual-RR, read repair, complete CLI operations and Batch 4 are still
+Eventual-noRR, Eventual-RR, read repair and complete CLI operations are still
 unimplemented.
+
+## Batch 4 — Putting Everything Together
+
+**Batch 4 = Storage + Hashing + Membership + Networking working together.**
+
+So far, we had useful pieces: a database, a rule for choosing five owners, a way to
+track which processes are alive, and a way to send one request to one replica. Batch 4
+gives one VM a runtime that starts and stops those pieces in the right order.
+
+### Example: starting VM4
+
+VM4 reads the same ten-machine manifest as the other nodes. It opens its own SQLite
+database. If this is its first start, we must say `--bootstrap`; if its database
+already exists, we say `--recover`. Recovery checks that this database belongs to
+VM4 and keeps its saved values and versions.
+
+Before VM4 opens a network listener, its membership runtime saves the next restart
+generation in SQLite. On the first start this might be generation 1; after a crash,
+the next process might use generation 2. Only after that number is durable does VM4
+start its membership listener and gossip, then its KV replica listener. `READY` means
+these local pieces started. It does not mean all ten VMs are reachable.
+
+```text
++------------------------- NodeRuntime: VM4 --------------------------+
+| Fixed manifest/ring  -> the five prescribed owners for each key      |
+| SQLite Store        -> saved values, versions, mode, restart number  |
+| MembershipRuntime   -> alive/suspected peers and restart generations|
+| ReplicaService      -> accepts one local READ_LOCAL or INSTALL call  |
+| ReplicaClient       -> sends one replica request to another VM      |
++---------------------------------------------------------------------+
+```
+
+### One remote request, not a distributed PUT or GET
+
+For example, VM1 can send `READ_LOCAL("photo")` to VM4. VM4 checks the request,
+reads its own SQLite copy, and sends back the result. The answer can be FOUND, NOT_FOUND,
+or an error. If the saved value is `b""`, VM4 returns FOUND with an empty value; this
+is different from NOT_FOUND. VM1 can also send `INSTALL_IF_NEWER` with a version and
+bytes. VM4 only replies with a successful durable result after SQLite commits.
+
+VM4 is the example node above. In the actual three-node loopback test, the roles are
+vm01 (requester), vm02 (replica), and vm03 (peer); the separate crash/recovery test
+uses VM06.
+
+```text
+ vm01 (requester)            vm02 (replica)             vm03 (peer)
+      |                           |                          |
+      |--- membership gossip ---->|<----- gossip ----------->|
+      |                           |                          |
+      |--- READ_LOCAL("photo") -->|                          |
+      |                           |-- read vm02's SQLite    |
+      |<-- FOUND / NOT_FOUND -----|                          |
+      |                           |                          |
+```
+
+The picture shows one request to one replica. A full distributed GET must contact the
+prescribed replicas and apply Strong or Eventual rules; that is future work.
+
+### What happens when VM4 crashes?
+
+If VM4 stops suddenly, it cannot run cleanup. SQLite has already committed any write
+that received a durable success reply. The other machines can suspect VM4 after its
+heartbeats stop, but they keep VM4 in the key's five-owner list. They do not swap in a
+different machine. When VM4 starts again with `--recover`, it opens the same database,
+keeps the same VM and ring identity, and durably advances its restart generation.
+Gossip tells peers about the newer generation; delayed gossip from VM4's older process
+does not make that old process current again.
+
+On a normal stop, the runtime stops accepting new local RPC calls, drains accepted
+requests within its bounded shutdown period, stops listeners and gossip, and closes
+SQLite after active work has ended. If a short forced stop cannot finish, it reports
+incomplete requests and leaves the database open; after that work finishes, a caller
+can retry stop and release the lock. Persistent values are not deleted.
+
+### What Batch 4 actually implemented
+
+`mp3/node.py` adds `NodeRuntime`: it validates startup inputs, opens or recovers the
+SQLite Store, uses `MembershipRuntime` to advance the durable generation exactly
+once, then starts membership and KV listeners and creates a `ReplicaClient`. Its
+`owners(key)`, `membership`, `generation`, and `call_replica(...)` methods expose
+local state and one remote replica call. `python3 -B -m mp3.node --help` describes the
+separate diagnostic launcher. It does not replace `python3 -m mp3` or turn on the
+unfinished demo commands.
+
+`mp3/membership.py` now reports whether its service threads stopped, can retry a
+non-clean join, and safely cleans up when thread startup fails. `mp3/replica.py` can
+refresh a forced-shutdown result on a later stop attempt and reports whether the
+accept thread and workers joined. These small lifecycle changes let the runtime keep
+SQLite open until its workers are done.
+
+The local integration tests use temporary databases and loopback ports. They start
+three logical nodes and exercise real gossip and RPC sockets, verify remote empty,
+missing and 1 MiB binary values, and run concurrent replica requests while gossip
+continues. A disposable VM6 subprocess receives SIGKILL, then restarts from the same
+database with the next generation; tests check its saved value, stable owner list, peer
+convergence, and rejection of stale generation evidence. Other tests inject startup
+thread failures and retry an incomplete forced shutdown. These are local process and
+loopback tests; **no university VM was contacted**.
+
+Final local results:
+
+- `python3 -B -m unittest discover -s mp3/tests -v` — **127 tests passed in 15.013s**.
+- Independent GPT-6 Luna/high reviewer — **127 tests passed in 14.830s**.
+- Focused `test_gossip_thread_start_failure_rolls_back_membership_listener_and_store`,
+  `test_kv_accept_thread_start_failure_rolls_back_workers_listener_and_store`, and
+  `test_forced_node_shutdown_reports_incomplete_active_and_queued_requests` — **3
+  tests passed in 0.758s**.
+- `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m compileall -q mp3`, and `git diff --check` — all passed.
+
+### What Batch 4 does not implement yet
+
+It does not implement Strong ABD, Eventual-noRR, Eventual-RR, quorum coordination,
+read repair, full distributed PUT/GET, mode switching, benchmark experiments, or the
+completed demo commands. It does not show that ten real VMs can communicate.
+
+### What comes next?
+
+Step 3 is where Krishna and Juhi implement the actual consistency protocols: Strong
+ABD and Eventual-noRR, after reviewing the remaining protocol decisions. Those
+protocols can build on the tested Store, fixed owners, membership, and one-replica
+network call. The one-replica call by itself is not a distributed operation.

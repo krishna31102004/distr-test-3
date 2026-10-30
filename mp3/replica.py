@@ -130,7 +130,8 @@ class ReplicaService:
             self._stop.set()
             listener.close()
             for worker in self._workers:
-                worker.join(timeout=0.5)
+                if worker.ident is not None:
+                    worker.join(timeout=0.5)
             raise
 
     def _accept_loop(self) -> None:
@@ -363,7 +364,8 @@ class ReplicaService:
 
     def stop(self, *, timeout: float | None = None) -> ShutdownReport:
         """Stop admission and drain accepted work; bound forced shutdown explicitly."""
-        if self._stopped:
+        if (self._stopped and self._last_shutdown.workers_joined
+                and self._last_shutdown.incomplete_requests == 0):
             return self._last_shutdown
         budget = (self.request_timeout + 2 * float(getattr(self.store, "timeout", 5.0)) + 1.0
                   if timeout is None else timeout)
@@ -379,9 +381,14 @@ class ReplicaService:
             except OSError:
                 pass
         shutdown_deadline = time.monotonic() + budget
+        accept_joined = True
         if self._accept_thread is not None:
-            self._accept_thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
-            self._accept_thread = None
+            if self._accept_thread.ident is not None:
+                self._accept_thread.join(
+                    timeout=max(0.0, shutdown_deadline - time.monotonic()))
+                accept_joined = not self._accept_thread.is_alive()
+            if accept_joined:
+                self._accept_thread = None
 
         with self._condition:
             while self._outstanding and time.monotonic() < shutdown_deadline:
@@ -413,8 +420,9 @@ class ReplicaService:
                     pass
 
         for worker in self._workers:
-            worker.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
-        joined = all(not worker.is_alive() for worker in self._workers)
+            if worker.ident is not None:
+                worker.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+        joined = accept_joined and all(not worker.is_alive() for worker in self._workers)
         if joined:
             self._workers.clear()
         self._last_shutdown = ShutdownReport(incomplete, joined)

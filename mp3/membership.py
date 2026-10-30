@@ -492,15 +492,21 @@ class MembershipService:
             conn.close()
             self._slots.release()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop admission and wait for bounded handlers; report listener join."""
         self._stop.set()
         if self._server is not None:
             self._server.close()
             self._server = None
+        accept_joined = True
         if self._accept_thread is not None:
-            self._accept_thread.join(timeout=self.io_timeout + 1)
-            self._accept_thread = None
+            if self._accept_thread.ident is not None:
+                self._accept_thread.join(timeout=self.io_timeout + 1)
+                accept_joined = not self._accept_thread.is_alive()
+            if accept_joined:
+                self._accept_thread = None
         self._pool.shutdown(wait=True, cancel_futures=True)
+        return accept_joined
 
 
 class MembershipRuntime:
@@ -545,6 +551,7 @@ class MembershipRuntime:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = False
+        self._stop_report: bool | None = None
         self._rpc_pool = ThreadPoolExecutor(max_workers=fanout,
                                             thread_name_prefix="mp3-membership-gossip")
 
@@ -621,12 +628,31 @@ class MembershipRuntime:
             remaining = self.gossip_interval - (self._clock() - started)
             self._stop.wait(max(0.0, remaining))
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop gossip/listening and report whether their threads have joined."""
+        if self._stop_report is True:
+            return self._stop_report
         self._stop.set()
+        gossip_joined = True
         if self._thread is not None:
-            self._thread.join(timeout=max(2.0, self.rpc_timeout * 2))
-            self._thread = None
+            if self._thread.ident is not None:
+                self._thread.join(timeout=max(2.0, self.rpc_timeout * 2))
+                gossip_joined = not self._thread.is_alive()
+            else:
+                # A failed Thread.start() during partial startup is already stopped.
+                self._thread = None
         if self._service is not None:
-            self._service.stop()
-            self._service = None
+            listener_joined = self._service.stop()
+            if listener_joined:
+                self._service = None
+        else:
+            listener_joined = True
         self._rpc_pool.shutdown(wait=True, cancel_futures=True)
+        if self._thread is not None and self._thread.ident is not None \
+                and self._thread.is_alive():
+            self._thread.join(timeout=self.rpc_timeout + 0.5)
+            gossip_joined = not self._thread.is_alive()
+        if gossip_joined:
+            self._thread = None
+        self._stop_report = gossip_joined and listener_joined
+        return self._stop_report

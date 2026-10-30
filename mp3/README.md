@@ -1,9 +1,10 @@
 # CS 425 MP3: distributed key-value store
 
-**Batches 1–3 are implemented and locally tested. Distributed client-facing KV
+**Batches 1–4 are implemented and locally tested. Distributed client-facing KV
 operations remain unfinished.** The foundation includes local SQLite WAL/FULL
 storage, fixed SHA-256 ring ownership, restart-aware membership, and a bounded
-single-replica KV TCP request/response service. Quorum coordinators, consistency
+single-replica KV TCP request/response service, and an integrated node runtime.
+Quorum coordinators, consistency
 protocols, read repair, operational command integration and mode changes remain
 future work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
 
@@ -26,6 +27,7 @@ mp3/
   eventlog.py                  structured logs and local replica event lines
   ring.py                      ten-node manifest, SHA-256 IDs and five owners
   membership.py                retained suspicion, TCP gossip and restart recovery
+  node.py                      one-node lifecycle and diagnostic launcher
   legacy_membership.py         byte-identical MP2 reference; not the MP3 service
   cli.py, pending.py            parsing and NOT_IMPLEMENTED command boundary
   tests/                        standard-library local tests
@@ -44,9 +46,10 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 114 tests. It uses temporary SQLite directories, fake
+The suite currently has 127 tests. It uses temporary SQLite directories, fake
 clocks, subprocesses killed with SIGKILL, and temporary loopback membership and KV
-listeners. It contacts no university VM. The verified results and limits are recorded
+listeners. `tests/test_node_runtime.py` starts three logical VMs on loopback and also
+tests a separate-process crash/restart path. It contacts no university VM. The verified results and limits are recorded
 in the implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
 real VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
 
@@ -122,6 +125,42 @@ The storage engine uses a separate SQLite connection per operation, WAL and
 budget. It preserves present empty values separately from missing keys. A replica
 request passes its absolute service deadline into local storage so admission and
 SQLite lock waits do not get a fresh budget.
+
+## Start one local node runtime
+
+`python3 -B -m mp3.node` is a diagnostic node entrypoint, separate from the existing
+`python3 -m mp3` command parser. It starts one logical VM's local SQLite store,
+membership listener/gossip, and single-replica KV listener. It does not run a
+distributed client PUT or GET. Supply a valid ten-node manifest with separate KV,
+membership and log-query endpoints. Create the database and log parent directories
+first; the node does not create or replace them implicitly:
+
+```bash
+mkdir -p data logs
+python3 -B -m mp3.node --vm-id vm01 --manifest ./manifest.json \
+  --db ./data/vm01.sqlite --bootstrap --log ./logs/vm01.jsonl
+```
+
+Use `--bootstrap` only for a new database. It creates Strong epoch 1 by default;
+`--bootstrap-mode eventual-noRR` is available for explicitly disposable local
+protocol tests. For an existing VM database, use `--recover` instead; its persisted
+identity, mode, epoch, records and restart metadata are validated and preserved.
+The entrypoint prints local `READY` only after membership and KV listeners start.
+That does not mean the other nine VMs are reachable. Press Ctrl-C or send SIGTERM
+for bounded shutdown. A forced non-clean stop is reported and the runtime can retry
+shutdown after outstanding work exits; SQLite remains open until accepted storage
+work has ended.
+
+```bash
+python3 -B -m mp3.node --help
+```
+
+For local integration, `NodeRuntime.from_files(...)` reads the manifest; `start()`
+performs ordered startup; `owners(key)`, `membership`, `generation`, and
+`call_replica(...)` expose diagnostics and one remote READ_LOCAL or INSTALL_IF_NEWER
+operation; `stop()` returns a `NodeShutdownReport`. A call reaches one replica only.
+Strong ABD, Eventual coordinators, quorum behavior, all-owner propagation and repair
+remain future work.
 
 ## Single-replica RPC foundation
 

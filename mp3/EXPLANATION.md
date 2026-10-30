@@ -1,8 +1,8 @@
-# Understanding MP3 and its verified Batch 1–3 foundations
+# Understanding MP3 and its verified Batch 1–4 foundations
 
 This guide describes the actual files. Batch 1's local durable SQLite store, Batch 2's
-fixed ring and membership service, and Batch 3's single-replica TCP RPC path are
-implemented and locally reviewed. **Distributed client-facing GET/PUT is still
+fixed ring and membership service, Batch 3's single-replica TCP RPC path, and Batch 4's
+integrated local node lifecycle are implemented and locally reviewed. **Distributed client-facing GET/PUT is still
 pending**: no coordinator, quorum, consistency protocol, read repair, or mode-switch
 service exists. Approved contracts and evidence are in IMPLEMENTATION_PLAN.md and
 KEY_DECISIONS.md. A local replica read/install is not a distributed GET/PUT.
@@ -257,7 +257,7 @@ READ_LOCAL or INSTALL_IF_NEWER. It does not schedule replication or repair.
 | `._emit` | Request and receive/respond phase → professor terminal line plus optional structured log; key control chars escaped, values omitted | I; KD-17 primitive only |
 | `._process` | Valid request and absolute deadline → mapped storage response; passes same deadline to storage so admission and SQLite lock waits cannot restart the RPC budget | I; C3/C5/C6 |
 | `._handle` | Socket and deadline → fully validates, logs receipt, dispatches once, sends actual response only within the deadline, then closes | I; C5/C6 |
-| `.stop` | Optional finite shutdown budget → `ShutdownReport`; stops admission, drains within the grace budget, drops and counts queued requests only on forced stop, interrupts active sockets, and reports unfinished work and whether workers joined | I; C6 |
+| `.stop` | Optional finite shutdown budget → refreshed `ShutdownReport`; stops admission, drains within the grace budget, drops and counts queued requests only on forced stop, interrupts active sockets, and reports unfinished work and whether workers joined. A non-clean stop can be retried to observe completed workers and release Store safely | I; C6 |
 
 The deadline passed into SQLite bounds queue admission, lock waits, transaction work
 and the pre-commit check. An OS/filesystem call that itself blocks cannot be cancelled
@@ -328,7 +328,7 @@ gossip fanout are bounded.
 | `exchange_gossip` | Endpoint, envelope, manifest and timeout → peer's full snapshot; one TCP connection, length frame, fixed deadline; no special introducer | I; KD-05/06 |
 | `MembershipService.__init__`, `start`, `_accept_loop`, `_handle`, `stop` | Bind the configured membership endpoint, admit bounded service workers, validate/merge gossip and reply with a snapshot; shutdown closes listener and drains workers | I; KD-05/07 |
 | `MembershipRuntime.__init__`, `generation`, `start` | Store, manifest and detector/gossip settings → runtime; on start recover context, reserve `Store.start_incarnation()` once per store path per process, then permit listener/background loop | I; C2 |
-| `MembershipRuntime.gossip_round`, `_run`, `stop` | Tick/check, probe up to configured fanout, merge responses, repeat at configured interval, stop bounded workers/listener | I; KD-04/05 |
+| `MembershipRuntime.gossip_round`, `_run`, `stop` | Tick/check, probe up to configured fanout, merge responses, repeat at configured interval; stop reports whether listener/gossip threads joined, can retry failed joins, and avoids joining a thread that never started | I; KD-04/05/14, Batch 4 lifecycle |
 
 For recovery when VM01 (the usual introducer) is unreachable, each runtime contacts
 peers directly from the immutable ten-node manifest. A local TCP test left VM01 down
@@ -342,6 +342,45 @@ gets its next durable generation from SQLite. The runtime uses Batch 1
 the caller closes its Store after stopping the runtime. It does not implement KV RPC,
 join/leave, consistency epochs, automatic membership persistence, or cluster mode
 changes. The full membership network runs locally in tests only at this stage.
+
+### `node.py` — integrated local node lifecycle (Batch 4; C1–C6 foundations)
+
+`NodeRuntime` owns one validated manifest/VM identity, one durable Store, one
+MembershipRuntime/table, one ReplicaService, one ReplicaClient, optional logging,
+and local lifecycle state. It is intentionally not a distributed coordinator. The
+entrypoint `python3 -B -m mp3.node` is independent of `mp3.__main__` and does not
+change the eight command guards.
+
+| Function/method | Inputs → output; internal behavior | Callers / dependencies | Status / decisions |
+|---|---|---|---|
+| `NodeShutdownReport.clean`, `.incomplete_requests` | No inputs → derived bool/count from replica report, outstanding client calls, membership join and Store close state; clean also requires zero incomplete requests | `NodeRuntime.stop`; `ShutdownReport` | I; KD-07/08/14, C6 |
+| `NodeRuntime.__init__` | Validated Manifest, VM ID, DB path, explicit bootstrap/recovery, optional mode/logging and bounded capacities → unopened runtime; rejects invalid identity/bootstrap combinations | `from_files`, local tests; ring/types | I; KD-01/02/03/09/14/15, C1–C6 |
+| `from_files` | Manifest path and explicit node/database lifecycle → runtime; loads and validates manifest before runtime creation | CLI `main`, tests; `load_manifest` | I; KD-02/03, C1 |
+| `ready`, `context`, `generation`, `membership` | No inputs → local readiness or current Store/runtime state; context/generation/membership reject reads before ready | CLI, callers/tests | I; KD-03/09/14, C1–C4 |
+| `owners(key)` | UTF-8 key → fixed five prescribed `Node`s independent of liveness | diagnostics/tests; `Manifest.owners` | I; KD-02, C1 |
+| `list_mem_ids()` | No inputs → diagnostic membership rows including suspected nodes, ordered by numeric ring ID | tests/future command; `MembershipTable` | I; KD-02/04, C1/C2; command remains guarded |
+| `start()` | No inputs → this ready runtime; explicitly opens/recovers Store/context, configures logging, starts MembershipRuntime (the sole durable generation increment), then replica listener, then client, and finally marks local readiness. Any failure attempts cleanup while preserving the startup error | CLI `main`, context manager, tests; storage, membership, replica, rpc | I; KD-03/04/05/07/09/14/16 local epoch, C1–C6 |
+| `_cleanup_failed_start()` | No inputs → None; stops whichever services started and closes Store only when membership and replica workers joined; cleanup exceptions do not replace the original startup failure | `start` exception path; membership/replica/store | I; KD-03/07/14, C2/C3/C6 |
+| `call_replica(target_id, op, key, deadline, version?, value?)` | One prescribed target and absolute monotonic deadline → one `RpcOutcome`; increments local active-call accounting, creates request from current context and durable sender generation, calls one target, then decrements accounting. It does not gather owners or calculate a quorum | callers/tests; `new_request`, `ReplicaClient`, live membership table | I; KD-03/06/07/08/10/14/15/16, C3/C5/C6 |
+| `stop(timeout)` | Nonnegative finite shutdown budget → `NodeShutdownReport`; stops new calls, drains/forces replica work, stops membership, waits client calls and closes Store only after workers and calls are done. An incomplete stop can be retried; later reports refresh joins/work and release the DB lock after work exits | CLI signal path, context manager, tests | I; KD-07/08/14, C6 |
+| `_close_logger()` | No inputs → None; removes/closes this runtime's handlers | startup rollback and stop | I; KD-17 |
+| `__enter__`, `__exit__` | Context-manager entry starts; exit stops and raises if shutdown remains incomplete without an earlier exception | Python `with` users | I; KD-14, C6 |
+| `_parser()` | No inputs → argparse parser for `--vm-id`, `--manifest`, `--db`, explicit `--bootstrap`/`--recover`, optional bootstrap mode and log | `main`, command help | I; C1/C2/C6 |
+| `main(argv?)` | CLI args → process exit code; starts one node, prints local READY, waits for SIGINT/SIGTERM, then prints shutdown evidence. It rejects bootstrap mode on recovery and performs no remote deployment | `python -m mp3.node`; NodeRuntime | I; KD-03/07/14, C1–C6 |
+
+The startup contract matters because a listener must never receive requests before
+this process has durably advanced and installed its restart generation. Recovery
+never invents a database or replaces the persisted context. A `READY` line only says
+this one node's local services bound successfully; peers may still be unavailable.
+On partial startup, started listeners and locks are released. If forced shutdown
+cannot join workers immediately, the Store stays open and a later `stop()` retry can
+finish cleanup; callers must not report clean shutdown before that succeeds.
+`MembershipRuntime.stop()` reports thread joins and can retry a failed join; it
+skips joining a thread whose `start()` itself failed.
+
+`python3 -B -m mp3.node` supports only single-replica READ_LOCAL and INSTALL_IF_NEWER
+through the programmatic `call_replica` primitive. It does not enable distributed
+PUT/GET or any CLI operation.
 
 ### `eventlog.py`
 
@@ -434,6 +473,40 @@ outputs are the unittest pass/fail report, not KV outcomes. Decision IDs identif
 the contract being checked; protocol work beyond the approved local foundation is
 not implied. Constructors and setUp helpers are called by unittest or their named
 test methods.
+
+### `tests/test_node_runtime.py` — integrated lifecycle and local multi-node behavior (Batch 4)
+
+`NodeRuntimeTests.setUp` creates ten validated loopback identities and a temporary
+manifest/database directory. Three-node tests use real membership and KV TCP sockets;
+the recovery test launches disposable local processes and sends SIGKILL only to its
+own VM06 child. No test contacts a university VM.
+
+The module helpers are test-only: `_free_port(reserved)` binds port 0 and returns a
+distinct loopback port; `local_manifest()` builds ten identities with separate KV,
+membership and log-query endpoints; `replace_row()` changes one row in a test snapshot;
+and `wait_until(predicate, timeout, description)` polls against a monotonic deadline.
+`setUp()` creates a temporary directory/manifest, `node()` constructs one runtime for
+it, `_member()` looks up one membership row, and `_wait_known_generations()` waits for
+gossip convergence. `_start_cli()` launches a disposable node process and waits for
+its READY line, `_stop_cli()` signals and collects that process, and
+`_target_accepts_requester()` checks remote membership acceptance with a real read
+request. None of these helpers is part of the production API.
+
+| Test method | Fixture/internal behavior → expected assertion |
+|---|---|
+| `test_explicit_bootstrap_defaults_strong_and_stops_without_deleting_data` | Starts VM04 → Strong epoch 1 and generation 1 are ready; stops, reopens SQLite, and confirms stored identity/context survive |
+| `test_explicit_disposable_eventual_bootstrap_is_supported` | Explicit test mode bootstrap → Eventual-RR context; clean stop |
+| `test_identity_manifest_and_bootstrap_recovery_inputs_fail_closed` | Invalid VM, recovery mode flag, absent/corrupt store and malformed manifest → rejected without serving |
+| `test_sqlite_database_lock_fails_startup_within_store_budget` | Separate writer holds SQLite lock → startup fails within configured budget, then database reopens |
+| `test_existing_database_is_never_implicitly_bootstrapped_or_reidentified` | Existing store passed to bootstrap or different VM identity → fail without replacing data; legitimate identity can reopen |
+| `test_failure_after_membership_start_releases_listener_and_store_lock` | Occupied KV port after membership starts → rollback closes membership endpoint and Store |
+| `test_membership_port_conflict_closes_database_without_starting_kv` | Occupied membership endpoint → Store lock released and KV endpoint never binds |
+| `test_gossip_thread_start_failure_rolls_back_membership_listener_and_store` | Inject gossip thread start error after membership listener binds → original error propagates, listener rebinds, DB reopens |
+| `test_kv_accept_thread_start_failure_rolls_back_workers_listener_and_store` | Inject KV accept thread start error after replica workers start → workers join, KV and membership endpoints rebind, DB reopens |
+| `test_forced_node_shutdown_reports_incomplete_active_and_queued_requests` | One active plus one queued socket with a very short shutdown → first report is non-clean with two incomplete; release work, retry stop, then report clean and reopen DB |
+| `test_real_three_node_gossip_rpc_binary_values_and_concurrency` | Three real loopback NodeRuntime instances → gossip generations/owners agree; remote empty/missing and full 1 MiB values round-trip; concurrent installs run while gossip progresses |
+| `test_subprocess_sigkill_recovery_gossip_and_stale_evidence` | VM06 child serves a committed value, receives SIGKILL, restarts on same DB with generation 2 → peers learn recovery, stale request/response/gossip is rejected, ring owners remain fixed |
+| `test_sigterm_shutdown_reports_success_and_recovery_keeps_context` | Launch CLI child, SIGTERM, recover same DB → clean shutdown and exactly one new generation with persisted context |
 
 ### `tests/test_storage.py` — local SQLite and version foundation (C2/C3/C4/C6)
 
