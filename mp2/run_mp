@@ -1,0 +1,77 @@
+#!/bin/bash
+
+USER="kbalaji4"
+REMOTE_DIR="fa26_cs425_.group-mp_.team-48/mp2"
+
+if [ $# -ne 1 ]; then
+    echo "Usage: ./run_mp <vm_number>"
+    exit 1
+fi
+
+vm_number=$1
+
+if ! [[ "$vm_number" =~ ^[0-9]+$ ]] ||
+   [ "$vm_number" -lt 1 ] ||
+   [ "$vm_number" -gt 10 ]; then
+    echo "VM number must be between 1 and 10"
+    exit 1
+fi
+
+host_suffix=$((4800 + vm_number))
+hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+echo "VM ${vm_number}: ${hostname}"
+
+# Do not start a duplicate copy of this node.
+existing_pid=$(ssh "${USER}@${hostname}" \
+    "pgrep -f \"^python3 node.py ${vm_number}\$\"" 2>/dev/null)
+
+if [ -n "$existing_pid" ]; then
+    echo "VM ${vm_number} is already running with PID ${existing_pid}"
+    exit 0
+fi
+
+# Make sure the remote MP2 directory exists.
+if ! ssh "${USER}@${hostname}" \
+    "mkdir -p ~/${REMOTE_DIR}"; then
+    echo "ERROR: could not create remote directory on VM ${vm_number}"
+    exit 1
+fi
+
+# Recreate stdin and terminal-output files for this process.
+# machine.<vm>.log is intentionally NOT removed; node.py appends to it.
+if ! ssh "${USER}@${hostname}" \
+    "cd ~/${REMOTE_DIR} && \
+     rm -f mp2_cmd && \
+     mkfifo mp2_cmd && \
+     rm -f node.out"; then
+    echo "ERROR: failed to prepare VM ${vm_number}"
+    exit 1
+fi
+
+# Keep the FIFO open on fd 3 so node.py's input() does not receive EOF.
+ssh -f "${USER}@${hostname}" \
+    "cd ~/${REMOTE_DIR} && \
+     exec bash -c 'exec 3<>mp2_cmd; exec env PYTHONUNBUFFERED=1 python3 node.py ${vm_number} <&3 > node.out 2>&1'"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: SSH launch failed on VM ${vm_number}"
+    exit 1
+fi
+
+sleep 2
+
+new_pid=$(ssh "${USER}@${hostname}" \
+    "pgrep -f \"^python3 node.py ${vm_number}\$\"" 2>/dev/null)
+
+if [ -n "$new_pid" ]; then
+    echo "VM ${vm_number}: PID ${new_pid} started"
+else
+    echo "ERROR: VM ${vm_number} failed to start"
+    echo "----- node.out -----"
+
+    ssh "${USER}@${hostname}" \
+        "cat ~/${REMOTE_DIR}/node.out 2>/dev/null || true"
+
+    exit 1
+fi

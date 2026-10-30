@@ -1,0 +1,53 @@
+# OS metadata and archive sidecars
+.DS_Store
+__MACOSX/
+mp3.zip
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime state, databases, and logs
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.db-wal
+*.db-shm
+*.db-journal
+*.log
+logs/
+runtime/
+data/
+results/
+
+# Local environment and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+credentials.json
+secrets.json
+id_rsa
+id_ed25519
+
+# Editor temporary files
+*.swp
+*.swo
+*~

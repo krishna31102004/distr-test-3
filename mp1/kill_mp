@@ -1,0 +1,13 @@
+#!/bin/bash
+USER="kbalaji4"
+
+vm_number=$1
+host_suffix=$((4800 + vm_number))
+hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+pid=$(ssh ${USER}@${hostname} "pgrep -f \"^python3 server.py ${vm_number}\$\"")
+
+if [ -n "$pid" ]; then
+    ssh ${USER}@${hostname} "kill -9 ${pid} 2>/dev/null"
+    echo "VM ${vm_number}, PID ${pid}"
+fi

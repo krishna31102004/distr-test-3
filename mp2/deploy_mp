@@ -1,0 +1,154 @@
+#!/bin/bash
+
+USER="kbalaji4"
+REMOTE_DIR="fa26_cs425_.group-mp_.team-48/mp2"
+LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+    echo "Usage: ./deploy_mp <vm_number> [vm_number ...]"
+    echo "       ./deploy_mp all"
+    echo ""
+    echo "Examples:"
+    echo "  ./deploy_mp 1"
+    echo "  ./deploy_mp 2 3 4 5"
+    echo "  ./deploy_mp 6 7 8 9 10"
+    echo "  ./deploy_mp all"
+}
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+if [ "$1" = "all" ]; then
+    if [ $# -ne 1 ]; then
+        echo "ERROR: use either './deploy_mp all' or specific VM numbers"
+        exit 1
+    fi
+    VMS=(1 2 3 4 5 6 7 8 9 10)
+else
+    VMS=("$@")
+fi
+
+for vm_number in "${VMS[@]}"; do
+    if ! [[ "$vm_number" =~ ^([1-9]|10)$ ]]; then
+        echo "ERROR: invalid VM number: $vm_number"
+        echo "VM numbers must be between 1 and 10."
+        exit 1
+    fi
+done
+
+for file in node.py membership.py protocol.py machines.txt; do
+    if [ ! -f "${LOCAL_DIR}/${file}" ]; then
+        echo "ERROR: missing local file: ${LOCAL_DIR}/${file}"
+        exit 1
+    fi
+done
+
+echo ""
+echo "Deploying to VMs: ${VMS[*]}"
+echo ""
+
+# Stop old copies only on the selected VMs.
+pids=()
+for vm_number in "${VMS[@]}"; do
+    "${LOCAL_DIR}/kill_mp" "$vm_number" &
+    pids+=($!)
+done
+
+kill_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        kill_failed=1
+    fi
+done
+
+if [ "$kill_failed" -ne 0 ]; then
+    echo "ERROR: could not stop all selected VMs"
+    exit 1
+fi
+
+# Copy all files before starting any of the selected nodes.
+pids=()
+for vm_number in "${VMS[@]}"; do
+    (
+        host_suffix=$((4800 + vm_number))
+        hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+        echo "VM ${vm_number}: copying files"
+
+        ssh "${USER}@${hostname}" \
+            "mkdir -p ~/${REMOTE_DIR}" || exit 1
+
+        scp \
+            "${LOCAL_DIR}/node.py" \
+            "${LOCAL_DIR}/membership.py" \
+            "${LOCAL_DIR}/protocol.py" \
+            "${LOCAL_DIR}/machines.txt" \
+            "${USER}@${hostname}:~/${REMOTE_DIR}/" || exit 1
+
+        echo "VM ${vm_number}: files copied"
+    ) &
+    pids+=($!)
+done
+
+copy_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        copy_failed=1
+    fi
+done
+
+if [ "$copy_failed" -ne 0 ]; then
+    echo "ERROR: deployment stopped because at least one file copy failed"
+    exit 1
+fi
+
+echo ""
+echo "All files copied. Starting selected nodes..."
+echo ""
+
+# If VM1 is part of this deployment, start the introducer first.
+has_introducer=0
+for vm_number in "${VMS[@]}"; do
+    if [ "$vm_number" -eq 1 ]; then
+        has_introducer=1
+        break
+    fi
+done
+
+if [ "$has_introducer" -eq 1 ]; then
+    if ! "${LOCAL_DIR}/run_mp" 1; then
+        echo "ERROR: introducer VM 1 failed to start"
+        exit 1
+    fi
+fi
+
+# Start the remaining selected nodes at roughly the same time.
+pids=()
+for vm_number in "${VMS[@]}"; do
+    if [ "$vm_number" -eq 1 ]; then
+        continue
+    fi
+
+    "${LOCAL_DIR}/run_mp" "$vm_number" &
+    pids+=($!)
+done
+
+start_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        start_failed=1
+    fi
+done
+
+if [ "$start_failed" -ne 0 ]; then
+    echo "ERROR: at least one VM failed to start"
+    exit 1
+fi
+
+echo ""
+echo "========================================"
+echo "MP2 deployment complete"
+echo "Running VMs: ${VMS[*]}"
+echo "========================================"

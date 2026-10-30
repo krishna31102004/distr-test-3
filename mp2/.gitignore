@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Experiment output
+results/
+
+# Local/debug files
+machine.*.log
+measure_plain_failure.py
+
+# macOS
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+
+# Temporary files
+*.swp
+*.swo
+*~

@@ -1,0 +1,49 @@
+#!/bin/bash
+
+USER="kbalaji4"
+REMOTE_DIR="fa26_cs425_.group-mp_.team-48/mp2"
+
+vm_number=$1
+shift
+
+if [ -z "$vm_number" ]; then
+    echo "Usage: ./cmd_mp <vm_number> <command>"
+    exit 1
+fi
+
+if ! [[ "$vm_number" =~ ^[0-9]+$ ]] ||
+   [ "$vm_number" -lt 1 ] ||
+   [ "$vm_number" -gt 10 ]; then
+
+    echo "VM number must be between 1 and 10"
+    exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "Usage: ./cmd_mp <vm_number> <command>"
+    exit 1
+fi
+
+command="$*"
+
+host_suffix=$((4800 + vm_number))
+hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+pid=$(ssh ${USER}@${hostname} \
+    "pgrep -f \"^python3 node.py ${vm_number}\$\"" 2>/dev/null)
+
+if [ -z "$pid" ]; then
+    echo "ERROR: VM ${vm_number}: node.py is not running"
+    exit 1
+fi
+
+echo "VM ${vm_number} <- ${command}"
+
+printf '%s\n' "$command" | \
+ssh ${USER}@${hostname} \
+    "cat > ~/${REMOTE_DIR}/mp2_cmd"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: failed to send command to VM ${vm_number}"
+    exit 1
+fi

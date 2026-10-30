@@ -1,0 +1,81 @@
+#!/bin/bash
+
+USER="kbalaji4"
+REMOTE_DIR="fa26_cs425_.group-mp_.team-48/mp2"
+
+usage() {
+    echo "Usage: ./reset_logs <vm_number> [vm_number ...]"
+    echo "       ./reset_logs all"
+    echo ""
+    echo "Run this only before a fresh demo/practice session."
+}
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+if [ "$1" = "all" ]; then
+    if [ $# -ne 1 ]; then
+        echo "ERROR: use either './reset_logs all' or specific VM numbers"
+        exit 1
+    fi
+    VMS=(1 2 3 4 5 6 7 8 9 10)
+else
+    VMS=("$@")
+fi
+
+for vm_number in "${VMS[@]}"; do
+    if ! [[ "$vm_number" =~ ^([1-9]|10)$ ]]; then
+        echo "ERROR: invalid VM number: $vm_number"
+        echo "VM numbers must be between 1 and 10."
+        exit 1
+    fi
+done
+
+# Refuse to erase evidence from a currently running demo.
+for vm_number in "${VMS[@]}"; do
+    host_suffix=$((4800 + vm_number))
+    hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+    pid=$(ssh "${USER}@${hostname}" \
+        "pgrep -f \"^python3 node.py ${vm_number}\$\"" 2>/dev/null)
+
+    if [ -n "$pid" ]; then
+        echo "ERROR: VM ${vm_number} is still running with PID ${pid}"
+        echo "Stop running nodes before resetting logs."
+        exit 1
+    fi
+done
+
+echo "Resetting logs on VMs: ${VMS[*]}"
+
+pids=()
+for vm_number in "${VMS[@]}"; do
+    (
+        host_suffix=$((4800 + vm_number))
+        hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+        ssh "${USER}@${hostname}" \
+            "mkdir -p ~/${REMOTE_DIR} && \
+             rm -f ~/${REMOTE_DIR}/machine.${vm_number}.log \
+                   ~/${REMOTE_DIR}/node.out" || exit 1
+
+        echo "VM ${vm_number}: logs reset"
+    ) &
+    pids+=($!)
+done
+
+reset_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        reset_failed=1
+    fi
+done
+
+if [ "$reset_failed" -ne 0 ]; then
+    echo "ERROR: at least one VM could not be reset"
+    exit 1
+fi
+
+echo "Log reset complete."

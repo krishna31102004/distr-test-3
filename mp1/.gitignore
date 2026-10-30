@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+*.swp
+
+# Log files (generated per-VM, never committed - each VM has its own real demo data)
+machine.*.log
+*.log
+
+# Live Share / VS Code collaboration
+.vsls.json
+
+# Environment/secrets
+.env
+.env.*

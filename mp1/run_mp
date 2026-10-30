@@ -1,0 +1,12 @@
+#!/bin/bash
+USER="kbalaji4"
+REPO_DIR="fa26_cs425_.group-mp_.team-48/mp1"
+
+vm_number=$1
+host_suffix=$((4800 + vm_number))
+hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+ssh -f ${USER}@${hostname} "cd ~/${REPO_DIR} && python3 server.py ${vm_number} > server.log 2>&1"
+sleep 2
+pid=$(ssh ${USER}@${hostname} "pgrep -f \"^python3 server.py ${vm_number}\$\"")
+echo "VM ${vm_number}, PID ${pid}"

@@ -1,0 +1,4 @@
+# Bootstrap example only: no listeners start and no production ports are chosen.
+# label host port (labels are not ring positions)
+vm1 127.0.0.1 42001
+vm2 127.0.0.1 42002

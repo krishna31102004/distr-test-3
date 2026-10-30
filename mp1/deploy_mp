@@ -1,0 +1,22 @@
+#!/bin/bash
+USER="kbalaji4"
+REPO_DIR="fa26_cs425_.group-mp_.team-48/mp1"
+LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+for vm_number in $(seq 1 10); do
+    host_suffix=$((4800 + vm_number))
+    hostname="fa26-cs425-${host_suffix}.cs.illinois.edu"
+
+    pid=$(ssh ${USER}@${hostname} "pgrep -f \"^python3 server.py ${vm_number}\$\"")
+    if [ -n "$pid" ]; then
+        ssh ${USER}@${hostname} "kill -9 ${pid}"
+        echo "VM ${vm_number}, PID ${pid} (killed)"
+    fi
+
+    scp ${LOCAL_DIR}/server.py ${LOCAL_DIR}/client.py ${LOCAL_DIR}/protocol.py ${LOCAL_DIR}/machines.txt ${USER}@${hostname}:~/${REPO_DIR}/
+
+    ssh -f ${USER}@${hostname} "cd ~/${REPO_DIR} && python3 server.py ${vm_number} > server.log 2>&1"
+    sleep 2
+    new_pid=$(ssh ${USER}@${hostname} "pgrep -f \"^python3 server.py ${vm_number}\$\"")
+    echo "VM ${vm_number}, PID ${new_pid} (started)"
+done
