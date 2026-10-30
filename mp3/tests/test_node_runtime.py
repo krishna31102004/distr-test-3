@@ -315,6 +315,197 @@ class NodeRuntimeTests(unittest.TestCase):
         with open_store(self.root / "vm05.sqlite", vm_id="vm05") as reopened:
             self.assertEqual(reopened.current_context(), Context(1, ConsistencyMode.STRONG))
 
+    def test_admitted_call_keeps_context_and_generation_through_shutdown(self):
+        node = self.node("vm01", gossip_background=False).start()
+        self.addCleanup(node.stop)
+        constructing = threading.Event()
+        allow_construction = threading.Event()
+        shutdown_entered = threading.Event()
+        draining_call = threading.Event()
+        call_finished = threading.Event()
+        stop_finished = threading.Event()
+        captured = []
+        rpc_result = object()
+        call_errors = []
+        stop_results = []
+        real_new_request = new_request
+        real_service_stop = node.replica_service.stop
+        real_condition_wait = node._calls.wait
+
+        def gated_new_request(**kwargs):
+            constructing.set()
+            if not allow_construction.wait(3):
+                raise AssertionError("request construction gate was not released")
+            return real_new_request(**kwargs)
+
+        def fake_call(target, request, *, deadline):
+            captured.append((target.vm_id, request, deadline))
+            return rpc_result
+
+        def observed_service_stop(*, timeout=None):
+            shutdown_entered.set()
+            return real_service_stop(timeout=timeout)
+
+        def observed_condition_wait(timeout=None):
+            draining_call.set()
+            return real_condition_wait(timeout)
+
+        node.rpc_client.call_replica = fake_call
+        node.replica_service.stop = observed_service_stop
+        node._calls.wait = observed_condition_wait
+        request_patch = mock.patch("mp3.node.new_request", side_effect=gated_new_request)
+        request_patch.start()
+        self.addCleanup(request_patch.stop)
+
+        def invoke():
+            try:
+                result = node.call_replica(
+                    "vm02", RpcOperation.INSTALL_IF_NEWER, "admitted",
+                    deadline=time.monotonic() + 4,
+                    version=Version("strong", 9, "vm01/1"), value=b"captured")
+                self.assertIs(result, rpc_result)
+            except BaseException as error:
+                call_errors.append(error)
+            finally:
+                call_finished.set()
+
+        def stop_node():
+            try:
+                stop_results.append(node.stop(timeout=3))
+            except BaseException as error:
+                call_errors.append(error)
+            finally:
+                stop_finished.set()
+
+        caller = threading.Thread(target=invoke)
+        stopper = threading.Thread(target=stop_node)
+        caller.start()
+        try:
+            self.assertTrue(constructing.wait(2), "call did not reach request construction")
+            self.assertEqual(node._active_calls, 1)
+            stopper.start()
+            self.assertTrue(shutdown_entered.wait(2), "shutdown did not close admission")
+            self.assertFalse(node.ready)
+            self.assertTrue(draining_call.wait(3), "shutdown did not wait for admitted call")
+            self.assertFalse(stop_finished.is_set(), "shutdown skipped an admitted call")
+            allow_construction.set()
+            self.assertTrue(call_finished.wait(2), "admitted RPC did not finish")
+            self.assertTrue(stop_finished.wait(4), "shutdown did not finish after RPC")
+            stopper.join(timeout=1)
+        finally:
+            allow_construction.set()
+            caller.join(timeout=2)
+            if stopper.ident is not None:
+                stopper.join(timeout=4)
+
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(call_errors, [])
+        self.assertEqual(len(captured), 1)
+        target_id, request, _deadline = captured[0]
+        self.assertEqual(target_id, "vm02")
+        self.assertEqual(request.sender_generation, 1)
+        self.assertEqual((request.epoch, request.mode), (1, ConsistencyMode.STRONG))
+        self.assertEqual((request.op, request.version, request.value),
+                         (RpcOperation.INSTALL_IF_NEWER,
+                          Version("strong", 9, "vm01/1"), b"captured"))
+        self.assertEqual(node._active_calls, 0)
+        self.assertTrue(stop_results[0].clean, stop_results[0])
+        self.assertTrue(stop_results[0].store_closed)
+
+    def test_shutdown_closes_call_admission_before_later_rpc_attempt(self):
+        node = self.node("vm02", gossip_background=False).start()
+        self.addCleanup(node.stop)
+        service_stop_entered = threading.Event()
+        release_service_stop = threading.Event()
+        stop_finished = threading.Event()
+        stop_results = []
+        stop_errors = []
+        real_service_stop = node.replica_service.stop
+
+        def gated_service_stop(*, timeout=None):
+            service_stop_entered.set()
+            if not release_service_stop.wait(3):
+                raise AssertionError("service shutdown gate was not released")
+            return real_service_stop(timeout=timeout)
+
+        node.replica_service.stop = gated_service_stop
+
+        def stop_node():
+            try:
+                stop_results.append(node.stop(timeout=4))
+            except BaseException as error:
+                stop_errors.append(error)
+            finally:
+                stop_finished.set()
+
+        stopper = threading.Thread(target=stop_node)
+        stopper.start()
+        try:
+            self.assertTrue(service_stop_entered.wait(2), "shutdown did not begin")
+            self.assertFalse(node.ready)
+            with self.assertRaisesRegex(RuntimeError, "not accepting RPC calls"):
+                node.call_replica("vm03", RpcOperation.READ_LOCAL, "too-late",
+                                  deadline=time.monotonic() + 2)
+            self.assertEqual(node._active_calls, 0)
+        finally:
+            release_service_stop.set()
+            stopper.join(timeout=5)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(stop_errors, [])
+        self.assertTrue(stop_finished.is_set())
+        self.assertTrue(stop_results[0].clean, stop_results[0])
+
+    def test_forced_node_stop_reports_admitted_rpc_and_closes_store_only_after_retry(self):
+        node = self.node("vm03", gossip_background=False).start()
+        self.addCleanup(node.stop)
+        entered_rpc = threading.Event()
+        release_rpc = threading.Event()
+        call_finished = threading.Event()
+        call_errors = []
+        rpc_result = object()
+
+        def blocked_rpc(_target, _request, *, deadline):
+            entered_rpc.set()
+            if not release_rpc.wait(4):
+                raise AssertionError("RPC release gate was not signaled")
+            return rpc_result
+
+        node.rpc_client.call_replica = blocked_rpc
+
+        def invoke():
+            try:
+                self.assertIs(node.call_replica(
+                    "vm04", RpcOperation.READ_LOCAL, "forced",
+                    deadline=time.monotonic() + 5), rpc_result)
+            except BaseException as error:
+                call_errors.append(error)
+            finally:
+                call_finished.set()
+
+        caller = threading.Thread(target=invoke)
+        caller.start()
+        try:
+            self.assertTrue(entered_rpc.wait(2), "RPC was not admitted")
+            report = node.stop(timeout=0.05)
+            self.assertFalse(report.clean)
+            self.assertEqual(report.outstanding_rpc_calls, 1)
+            self.assertFalse(report.store_closed)
+            self.assertFalse(node.store._closed)
+            self.assertEqual(node._active_calls, 1)
+        finally:
+            release_rpc.set()
+            caller.join(timeout=2)
+
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(call_finished.is_set())
+        self.assertEqual(call_errors, [])
+        self.assertEqual(node._active_calls, 0)
+        completed = node.stop(timeout=3)
+        self.assertTrue(completed.clean, completed)
+        self.assertTrue(completed.store_closed)
+        with open_store(self.root / "vm03.sqlite", vm_id="vm03") as reopened:
+            self.assertEqual(reopened.current_context(), Context(1, ConsistencyMode.STRONG))
+
     def test_real_three_node_gossip_rpc_binary_values_and_concurrency(self):
         nodes = tuple(self.node(f"vm{number:02d}", gossip_background=True,
                                replica_workers=6, replica_queue=12).start()

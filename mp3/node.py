@@ -175,8 +175,8 @@ class NodeRuntime:
             # client. Only after all local services exist do we report local readiness.
             self.rpc_client = ReplicaClient(self.manifest,
                                             self.membership_runtime.table)
-            self._ready = True
             with self._calls:
+                self._ready = True
                 self._accepting_calls = True
             return self
         except BaseException:
@@ -218,15 +218,20 @@ class NodeRuntime:
         with self._calls:
             if not self._ready or not self._accepting_calls or self.rpc_client is None:
                 raise RuntimeError("node is not accepting RPC calls")
+            # Snapshot readiness-dependent values in the same critical section as
+            # admission. stop() closes admission under this condition, so an
+            # accepted call retains its context/generation after readiness changes.
+            context = self.context
+            generation = self.generation
+            client = self.rpc_client
             self._active_calls += 1
         try:
-            context = self.context
             request = new_request(
                 manifest=self.manifest, sender_id=self.vm_id,
-                sender_generation=self.generation, target_id=target_id,
+                sender_generation=generation, target_id=target_id,
                 epoch=context.epoch, mode=context.mode, op=op, key=key,
                 version=version, value=value)
-            return self.rpc_client.call_replica(
+            return client.call_replica(
                 self.manifest.node(target_id), request, deadline=deadline)
         finally:
             with self._calls:
@@ -245,9 +250,11 @@ class NodeRuntime:
         if not valid_timeout:
             raise ValueError("shutdown timeout must be nonnegative and finite")
         deadline = time.monotonic() + timeout
-        self._ready = False
-        self._stopping = True
         with self._calls:
+            # Close the public admission gate and readiness atomically with respect
+            # to call_replica's check and context/generation snapshot.
+            self._ready = False
+            self._stopping = True
             self._accepting_calls = False
 
         replica_report = None

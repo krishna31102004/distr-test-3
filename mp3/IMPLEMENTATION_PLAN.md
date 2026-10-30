@@ -1101,3 +1101,30 @@ individual components start together and pass local loopback/process acceptance 
 it does not establish ten-VM deployment readiness, real-cluster convergence, multi-owner
 protocol correctness, or demo-command readiness. Step 3 still requires its deferred
 Strong and Eventual design decisions before those coordinators are implemented.
+
+### Step 2 final concurrency correction — October 30, 2026
+
+`NodeRuntime.call_replica()` and `NodeRuntime.stop()` now use the same call condition
+to linearize admission against shutdown. An admitted caller snapshots its Context,
+restart generation, and client before incrementing active-call accounting and releasing
+the condition. It then builds the request and performs RPC outside the condition. Stop
+atomically closes readiness and admission under the condition, rejects later callers,
+waits for admitted work within the existing shutdown deadline, and closes SQLite only
+after active calls reach zero. No request deadline, version, epoch or generation
+semantics changed; no retry or coordinator behavior was added.
+
+Three event-controlled tests cover request construction paused across readiness change,
+rejection after admission closes, and forced-stop reporting followed by safe retry,
+database reopen and zero active-call accounting. The admitted-call test observes the
+runtime actually waiting in its active-call drain before allowing request construction
+to continue.
+
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **130 tests passed in
+  14.674s**; the three focused concurrency tests passed in **1.047s**.
+- Independent GPT-6 Luna/high reviewer: full suite — **130 tests passed in 14.818s**.
+- Main and reviewer: `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` — all exited 0.
+
+The Step 2 local foundation remains VERIFIED after this correction. No ten-VM test
+was run; Step 3 and the consistency protocols remain untouched.

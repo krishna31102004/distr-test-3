@@ -377,7 +377,7 @@ convergence, and rejection of stale generation evidence. Other tests inject star
 thread failures and retry an incomplete forced shutdown. These are local process and
 loopback tests; **no university VM was contacted**.
 
-Final local results:
+Initial Batch 4 local results before the final concurrency correction:
 
 - `python3 -B -m unittest discover -s mp3/tests -v` — **127 tests passed in 15.013s**.
 - Independent GPT-6 Luna/high reviewer — **127 tests passed in 14.830s**.
@@ -400,3 +400,39 @@ Step 3 is where Krishna and Juhi implement the actual consistency protocols: Str
 ABD and Eventual-noRR, after reviewing the remaining protocol decisions. Those
 protocols can build on the tested Store, fixed owners, membership, and one-replica
 network call. The one-replica call by itself is not a distributed operation.
+
+### Final call-admission and shutdown correction
+
+We found a race between starting an RPC and stopping its node. A call could pass the
+admission check, then shutdown could mark the node not ready before that call finished
+building its request. The call would incorrectly fail even though it had already been
+accepted.
+
+Now the admission check, readiness check, and capture of the current mode/epoch,
+restart generation, and RPC client happen together under one short condition lock.
+Shutdown closes readiness and new-call admission under that same lock. A call that
+already entered keeps its captured information and continues building/sending its
+request after the lock is released. No network operation happens under this lock.
+Shutdown waits for admitted calls within its existing deadline; if time runs out, it
+reports the call as outstanding and leaves SQLite open. Once the call finishes, another
+stop attempt can close SQLite safely.
+
+Three event-controlled regression tests verify that an admitted install keeps its
+version/context/generation while request construction is paused across shutdown, a new
+call is rejected after shutdown closes admission, shutdown reaches its call-drain wait,
+and a forced stop reports an outstanding operation then cleans up after retry. They
+also check that active-call accounting returns to zero and the database can be reopened.
+
+Final results after independent review:
+
+- `python3 -B -m unittest discover -s mp3/tests -v` — **130 tests passed in 14.674s**.
+- Independent GPT-6 Luna/high reviewer — **130 tests passed in 14.818s**.
+- Focused `test_admitted_call_keeps_context_and_generation_through_shutdown`,
+  `test_shutdown_closes_call_admission_before_later_rpc_attempt`, and
+  `test_forced_node_stop_reports_admitted_rpc_and_closes_store_only_after_retry` —
+  **3 tests passed in 1.047s**.
+- Smoke, `mp3` help, `mp3.node` help, compileall, and `git diff --check` passed.
+
+The Step 2 local foundation remains verified. These tests used temporary storage and
+local threads/sockets; no university VM was contacted. Step 3 and all consistency
+protocols remain untouched.
