@@ -580,20 +580,23 @@ fanout because the client Future has completed or a queue is full.
 
 **Client wait versus background lifetime — APPROVED BY KRISHNA — C1–C6 foundation only:**
 The initial client deadline is admission_time+5s. It bounds waiting for qualifying W
-(or R), not completion of all Eventual PUT fanout. Recommended independent PUT
-continuation budget: 10s after foreground completion, configurable and subject to
-KD-12 review. At success time t_ack, retain reserved unsent/in-flight jobs through
-background_deadline=t_ack+10s; success near the 5s boundary still gets that window.
-Every job has one attempt, no automatic retries; queue/connect/read/write waits
-use the job's remaining background budget after handoff. Do not retain the expired
-foreground deadline on transferred jobs. Proposed maximum accepted lifetime is 15s
-from admission (client completion occurs by 5s); no repeated deadline extension.
+(or R), not completion of all Eventual PUT fanout. The approved independent PUT
+continuation budget is 10s after foreground completion. At success time t_ack, retain
+reserved unsent/in-flight jobs through background_deadline=t_ack+10s; success near
+the 5s boundary still gets that window. The approved maximum accepted lifetime is
+15s from admission (client completion occurs by 5s); no repeated deadline extension.
+These are the approved C6 starting durations, not new KD-12 approval questions. Every
+job has one attempt, no automatic retries; queue/connect/read/write waits use the
+job's remaining background budget after handoff. Do not retain the expired foreground
+deadline on transferred jobs.
 For a client timeout/error with potentially committed writes, accepted remaining
 jobs may likewise finish within completion_time+10s, without changing the client
 outcome. Both foreground and background phases target all reachable prescribed
 owners, never replacement nodes; failure to contact one is recorded, not success.
-Exact protocol response/qualification and RR's separate comparison/repair budget
-remain deferred to KD-12/13. This is a finite lifetime proposal, not hinted handoff,
+KD-12 must still approve the Eventual-specific reservation, success/timeout outcome,
+and per-owner propagation accounting that use these approved durations. Exact
+protocol response/qualification and RR's separate comparison/repair budget remain
+deferred to KD-12/13. This is a finite lifetime, not hinted handoff,
 anti-entropy, retry machinery or an implemented Eventual protocol.
 
 Record each owner's attempted/pending/durable-confirmed/failed/timed-out result.
@@ -648,12 +651,16 @@ Historical contract questions — now accepted by Krishna with their documented 
    Recommended: as specified; preserve the KD-11/12 qualification gate.
 4. Accept C5's envelope/validation/16 KiB metadata cap, 1 MiB body and per-RPC UUIDs?
    Recommended: as specified; reject over-cap encoded metadata rather than truncate.
-5. Accept proposed port 65434, 5s overall deadline and C6 initial pool/queue capacities?
-   Recommended: configurable starting defaults, pending compatibility/load tests.
-6. Accept C3's epoch boundary with no public advance API until Step 4, plus C6's
-   reserved-background and bounded shutdown rules? Recommended: as specified;
-   the proposed independent PUT continuation is 10s after foreground completion
-   (<=15s total); RR budget and cluster switching remain deferred.
+5. The proposed KV port 65434 remains a configurable endpoint subject to availability
+   checks. The C6 five-second overall foreground deadline and initial pool/queue
+   capacities are approved starting defaults; compatibility and load tests are
+   verification tasks, not pending approvals.
+6. The C3 exact local epoch check/no public advance API until Step 4 and C6 bounded
+   background/shutdown rules were approved for the foundation. C6's approved PUT
+   continuation is 10s after foreground completion, with a 15s maximum from
+   admission. KD-12 still needs to settle Eventual-specific reservation, completion
+   qualification and per-owner outcome reporting; RR lifetime and cluster switching
+   remain deferred.
 
 Independent documentation review (GPT-6 Luna/high, October 29) found no contract
 correctness blocker. Main corrected two historical roadmap statements that still

@@ -249,13 +249,14 @@ libraries are prohibited. These requirements are not approval questions.
 **Planned tests / acceptance:** Duplicate/stale replies, deadline exhaustion, delayed ack, retry
   storms, and timeout latency; confirm successful durable writes can outlive timeouts.
 
-**Step 3 proposal — PENDING, awaiting Krishna's approval:** One `operation_id` spans
-all phases of one coordinator operation; every target/phase RPC has its own UUID4
-`request_id`. Use one absolute five-second monotonic foreground deadline from
-admission across queueing, both Strong phases, response validation and nested RPCs.
-Do not reset it between phases or count a late reply. An INSTALL that may have been
-sent but whose valid response/quorum is absent yields uncertain completion, not a
-definite non-write. No retries are proposed.
+**Step 3 protocol refinements — PENDING, awaiting Krishna's approval:** One
+`operation_id` spans all phases of one coordinator operation; every target/phase RPC
+has its own UUID4 `request_id`. Reuse the already approved C6 default of one absolute
+five-second monotonic foreground deadline from admission across queueing, both Strong
+phases, response validation and nested RPCs. Do not reset it between phases or count
+a late reply. An INSTALL that may have been sent but whose valid response/quorum is
+absent yields uncertain completion, not a definite non-write. No retries are
+proposed.
 
 For Eventual PUT, the five-second deadline bounds waiting for W. Accepted remaining
 owner attempts use a distinct ten-second continuation after the client response,

@@ -591,10 +591,10 @@ endpoint; it does not bypass the replica handler or durable Store boundary.
 
 ### 6.3 Deadline and result rules
 
-- The initial foreground budget is five seconds from accepted operation admission,
-  subject to configuration. One absolute `time.monotonic()` deadline covers queue
-  admission, all phases, connect/send/receive and response validation; nested calls
-  never reset it.
+- The already approved C6 initial foreground budget is five seconds from accepted
+  operation admission, subject to configuration. One absolute `time.monotonic()`
+  deadline covers queue admission, all phases, connect/send/receive and response
+  validation; nested calls never reset it.
 - Do not count a response received after the deadline as an on-time quorum response.
   Strong phase transitions consume the same deadline, not a fresh five seconds.
 - A timed-out Strong PUT after an install may have been sent has
@@ -686,8 +686,8 @@ Krishna's design review. KD-01..07 and the approved C1–C6 directions are not r
 | KD-11-D | Approve `allocate_strong_version(context, observed_max)` using a committed local counter greater than both observed counter and local high-water? | Yes; metadata migration preserves records and counter survives process restart |
 | KD-12-A | Approve Eventual PUT W evidence as exact requested version in durable INSTALLED/UNCHANGED only, with SUPERSEDED excluded? | Yes; conservative and directly proves this value/version is durably installed |
 | KD-12-B | Approve R/W defaults 2/2, first-R max selection, all-explicit-absence requirement, and no repair in noRR? | Yes; within mandated configurable 1..5 rules |
-| KD-12-C | Approve five-slot atomic reservation, 5s foreground + 10s post-completion continuation, at most 15s total, one attempt per owner? | Yes; existing C6 starting proposal; no dropped accepted work/retries |
-| KD-08/14 | Approve one operation ID across phases, request ID per RPC, same absolute deadline, and the shared 16-active/64-queued outbound attempt capacity? | Yes; overload before writes if all required reservations unavailable |
+| KD-12-C | Approve atomic reservation of all five owner attempts and applying the already approved C6 continuation to them? | Yes; reuse the approved five-second foreground, ten-second continuation, fifteen-second total cap, and one attempt per owner; no dropped accepted work/retries |
+| KD-08/14 | Approve one operation ID across phases, request ID per RPC, and the shared 16-active/64-queued outbound-attempt capacity? | Yes; reuse C6's approved single monotonic foreground deadline; overload before writes if required reservations are unavailable |
 | KD-14 | For shutdown, may a configured bound truncate accepted Eventual background attempts and report them incomplete? | Yes; preserve foreground result and never claim unfinished writes succeeded |
 
 This approval set does **not** approve Step 4 read repair, cluster-wide mode switching,
