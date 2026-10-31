@@ -249,6 +249,23 @@ libraries are prohibited. These requirements are not approval questions.
 **Planned tests / acceptance:** Duplicate/stale replies, deadline exhaustion, delayed ack, retry
   storms, and timeout latency; confirm successful durable writes can outlive timeouts.
 
+**Step 3 proposal — PENDING, awaiting Krishna's approval:** One `operation_id` spans
+all phases of one coordinator operation; every target/phase RPC has its own UUID4
+`request_id`. Use one absolute five-second monotonic foreground deadline from
+admission across queueing, both Strong phases, response validation and nested RPCs.
+Do not reset it between phases or count a late reply. An INSTALL that may have been
+sent but whose valid response/quorum is absent yields uncertain completion, not a
+definite non-write. No retries are proposed.
+
+For Eventual PUT, the five-second deadline bounds waiting for W. Accepted remaining
+owner attempts use a distinct ten-second continuation after the client response,
+bounded by fifteen seconds from admission; they continue once each and are reported
+incomplete at expiry/shutdown. Recommended response policy: only exact-version,
+durable INSTALLED/UNCHANGED counts for Eventual W; a strictly higher SUPERSEDED copy
+is not an acknowledgment of this value. Strong may count durable strictly-higher
+SUPERSEDED as at-least-tag evidence. Examples, status predicates and acceptance
+traces are in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
+
 ## KD-09 — Persistent storage and durability
 
 **Status: APPROVED — C1–C6 foundation contract; implementation/verification tracked separately.**
@@ -309,6 +326,19 @@ libraries are prohibited. These requirements are not approval questions.
 **Planned tests / acceptance:** Frozen/backward clocks, concurrent allocations, reboot, very large
   counters, total-order vectors, equal-tag conflicts, and cross-language JSON precision.
 
+**Step 3 allocation proposal — PENDING:** Add a durable Strong logical-counter
+high-water mark. `allocate_strong_version(*, context, observed_max)` takes a short
+SQLite write transaction, validates the exact Strong context, chooses one greater
+than both the observed maximum's counter and persisted local high-water, commits,
+then returns `(counter, vmNN/generation)`. It makes no wall-clock assumption and
+holds no lock during RPC. Same-writer concurrent calls get different counters;
+different writers can share a counter but have distinct totally ordered writer IDs.
+The metadata migration must preserve existing records and fail closed on corrupt
+state. Whether the allocator survives a later Strong/Eventual epoch switch is
+deferred to KD-16. Eventual allocation is already implemented and durable in
+`Store.allocate_eventual_version`; Step 3 proposes reusing it, not adding a second
+allocator. See the interface and crash/race acceptance cases in the design document.
+
 ## KD-11 — Strong multi-writer atomic-register protocol
 
 **Status: PENDING — deferred.**
@@ -316,6 +346,32 @@ libraries are prohibited. These requirements are not approval questions.
 **Concept:** A read must carry the newest value it sees to a majority before returning. Otherwise one read may see a partly propagated write and a later read miss it, violating the single-copy illusion.
 
 Multi-writer Strong protocol: full two-phase ABD rules, bottom/absence, tag allocation and durable phase acknowledgments await Step 3. No Strong protocol is approved by this handoff.
+
+**Step 3 proposal — PENDING, awaiting Krishna's approval:** use full two-phase
+multi-writer ABD on the five fixed owners, with quorum Q=3 in each phase. PUT queries
+all five, takes the maximum actual record (or conceptual bottom), durably allocates
+a counter above that maximum and local high-water, then conditionally installs the
+new tag/value. GET queries a majority, selects the maximum record and durably writes
+that exact pair back to a majority before returning it. `None` is the proposed
+coordinator-only bottom; it is never stored or sent. Three explicit NOT_FOUND query
+replies may return NOT_FOUND without a bottom writeback; fewer than three valid
+responses cannot.
+
+The proposed `SUPERSEDED` rule is durable-at-least evidence only when the actual
+stored tag is strictly greater than the requested tag, and all response/context/
+owner/generation bindings validate. That rule can count for Strong phase 2 because
+the higher committed value orders after the attempted tag; `VERSION_CONFLICT` never
+counts. Two writers at the same observed max get distinct ordered tags by writer ID;
+same-writer allocation is serialized by a short durable counter transaction. If
+three owners do not provide required evidence before the single operation deadline,
+return TIMEOUT/ERROR. If a write phase may have committed, report uncertain
+completion. The rationale, traces, assumptions and adversarial tests are specified
+in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). No protocol behavior is
+implemented or approved yet.
+
+**Approval question:** Is this ABD procedure, bottom rule, allocation contract,
+phase naming and Strong-only `SUPERSEDED` qualification the chosen KD-11 design?
+Recommended default: yes, subject to reviewing the detailed traces and tests.
 
 **Approval record:** No engineering approval recorded.
 
@@ -370,6 +426,32 @@ Eventual fanout/first-R/durable-W requirements are mandated; exact coordinator q
 
 **Planned tests / acceptance:** R/W combinations, one replica replying repeatedly, post-ack fanout,
   partitions, stale replies, empty bytes, and timeout-vs-absence at multiple R values.
+
+**Step 3 proposal — PENDING, awaiting Krishna's approval:** keep R/W in 1..5 and
+default 2/2. GET concurrently queries all five, returns after the first R distinct
+valid replies, and chooses the maximum version among those R; all R explicit
+NOT_FOUND replies mean NOT_FOUND, while fewer than R replies mean TIMEOUT/ERROR.
+No comparison or repair follows an Eventual-noRR response. Equal version with
+different bytes fails closed.
+
+PUT durably allocates the existing Eventual `(timestamp, vmNN/generation)` version,
+atomically reserves all five owner-attempt slots, and dispatches one write to every
+fixed owner. Count W only when distinct replicas report durable INSTALLED or
+UNCHANGED at the exact requested version. Proposed policy excludes SUPERSEDED
+because it confirms a newer value rather than this PUT's value. If capacity cannot
+reserve all five attempts, fail OVERLOADED before sending. If W is reached before
+the five-second foreground deadline, respond success but retain every remaining
+accepted attempt for a separate ten-second continuation, capped at fifteen seconds
+from admission. One attempt per owner, no retries, and explicit incomplete-propagation
+records at expiry. Foreground timeout after a possible commit reports unknown
+completion; it is never NOT_FOUND. A crash may lose in-memory attempts but not
+committed SQLite data. These settings reuse the approved C6 starting envelope;
+protocol-specific qualification and reservation details still require KD-12 review.
+
+**Approval question:** Approve exact-version W acknowledgments, all-five reservation,
+first-R read, and bounded post-ack continuation as specified? Recommended default:
+yes; this avoids false acknowledgments and dropped accepted fanout. Full examples,
+R/W failure matrix and tests are in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
 
 ## KD-13 — Read repair and background execution
 
@@ -428,6 +510,19 @@ Read repair requirements are mandated; collection/repair scheduling and backgrou
 **Planned tests / acceptance:** Barrier-controlled same-key races, unrelated-key progress, worker
   exhaustion/deadlock, shutdown, and throughput/latency across client counts.
 
+**Step 3 proposal — PENDING, awaiting Krishna's approval:** retain C6 limits of
+coordinator 16 active/32 queued, replica handlers 32/64, and bounded outbound
+replica-attempt/background work 16/64, with separate membership capacity. Atomic
+reservation is required before Eventual PUT dispatch, so a successful W response
+cannot discard queued fanout. Strong operations reserve enough bounded attempt
+capacity for both phases before starting writes. Queue exhaustion is explicit
+OVERLOADED; it must not spawn extra threads. Coordinators may wait on bounded RPC
+workers, but workers never wait on coordinator tasks. Same-key distributed operations
+overlap; only SQLite's short transaction and Strong's short durable allocator
+transaction serialize. No global/membership/key lock crosses network IO. Exact
+reservation bookkeeping and shutdown truncation/reporting are proposed for review,
+not implemented. See the resource ownership table and deadlock tests in the design.
+
 ## KD-15 — Shared storage/RPC interface contract
 
 **Status: APPROVED — C1–C6 foundation contract; implementation/verification tracked separately.**
@@ -455,6 +550,18 @@ Read repair requirements are mandated; collection/repair scheduling and backgrou
 
 **Planned tests / acceptance:** Shared contract tests against a disposable store, version ordering,
   concurrent installs, disk errors, and serialization round trips.
+
+**Step 3 protocol extension proposal — PENDING:** Preserve the C5 binary frame and
+limits. Add stable `operation_id` alongside per-attempt UUID4 `request_id`; introduce
+schema 2 for protocol phases while retaining schema 1 only for the existing
+`phase="local"` path. Do not auto-downgrade. Reuse `READ_LOCAL` and
+`INSTALL_IF_NEWER`; add `strong_query`, `strong_write`, `strong_readback`,
+`eventual_read`, and `eventual_put`. Schema-2 responses keep READ `version` as the
+actual record and INSTALL `stored_version` as the committed replica value. A
+protocol-specific predicate—not the raw status name—decides quorum qualification.
+Strong and Eventual use separate `SUPERSEDED` rules. This is an exact proposed
+envelope change, and all affected validators and mixed-version behavior are detailed
+in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
 
 ## KD-16 — Mode changes and stale-message fencing
 

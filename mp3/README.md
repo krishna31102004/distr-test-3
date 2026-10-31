@@ -14,6 +14,10 @@ Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [BUILD_PROGRESS_EXPLAINED.md](BUILD_PROGRESS_EXPLAINED.md). Claude Code entrypoints
 use the same shared agent rules.
 
+The proposed Strong ABD and Eventual-noRR design is in
+[STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). It awaits Krishna's explicit
+approval; no consistency protocol implementation has started.
+
 ## Layout
 
 ```text

@@ -436,3 +436,83 @@ Final results after independent review:
 The Step 2 local foundation remains verified. These tests used temporary storage and
 local threads/sockets; no university VM was contacted. Step 3 and all consistency
 protocols remain untouched.
+
+## Step 3 — Designing Strong and Eventual Consistency
+
+**DESIGN PROPOSED / NOT IMPLEMENTED.** This section describes a design that still
+needs Krishna's explicit approval. Strong and Eventual-noRR do not work yet.
+
+Five machines keep copies of a key so the store can continue when some machines are
+slow or down. A **quorum** means the required number of different owners answered
+with valid evidence. With five owners, Strong uses three: any group of three shares
+at least one owner with every other group of three.
+
+### Proposed Strong flow
+
+```text
+PUT: ask owners for current versions -> choose a newer tag -> install to 3 owners
+GET: ask owners for current versions -> choose the newest -> write it back to 3
+```
+
+The read-back step matters because one replica may have seen a write that has not
+reached the others yet. Before returning that value, GET spreads the selected record
+to a majority. A missing key is represented by a special coordinator-only bottom
+state; it is not a fake stored value. Concurrent writers use unique ordered tags.
+
+### Proposed Eventual-noRR flow
+
+```text
+PUT: reserve all 5 sends -> send to the 5 owners -> return after W durable saves
+                                      `-- remaining accepted sends continue briefly
+GET: ask the owners -> use the first R valid replies -> choose their newest version
+```
+
+At the default R=2 and W=2, a GET waits for two different replicas and chooses the
+newer version among those two. A PUT waits for two different replicas to durably
+store that exact version. Its remaining reserved one-time sends can continue after
+the client receives success, within a separate bounded window. A timestamp plus a
+stable process identity orders Eventual versions, including when timestamps tie.
+This mode does not do read repair.
+
+### What we are designing now
+
+The actual implementation already has one-node storage, ring placement, membership,
+and one-replica TCP reads/installs. The design in
+[STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) proposes how coordinators could
+use those pieces: fixed owners, unique response counting, Strong's two phases,
+Eventual's R/W, time limits, and bounded worker capacity. KD-11 and KD-12 remain
+pending for human approval. Other pending protocol-specific details are listed in
+that document. No new protocol tests or operations have been run as part of this
+design-only step.
+
+The unchanged Step 2 baseline was checked while preparing this design:
+
+```text
+Main:     python3 -B -m unittest discover -s mp3/tests -v — 130 passed (15.330s)
+Reviewer: python3 -B -m unittest discover -s mp3/tests -v — 130 passed (14.821s)
+Main and reviewer: mp3 --smoke, mp3 --help, mp3.node --help, compileall, diff-check — passed
+```
+
+These are foundation checks only; they do not test Strong or Eventual protocols.
+The independent reviewer found no substantive protocol-design blocker and asked for
+clarification on in-flight generation evidence and operation-result fields. The
+design now preserves an already issued RPC's dispatch-time generation binding (with
+no retry) and defines the result status/value/version/uncertainty rules. It also
+clarifies that Strong/Eventual GET may cancel unused attempts after returning, while
+Eventual PUT retains its five reserved one-shot attempts through the separate bounded
+continuation. Krishna still needs to approve the design before Step 3 Batch 1 begins.
+
+### What has NOT been implemented yet
+
+Strong ABD, Eventual-noRR, Eventual-RR, read repair, quorum counting, distributed
+client-facing PUT/GET, mode switching, and completed demo commands are all future
+work. Existing Step 2 tests remain evidence for the foundation only; they do not
+test consistency protocols.
+
+### What Step 3 Batch 1 will implement after approval
+
+The proposed first implementation batch is shared coordinator plumbing: bounded
+operation admission, phase-aware request/response identifiers, counting each owner
+only once, deadlines, and a bounded way to reserve the network work. It will establish
+the shared interface before Krishna implements Strong and Juhi implements
+Eventual-noRR. This Batch 1 work has not started.

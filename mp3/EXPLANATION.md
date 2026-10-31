@@ -684,3 +684,35 @@ roundtrips a 2**15000 Strong counter without changing global Python limits.
 Invalid context types return local ERROR; valid mismatched contexts return STALE_EPOCH.
 The full 51-test suite passed after these refinements. No power-loss or VM proof is
 claimed by local SIGKILL tests.
+
+## Step 3 protocol design — proposed, not implemented
+
+See [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) for the implementation-level
+proposal. There are no new Python source functions in this design-only update. The
+following proposed signatures describe future boundaries and must not be treated as
+working methods:
+
+| Proposed interface | Purpose and inputs → output | Caller/dependencies | Status |
+|---|---|---|---|
+| `StrongCoordinator.put(key, value, *, context, deadline)` | Query the five fixed owners, derive a tag above the maximum, durably install to a majority, and return a version-aware `ProtocolResult` | Future `NodeRuntime.strong_put`; `Manifest`, `Store`, `ReplicaClient`, bounded dispatcher | PROPOSED; KD-11 pending |
+| `StrongCoordinator.get(key, *, context, deadline)` | Query a majority; return bottom/NOT_FOUND or write the maximum record back to a majority before success | Future `NodeRuntime.strong_get`; same foundation dependencies | PROPOSED; KD-11 pending |
+| `EventualNoRRCoordinator.put(key, value, *, context, deadline)` | Reserve five attempts, allocate the existing durable Eventual version, await W exact-version durable acknowledgments, retain remaining attempts for bounded continuation | Future `NodeRuntime.eventual_put`; Store allocator, ring, RPC, bounded attempt scheduler | PROPOSED; KD-12 pending |
+| `EventualNoRRCoordinator.get(key, *, context, deadline)` | Return max version among the first R distinct valid owner responses, or explicit NOT_FOUND/error | Future `NodeRuntime.eventual_get`; ring, RPC, response collector | PROPOSED; KD-12 pending |
+| `Store.allocate_strong_version(*, context, observed_max)` | Atomically persist and return a Strong counter above local high-water and observed maximum | Future Strong PUT; SQLite WAL/FULL transaction | PROPOSED; KD-10/11 pending |
+| `dispatch_owner(...)`, `collect_distinct(...)` | Schedule one RPC per prescribed owner and count distinct bound replies under one deadline | Future coordinators; existing `ReplicaClient.call_replica` | PROPOSED; KD-08/14/15 pending details |
+
+The proposal connects through the existing `NodeRuntime`: it captures one Store
+context and durable local generation, passes work to the appropriate coordinator,
+and keeps network calls outside lifecycle locks. The current `NodeRuntime.call_replica`
+is still only a single-target primitive. `ReplicaRequest`/`ReplicaResponse` currently
+support schema 1 and `phase="local"`; the design proposes a strict schema-2
+`operation_id` plus protocol phases while retaining the C5 binary framing. The
+proposed phases are `strong_query`, `strong_write`, `strong_readback`,
+`eventual_read`, and `eventual_put`. No protocol phase, quorum collector, Strong
+allocator, coordinator, or operation wrapper has been implemented or tested.
+
+The design relies on local Store evidence, not socket receipt: Strong uses three of
+five owners in each required phase; Eventual GET uses the first R distinct valid
+replies and Eventual PUT uses W distinct durable exact-version acknowledgments. A
+coordinator-only `None` bottom represents initial absence in Strong; it is never
+stored or sent. The exact rules and acceptance tests await explicit human approval.

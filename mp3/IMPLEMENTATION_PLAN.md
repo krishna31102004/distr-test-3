@@ -153,6 +153,56 @@ multi-owner protocols and coordinator integration remain future work. The accept
 without a concrete specification conflict or serious correctness issue. Defer KD-11/12
 to Step 3, KD-13/full KD-16/final KD-17 to Step 4, and KD-18 to Step 6.
 
+### Step 3 design gate — prepared, awaiting Krishna's approval
+
+`STEP3_PROTOCOL_DESIGN.md` specifies proposed Strong multi-writer ABD, Eventual-noRR,
+shared RPC/coordinator extensions, response qualification, bounded resources,
+deadlines, failure cases, and acceptance tests. The proposal is independently
+reviewed before implementation; it is **not approved and does not authorize code**.
+KD-11 and KD-12 remain PENDING. The approved C1–C6 foundation remains intact, and
+all existing ownership, task IDs and implementation statuses remain unchanged.
+
+The proposed Step 3 implementation order is:
+
+1. **Batch 1 — Shared coordinator infrastructure (Joint boundary review; Krishna owns
+   RPC/routing changes, Juhi owns storage/version changes):** after approval of the
+   affected KD-08/10/14/15 details, add operation-ID binding, strict phase-aware RPC
+   validation, distinct-owner collection, deadline handling and bounded capacity
+   reservation. Add the Strong durable counter allocator only if KD-11 allocation
+   is approved. Acceptance covers fixed five-owner dispatch, duplicate/late/wrong
+   evidence rejection, timeouts vs absence, overload, shutdown and restart.
+2. **Batch 2 — Strong ABD (Krishna):** after Batch 1 interfaces integrate, implement
+   two-phase PUT and GET with Q=3, bottom handling, durable tag allocation and
+   readback. Acceptance includes partial writes, concurrent histories, crash/delay
+   schedules, and a history-based linearizability check.
+3. **Batch 3 — Eventual-noRR (Juhi):** after shared APIs integrate, implement
+   configurable R/W, first-R maximum, distinct durable W, and guaranteed bounded
+   post-ack all-owner propagation. Acceptance includes R/W 1/1, 2/2, 3/3, 5/5,
+   failures, empty values, version conflicts, and foreground/background lifetimes.
+4. **Batch 4 — Adversarial protocol integration (Joint):** run local multi-process
+   histories with concurrent coordinators, delayed messages, partitions,
+   SIGKILL/restart, generation/epoch fencing, overload and shutdown. No university
+   VM activity is implied.
+
+Batch 1 is a shared-interface gate: neither protocol coordinator should begin until
+the RPC schema/phase contract, result types, quorum-evidence predicates and resource
+reservation behavior are integrated. Strong and noRR implementation can then proceed
+in parallel against those contracts. Reviewer acceptance of this design is not
+human approval; Krishna must explicitly approve the listed pending KD questions.
+Step 4 read repair, complete mode switching, command integration and logging remain
+deferred as already recorded below.
+
+**Design review and baseline evidence:** The independent GPT-6 Luna/high reviewer
+inspected the actual specification, source, tests and proposed interfaces. The
+review found no substantive ABD or Eventual-noRR correctness blocker, and requested
+two clarifications: dispatch-time generation binding for in-flight responses and
+explicit `ProtocolResult` status payload semantics. Both were added; focused follow-up
+review is recorded at handoff. Main agent ran
+`python3 -B -m unittest discover -s mp3/tests -v` (130 passed, 15.330s); reviewer
+independently ran the same suite (130 passed, 14.821s). Main and reviewer ran the
+smoke/help/node-help/compileall/diff-check baseline commands successfully. These are
+Step 2 checks only; no consistency-protocol behavior was tested or implemented.
+
 ## Requirement checklist and traceability
 
 `[x]` means the listed behavior has a verified local implementation at this plan
