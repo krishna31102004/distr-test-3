@@ -1,11 +1,6 @@
 # Understanding MP3 and its verified Batch 1–4 foundations
 
-This guide describes the actual files. Batch 1's local durable SQLite store, Batch 2's
-fixed ring and membership service, Batch 3's single-replica TCP RPC path, and Batch 4's
-integrated local node lifecycle are implemented and locally reviewed. **Distributed client-facing GET/PUT is still
-pending**: no coordinator, quorum, consistency protocol, read repair, or mode-switch
-service exists. Approved contracts and evidence are in IMPLEMENTATION_PLAN.md and
-KEY_DECISIONS.md. A local replica read/install is not a distributed GET/PUT.
+This guide describes the actual files. Step 2 storage, fixed ring/membership, single-replica RPC, and integrated node runtime are implemented and locally reviewed. Step 3 Batch 1 now adds phase-aware schema-2 RPC, shared response evidence and bounded scheduling, attempt leases, and durable Strong tag allocation. **Full Strong ABD and Eventual-noRR coordinators, distributed client-facing GET/PUT, read repair, and mode switching are still pending.** A local replica read/install or one coordinator dispatch is not a distributed GET/PUT.
 
 ## The system we will build
 
@@ -163,13 +158,14 @@ tested against power loss, remote filesystems, or VM storage.
 | `Store.read_local` | key, keyword Context and optional absolute deadline → ReadResult; atomically checks context and reads one row, returns NOT_FOUND or FOUND (including empty bytes), STALE_EPOCH or ERROR | tests, ReplicaService | I; local read only, no quorum |
 | `Store.install_if_newer` | key, Record, keyword Context and optional absolute deadline → InstallResult; validates exact context and kind, compares under one short `BEGIN IMMEDIATE`, installs a higher tag, otherwise returns UNCHANGED, SUPERSEDED, or VERSION_CONFLICT with stored-version evidence; commits before durable success | tests, ReplicaService | I; local conditional install only, C3/C6 |
 | `Store.start_incarnation` | no args → next persisted positive generation; commits increment before return; caller must invoke once per boot before serving | tests; future startup admission | I; C2 local restart foundation |
-| `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; future Eventual coordinator | I; C4 eventual only, no Strong allocation |
+| `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; future Eventual coordinator | I; C4 eventual only |
+| `Store.allocate_strong_version(*, context, observed_max, deadline=None)` | Strong Context, optional queried maximum and deadline → committed Version above observed and local durable high-water; writer ID uses the current durable VM generation; never holds a lock over RPC | tests; future Strong PUT coordinator | I; approved KD-10/11 allocator; coordinator remains future work |
 | `Store.close`, `__enter__`, `__exit__` | close stops new admissions, waits for active bounded operations, releases process lock; context-manager methods return self/None and call close | tests and future owner | I; C2/C6 local lifecycle |
 | `open_store` | path, optional bootstrap, vm_id, timeout, capacity → Store | tests and future local owner | I; C2/C3 |
 
 `install_if_newer` does not decide whether SUPERSEDED qualifies for any quorum;
-that protocol rule is deferred. `allocate_eventual_version` is not a Strong tag
-allocator. There is no public epoch-advance/clear API: requests with any context
+that protocol rule is deferred. `allocate_eventual_version` is the Eventual tag
+allocator; `allocate_strong_version` is a local durable tag primitive, not a Strong coordinator. There is no public epoch-advance/clear API: requests with any context
 other than the locally persisted exact epoch and mode fail closed. The store does
 not know membership, owners, RPC identities, or cluster admission. SIGKILL tests
 exercise process-crash visibility before/after SQLite COMMIT in disposable local
@@ -220,17 +216,18 @@ bytes before a replica operation can reach storage.
 | `_version_from_wire`, `_version_to_wire` | Convert nullable `{kind, number, writer_id}` to/from `Version`, checking mode kind and manifest writer identity | I; C3–C5 |
 | `_unique_object`, `_reject_json_constant`, `_decode_json`, `_encode_json` | Parse strict UTF-8 JSON with duplicate-key/nonfinite-number rejection and enforce the metadata cap | I; C5 |
 | `_mode`, `_operation`, `_status` | Convert exact wire strings to approved enums; unknown names fail closed | I; C5 |
-| `ReplicaRequest.__post_init__`, `.value_len`, `._validate_version_kind`, `.validate_manifest`, `.to_metadata`, `.from_metadata` | Validate request identity, operation-specific version/value shape, phase=`local`, and manifest; convert strict fields to/from metadata | I; C5 |
-| `ReplicaResponse.__post_init__`, `.value_len`, `.validate_for`, `.to_metadata`, `.from_metadata` | Check status evidence and bind one response to the request, target, manifest, generation, context and operation | I; C3/C5 |
+| `ReplicaRequest.__post_init__`, `.value_len`, `._validate_version_kind`, `.validate_manifest`, `.to_metadata`, `.from_metadata` | Validate schema-1 local and schema-2 protocol-phase identity, operation/version/value shape, UUID fields and manifest; convert strict fields to/from metadata | I; C5/KD-15 |
+| `ReplicaResponse.__post_init__`, `.value_len`, `.validate_for`, `.to_metadata`, `.from_metadata` | Check status evidence and bind schema, request/operation IDs, phase, target, manifest, dispatch-time generation and context; enforce stored-version evidence | I; C3/C5/KD-15 |
 | `RpcOutcome` | Carries outcome kind, optional validated response, bounded error text and whether an INSTALL may have completed without acknowledgment; read-only failures never set the write-completion flag | I; C5/C6 |
-| `new_request` | Manifest, sender/generation, target, context, op/key and optional record → fresh UUID4 `ReplicaRequest` | I; C5 |
+| `new_operation_id`, `new_request` | Create canonical UUID4 operation IDs and fresh per-RPC request IDs; schema-2 requests require protocol phase and an operation ID shared by the caller | I; C5/KD-08/15 |
 | `_encode_payload`, `encode_request`, `encode_response` | Valid metadata/body → capped `JSON length + JSON + bytes` payload after manifest/schema checks | I; C5 |
 | `_recv_payload`, `_require_eof`, `receive_request`, `receive_response` | Socket/deadline → validated metadata/body/request/response; checks both declared lengths before body reads and rejects truncation/trailing bytes | I; C5/C6 |
 | `send_request`, `send_response` | Socket plus validated type/manifest/deadline → send exactly one outer frame under one absolute deadline | I; C5/C6 |
 | `_request_error` | Outcome kind and error → bounded error-only result | I; C5 |
 | `ReplicaClient.__init__` | Manifest and matching `MembershipTable` → reusable per-node RPC client; resolves fixed KV endpoints once, caps cached candidates at eight, preserves resolution errors as per-target outcomes | I; C1/C2/C5 |
 | `ReplicaClient._connect` | Node and absolute deadline → connected socket; tries cached numeric candidates using the remaining budget before each attempt, without blocking DNS in the operation | I; C5/C6 |
-| `ReplicaClient.call_replica` | Prescribed Node, request and absolute deadline → one response or typed outcome; snapshots expected generation, performs one connection/no retry, checks response evidence and marks INSTALL completion uncertain after possible transmission, including late validation and STORAGE_ERROR | I; C5/C6; no quorum collection |
+| `_lease_wait`, `_lease_connect`, `_lease_send_all`, `_lease_recv_exact`, `_lease_receive_response` | Lease-aware nonblocking connect and exact frame I/O; poll at most 50ms between lease checks; honor cancellation and evolving deadline; one attempt, no retry | I; KD-08/12/14 |
+| `ReplicaClient.call_replica` | Prescribed Node, request and absolute deadline → one response or typed outcome; snapshots/accepts captured target generation, supports schema-2 activation and an optional Eventual PUT lease, no retry, validates response evidence, preserves possible-commit uncertainty | I; C5/C6, KD-08/15 |
 
 `READ_LOCAL` returns FOUND with actual version and raw bytes, or NOT_FOUND with no
 record; empty bytes remain FOUND. INSTALL returns the version actually stored.
@@ -672,8 +669,10 @@ membership class, socketpair framing, pathlib, importlib and mock.patch clocks.
 ## Pending components have no imaginary implementation
 
 Local storage, fixed hashing/membership and single-replica KV RPC exist as described
-above. There is no Strong/Eventual coordinator, quorum collection, all-owner PUT
-fanout, read repair, mode manager, benchmark, plotting or deployment implementation.
+above. Shared distinct-response collection and bounded dispatch are implemented, but
+there is no Strong/Eventual coordinator or distributed quorum operation. All-owner
+Eventual PUT orchestration, read repair, mode manager, benchmark, plotting or deployment
+implementation remain future work.
 The CLI operation entrypoints still terminate at `pending.execute`; the RPC API is a
 library foundation and does not make those commands operational. Later responsibilities
 and decision gates are in the plan and KD-01..18. No fabricated benchmark/report
@@ -685,50 +684,89 @@ Invalid context types return local ERROR; valid mismatched contexts return STALE
 The full 51-test suite passed after these refinements. No power-loss or VM proof is
 claimed by local SIGKILL tests.
 
-## Step 3 protocol design — proposed, not implemented
+## Step 3 Batch 1 — implemented shared infrastructure, no coordinators
 
-See [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) for the implementation-level
-proposal. There are no new Python source functions in this design-only update. The
-following proposed signatures describe future boundaries and must not be treated as
-working methods:
+Krishna approved the Step 3 design on October 31, 2026. Batch 1 implements common
+infrastructure only. It does **not** implement Strong ABD or Eventual-noRR PUT/GET
+algorithms. The planned coordinator APIs below remain future behavior; shared primitives
+are implemented as listed.
 
-| Proposed interface | Purpose and inputs → output | Caller/dependencies | Status |
-|---|---|---|---|
-| `StrongCoordinator.put(key, value, *, context, deadline)` | Query the five fixed owners, derive a tag above the maximum, durably install to a majority, and return a version-aware `ProtocolResult` | Future `NodeRuntime.strong_put`; `Manifest`, `Store`, `ReplicaClient`, bounded dispatcher | PROPOSED; KD-11 pending |
-| `StrongCoordinator.get(key, *, context, deadline)` | Query a majority; return bottom/NOT_FOUND or write the maximum record back to a majority before success | Future `NodeRuntime.strong_get`; same foundation dependencies | PROPOSED; KD-11 pending |
-| `EventualNoRRCoordinator.put(key, value, *, context, deadline)` | Reserve five attempts, allocate the existing durable Eventual version, await W exact-version durable acknowledgments, retain remaining attempts for bounded continuation | Future `NodeRuntime.eventual_put`; Store allocator, ring, RPC, bounded attempt scheduler | PROPOSED; KD-12 pending |
-| `EventualNoRRCoordinator.get(key, *, context, deadline)` | Return max version among the first R distinct valid owner responses, or explicit NOT_FOUND/error | Future `NodeRuntime.eventual_get`; ring, RPC, response collector | PROPOSED; KD-12 pending |
-| `Store.allocate_strong_version(*, context, observed_max)` | Atomically persist and return a Strong counter above local high-water and observed maximum | Future Strong PUT; SQLite WAL/FULL transaction | PROPOSED; KD-10/11 pending |
-| `dispatch_owner(...)`, `collect_distinct(...)` | Schedule one RPC per prescribed owner and count distinct bound replies under one deadline | Future coordinators; existing `ReplicaClient.call_replica` | PROPOSED; KD-08/14/15 pending details |
-| `AttemptLease` | Admission time plus foreground completion/cancel events → lock-protected per-owner dynamic deadline, capped at admission+15s | Future Eventual PUT scheduler and proposed `ReplicaClient.call_replica(..., attempt_lease=...)` path | PROPOSED; KD-12/14 pending |
+### `attempts.py`
 
-The proposal connects through the existing `NodeRuntime`: it captures one Store
-context and durable local generation, passes work to the appropriate coordinator,
-and keeps network calls outside lifecycle locks. The current `NodeRuntime.call_replica`
-is still only a single-target primitive. `ReplicaRequest`/`ReplicaResponse` currently
-support schema 1 and `phase="local"`; the design proposes a strict schema-2
-`operation_id` plus protocol phases while retaining the C5 binary framing. The
-proposed phases are `strong_query`, `strong_write`, `strong_readback`,
-`eventual_read`, and `eventual_put`. No protocol phase, quorum collector, Strong
-allocator, coordinator, or operation wrapper has been implemented or tested.
+| Function/type | Inputs → output; behavior and callers | Status |
+|---|---|---|
+| `AttemptCancelled` | Exception raised when a queued or active lease-bound attempt is explicitly canceled | I; KD-08/12/14 |
+| `AttemptLease.__init__` | Admission time, 5s foreground, 10s continuation, 15s hard maximum and injectable monotonic clock → one lock-protected lease | I; approved KD-12/C6 |
+| `foreground_deadline`, `hard_deadline`, `current_deadline`, `foreground_finished`, `cancelled` | Lease → read-only state/deadline snapshots | I; callers in lease-aware RPC and coordinator tests |
+| `finish_foreground(completed_at=None)` | Foreground completion/timeout time → continuation deadline `min(completion+10s, admission+15s)`; may run only once | I; future Eventual PUT orchestration; tested primitive |
+| `check()` | No input → remaining time or `AttemptCancelled`/`TimeoutError`; uses current dynamic deadline | I; lease socket steps |
+| `cancel()` | No input → bool; idempotently cancels only a live lease | I; bounded shutdown/fault handling |
 
-The design relies on local Store evidence, not socket receipt: Strong uses three of
-five owners in each required phase; Eventual GET uses the first R distinct valid
-replies and Eventual PUT uses W distinct durable exact-version acknowledgments. A
-coordinator-only `None` bottom represents initial absence in Strong; it is never
-stored or sent. The exact rules and acceptance tests await explicit human approval.
+### `coordinator.py`
 
-For Eventual PUT only, the design proposes keeping the existing five-second client
-collector deadline separate from each reserved network attempt's `AttemptLease`. The
-current `call_replica` accepts one fixed absolute deadline and therefore needs the
-small lease-aware socket path described in §5.1 of the design; ordinary calls retain
-their fixed deadline API. Five one-shot attempts are reserved before dispatch. After
-the client returns at W or times out, accepted attempts continue until the earlier of
-foreground completion+10 seconds and admission+15 seconds, unless bounded shutdown
-cancels them sooner. This is a proposal, not an implemented behavior.
+This file provides types and generic infrastructure. It does not implement an algorithm
+that issues Strong phases or decides client-facing Eventual results.
 
-The proposed schema-2 rollout is a one-time activation gate based on a full
-ten-identity release/version inventory. It is not a per-operation all-node health
-check. After activation, incompatible/offline owners do not qualify; each request
-still contacts only its five prescribed owners and may complete when its own Strong
-or Eventual response threshold is met. No schema downgrade is allowed.
+| Function/type | Inputs → output; behavior and callers | Status |
+|---|---|---|
+| `OperationStatus`, `OwnerOutcome`, `AttemptState` | Enumerate client-result, per-owner and scheduler states without conflating absence, transport failure or overload | I; KD-08/14/15 |
+| `ProtocolResult.__post_init__` | Validate status/value/version shape and canonical UUID4 operation ID | I; future coordinator result contract |
+| `RpcCompletion.__post_init__` | Require typed `RpcOutcome` and finite monotonic completion time | I; `collect_distinct` |
+| `QualifiedReply`, `OwnerFailure`, `QuorumCollection`, `OwnerCall`, `AttemptReport` | Carry response/request evidence, explicit failures, threshold result and any still-running owner calls | I; future coordinators |
+| `AttemptLedger` | Five distinct owner IDs → one validated per-owner state machine with terminal outcome and release callback | I; C6 shared tracking |
+| `Schema2Activation.from_inventory`, `.from_file`, `.enabled_for` | Manifest and complete ten-identity, same-release schema inventory → explicit activation object; this is a deployment assertion, not a per-operation health check | I; approved rollout contract; local fixtures only |
+| `CapacityReservation.submit`, `.close`, `.remaining` | Reserved count and tasks → queued tasks or released unused slots; no unbounded thread/queue growth | I; KD-14/C6 |
+| `BoundedExecutor.reserve`, `.submit`, `._submit_reserved`, `._release_unused`, `._worker`, `._finish_job`, `._cancel_queued`, `.shutdown` | Fixed worker count, bounded queue and deadline → atomic capacity reservation, Future, explicit overload/timeout or shutdown report; exact active/queued/unsubmitted accounting | I; approved 16/32 coordinator and 16/64 attempt defaults |
+| `CoordinatorResources.reserve_attempts`, `.shutdown` | Node-owned worker groups and total shutdown budget → separate coordinator/attempt reservations and combined report | I; KD-14/C6 |
+| `dispatch_owner(client, node, request, *, deadline, expected_generation, executor, reservation=None, attempt_lease=None)` | One validated request → one Future-backed RPC with generation captured at dispatch; no retry and no quorum decision | I; NodeRuntime, future coordinators |
+| `_qualifies(phase, request, response)` | Phase and validated request/response → protocol-specific evidence bool: Strong at-least durable rules, Eventual exact-version W rule, or valid read result | I; approved KD-11/12 predicates, not a coordinator |
+| `collect_distinct(...)` | Exactly five prescribed owner calls, threshold, phase/context/operation and absolute deadline → `QuorumCollection`; validates request/response binding, counts each identity once, stops at threshold, and keeps Eventual PUT attempts in `continuing` even after W or when W is impossible | I; approved KD-08/11/12/15 shared collector |
+
+`QuorumCollection.continuing` is important: an Eventual PUT caller must supervise those
+owner futures until each attempt has a terminal outcome or the separate lease/shutdown
+boundary. Reaching W does not cancel them; an impossible W threshold does not cancel
+remaining fanout either. Strong/read calls cancel only queued unneeded calls and expose
+non-cancelable active calls as continuing. This preserves attempt ownership without
+implementing the Eventual coordinator.
+
+### Changed integration points
+
+`ReplicaRequest` and `ReplicaResponse` now encode schema 2 with operation IDs and the
+approved protocol phase set. Schema 1 remains valid only for `phase="local"` and carries
+no operation ID. `ReplicaService` handles schema-2 READ_LOCAL/INSTALL_IF_NEWER through
+the existing Store methods only when passed a complete compatible-release activation;
+it never decides quorum success. `NodeRuntime` owns separate bounded coordinator and
+outbound-attempt executors, can reserve outbound capacity, and can dispatch one schema-2
+owner call. Activation is supplied explicitly with `--schema2-inventory`; no operation
+contacts all ten VMs for a compatibility check. All paths still use the same NodeRuntime.
+
+`Store` migrates schema-1 metadata to schema 2 within one SQLite transaction, preserves
+all rows, derives a Strong high-water mark from existing Strong records, and fails closed
+on malformed metadata. `allocate_strong_version` reserves `max(observed_counter,
+local_high_water)+1` in a short durable transaction. Same-process concurrency is serialized
+only during this transaction; no network lock is held. The persisted high-water survives
+SIGKILL/restart. Full mode-switch rules remain KD-16 work.
+
+### Tests added in this batch
+
+`tests/test_coordinator.py` covers AttemptLease timing/cancellation, bounded atomic
+reservations, forced shutdown accounting, distinct-owner threshold evidence, duplicate
+owners, NOT_FOUND versus transport errors, Eventual SUPERSEDED exclusion, retained
+Eventual PUT fanout after W and when W becomes impossible, and dispatch-generation
+binding. `tests/test_storage.py` adds Strong concurrent allocation/restart and preserving
+schema migration/interrupted migration tests. `tests/test_rpc.py` covers schema-2 phase
+and operation-ID validation plus the compatible inventory gate. `tests/test_node_runtime.py`
+uses real loopback TCP for Strong schema-2 and Eventual lease-bound installs/reads.
+`tests/test_replica.py` checks fail-closed rejection when schema 2 is not activated.
+
+The full suite and command results are recorded at the end of IMPLEMENTATION_PLAN.md;
+those results are local only. No ten-VM validation or distributed consistency result is
+claimed.
+
+### Future protocol coordinators (not implemented)
+
+| Proposed interface | Purpose and dependencies | Status |
+|---|---|---|
+| `StrongCoordinator.put/get` | Two-phase Q=3 ABD using `dispatch_owner`, `collect_distinct`, Store allocator, and fixed owners | DESIGN APPROVED; IMPLEMENTATION NOT_STARTED (A-01) |
+| `EventualNoRRCoordinator.put/get` | Configurable R/W, first-R maximum, five-owner propagation and lease supervision | DESIGN APPROVED; IMPLEMENTATION NOT_STARTED (E-01) |
+| `EventualRRCoordinator` and full mode/CLI integration | Read repair, cluster-wide epoch transition, files/commands | Deferred to Step 4; KD-13/full KD-16 pending |

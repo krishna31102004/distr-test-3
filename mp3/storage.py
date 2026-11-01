@@ -94,21 +94,51 @@ class Store:
                     db.execute("CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
                     db.execute("CREATE TABLE records (key TEXT PRIMARY KEY, kind TEXT NOT NULL, number TEXT NOT NULL, writer TEXT NOT NULL, value BLOB NOT NULL)")
                     db.executemany("INSERT INTO meta VALUES (?,?)", [
-                        ("schema", "1"), ("vm_id", vm_id), ("epoch", "1"),
-                        ("mode", bootstrap.mode.value), ("generation", "0"), ("last_timestamp", "0")])
+                        ("schema", "2"), ("vm_id", vm_id), ("epoch", "1"),
+                        ("mode", bootstrap.mode.value), ("generation", "0"),
+                        ("last_timestamp", "0"), ("strong_counter", "0")])
                 if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                     raise StorageError("database integrity check failed")
-                self._context = self._read_context(db)
                 metadata = dict(db.execute("SELECT name,value FROM meta"))
-                if set(metadata) != {"schema", "vm_id", "epoch", "mode", "generation", "last_timestamp"} or metadata["schema"] != "1" or metadata["vm_id"] != vm_id:
+                schema1 = {"schema", "vm_id", "epoch", "mode", "generation", "last_timestamp"}
+                schema2 = schema1 | {"strong_counter"}
+                if metadata.get("vm_id") != vm_id:
                     raise StorageError("invalid schema/identity metadata")
+                if metadata.get("schema") == "1" and set(metadata) == schema1:
+                    # Validate all old state before changing metadata. SQLite makes
+                    # the data-preserving schema bump and Strong high-water insert
+                    # one atomic transaction; a killed migration rolls back wholly.
+                    self._context = self._read_context(db)
+                    _natural(metadata["generation"])
+                    _natural(metadata["last_timestamp"])
+                    strong_high_water = 0
+                    for key, *row in db.execute("SELECT key,kind,number,writer,value FROM records"):
+                        _key(key)
+                        record = self._decode(row)
+                        if record.version.kind != _kind(self._context):
+                            raise StorageError("stored version kind disagrees with mode")
+                        if record.version.kind == "strong":
+                            strong_high_water = max(strong_high_water, record.version.number)
+                    db.execute("INSERT INTO meta(name,value) VALUES ('strong_counter',?)",
+                               (_decimal(strong_high_water),))
+                    db.execute("UPDATE meta SET value='2' WHERE name='schema'")
+                    metadata = dict(db.execute("SELECT name,value FROM meta"))
+                if set(metadata) != schema2 or metadata.get("schema") != "2":
+                    raise StorageError("invalid schema/identity metadata")
+                self._context = self._read_context(db)
                 _natural(metadata["generation"])
                 _natural(metadata["last_timestamp"])
+                strong_high_water = _natural(metadata["strong_counter"])
+                record_high_water = 0
                 for key, *row in db.execute("SELECT key,kind,number,writer,value FROM records"):
                     _key(key)
                     record = self._decode(row)
                     if record.version.kind != _kind(self._context):
                         raise StorageError("stored version kind disagrees with mode")
+                    if record.version.kind == "strong":
+                        record_high_water = max(record_high_water, record.version.number)
+                if strong_high_water < record_high_water:
+                    raise StorageError("Strong counter metadata is below a stored Strong version")
         except Exception as error:
             if self._lockfile is not None:
                 self._lockfile.close()
@@ -224,6 +254,14 @@ class Store:
                 else:
                     stored = previous.version
                     status = S.SUPERSEDED if order < 0 else (S.UNCHANGED if previous.value == record.value else S.VERSION_CONFLICT)
+                if record.version.kind == "strong":
+                    high_water = _natural(db.execute(
+                        "SELECT value FROM meta WHERE name='strong_counter'").fetchone()[0])
+                    committed_number = max(record.version.number,
+                                           0 if previous is None else previous.version.number)
+                    if committed_number > high_water:
+                        db.execute("UPDATE meta SET value=? WHERE name='strong_counter'",
+                                   (_decimal(committed_number),))
             return InstallResult(status, stored, status != S.VERSION_CONFLICT, actual)
         except StaleEpochError as error:
             return InstallResult(S.STALE_EPOCH, None, False, error.context, str(error))
@@ -255,6 +293,36 @@ class Store:
                 db.execute("UPDATE meta SET value=? WHERE name='last_timestamp'", (_decimal(number),))
             return Version("eventual", number, f"{self.vm_id}/{_decimal(generation)}")
         except (sqlite3.Error, ValueError, TypeError) as error:
+            raise StorageError(str(error)) from error
+
+    def allocate_strong_version(self, *, context, observed_max, deadline=None):
+        """Durably allocate a unique local Strong tag above query/local maxima.
+
+        The short write transaction serializes simultaneous local allocations. It
+        does not span network I/O. The committed counter survives process crashes.
+        """
+        try:
+            if observed_max is not None and (
+                    not isinstance(observed_max, Version) or observed_max.kind != "strong"):
+                raise ValueError("observed_max must be a Strong Version or None")
+            with self._transaction(write=True, deadline=deadline) as db:
+                actual = self._check_context(db, context)
+                if actual.mode != ConsistencyMode.STRONG:
+                    raise StorageError("Strong allocation requires Strong context")
+                generation = _natural(db.execute(
+                    "SELECT value FROM meta WHERE name='generation'").fetchone()[0])
+                if generation == 0:
+                    raise StorageError("start_incarnation required before allocation")
+                local_high_water = _natural(db.execute(
+                    "SELECT value FROM meta WHERE name='strong_counter'").fetchone()[0])
+                observed = 0 if observed_max is None else observed_max.number
+                number = max(local_high_water, observed) + 1
+                db.execute("UPDATE meta SET value=? WHERE name='strong_counter'",
+                           (_decimal(number),))
+            return Version("strong", number, f"{self.vm_id}/{_decimal(generation)}")
+        except StaleEpochError:
+            raise
+        except (sqlite3.Error, StorageError, ValueError, TypeError) as error:
             raise StorageError(str(error)) from error
 
     def close(self):

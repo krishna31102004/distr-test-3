@@ -2,8 +2,10 @@
 
 Prepared October 22, 2026; roadmap reconciled with the local October 21 specification.
 **Current gate: Step 2 Batches 1–4 local foundation is VERIFIED and independently
-reviewed on the Batch 4 feature branch. This is not ten-VM deployment verification.
-Coordinator protocols remain pending.** Read AGENTS.md and
+reviewed. Step 3 design KD-11/KD-12 and scoped KD-08/10/14/15 refinements were
+approved October 31, 2026. Step 3 Batch 1 shared infrastructure is implemented and
+independently reviewed; Strong/Eventual coordinator algorithms remain unimplemented.
+This is not ten-VM deployment verification.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
 completed so far is local storage/versioning, fixed ring/membership/recovery,
@@ -35,20 +37,22 @@ Evaluation: demo 60%, report 30%, code quality 10%.
 
 Follow the steps in order; use the detailed checklist, audit and task table below
 for specifics. Approvals are entry gates before implementation, not extra phases.
-Step 2 Batches 1–4 are complete for the local foundation; ten-VM validation, multi-owner
-coordinator integration, and Steps 3–6 remain future work. Task statuses below reflect verified local work.
+Step 2 Batches 1–4 are complete for the local foundation and Step 3 Batch 1 shared
+infrastructure is verified. Strong/Eventual multi-owner protocol coordinators, ten-VM
+validation, and Steps 4–6 remain future work. Task statuses below reflect verified local work.
 KD direction approvals and C1–C6 contract approvals remain recorded; deferred protocol
 decisions remain pending.
 
 **Current approval authority:** Krishna alone approves the exact handoff. Joint
 ownership/coordination below is retained, not an additional approval requirement.
-All C1–C6 foundation schemas/signatures are approved; deferred protocol details remain pending.
+All C1–C6 foundation schemas/signatures and the scoped Step 3 design are approved;
+KD-13, full KD-16, final KD-17 choices, KD-18 and VM runtime verification remain pending.
 
 **Mandated versus chosen:** Ten VMs, N=5, fixed owners, MP1/MP2 reuse, durable
 recovery, concurrent operations without global locks, the three consistency guarantees,
 mode-clear semantics, command/output requirements and experiments come from SPEC.md.
 Humans approve their implementation choices under the KDs. A multi-writer atomic
-register is required; two-phase ABD remains proposed under KD-11. Infinite-suspicion recovery and
+register is required; the two-phase ABD design is approved under KD-11 but not implemented. Infinite-suspicion recovery and
 SHA-256 are Krishna-approved directions; exact detector and hashing contracts below
 are approved as C1/C2 contracts; their implementations remain future work.
 
@@ -57,8 +61,9 @@ are approved as C1/C2 contracts; their implementations remain future work.
 - **Work / owners:** Krishna completed the reuse audit, local utilities/tests and
   shared docs; an independent reviewer checked them. Juhi's future ownership is
   recorded. Tasks P0-01..07; MP1/MP2 remain unchanged.
-- **Approval first:** None needed for these limited prototypes. **Can wait:** all
-  KD-01..18 are still PENDING; prototype tests approve no final architecture.
+- **Approval first:** None needed for these limited prototypes. **Historical status:**
+  at the Phase 0 gate all KD decisions were pending; later scoped approvals are
+  recorded in KEY_DECISIONS.md.
 - **Exit evidence:** Prior 34-test pass, smoke/compile and review records in
   VERIFICATION.md / REVIEW.md; every distributed command remains NOT_IMPLEMENTED.
 
@@ -69,14 +74,14 @@ are approved as C1/C2 contracts; their implementations remain future work.
   membership/recovery foundation are independently implemented and locally verified.
   Krishna's bounded KV RPC replica service/client (N-01) is now implemented and
   locally reviewed. Batch 4's joint `NodeRuntime` now starts and stops those foundations
-  in order, without implementing a multi-owner coordinator. Ownership is unchanged.
-  **Next:** obtain the deferred Step 3 protocol decisions, then Krishna and Juhi can
-  build their separately owned coordinators against this integrated local foundation.
+  in order, without implementing a multi-owner coordinator. Step 3 Batch 1 shared
+  coordinator infrastructure is now implemented and reviewed. Ownership is unchanged.
+  **Next:** Krishna and Juhi can build their separately owned protocol coordinators
+  against this integrated local foundation.
 - **Decisions already approved for these foundations:** KD-02/03/04/05/06/07/09/14/15
-  and the applicable C1–C6 contracts. KD-01's VM runtime compatibility, KD-08's
-  protocol-specific qualifications, KD-10's Strong allocation and KD-16's full
-  cluster switching remain unresolved or deferred as recorded in KEY_DECISIONS.md.
-- **Can wait:** KD-11/12 until Step 3; KD-13, full KD-16 and final KD-17 until
+  and the applicable C1–C6 contracts. KD-01's VM runtime compatibility and KD-16's
+  full cluster switching remain unresolved or deferred as recorded in KEY_DECISIONS.md.
+- **Can wait:** KD-13, full KD-16 and final KD-17 until
   Step 4; KD-18 until Step 6. Do not implement ABD, Eventual protocols, repair,
   mode switching or command integration as part of this step update.
 - **Verified local evidence:** Batch 1 store/version, Batch 2 ring/membership, Batch 3
@@ -88,11 +93,13 @@ are approved as C1/C2 contracts; their implementations remain future work.
 
 ### Step 3 — Build Strong and Eventual-noRR in parallel
 
-- **Work / owners:** After Step 2 integration, Krishna implements Strong (proposed
-  multi-writer ABD, A-01); Juhi implements noRR (E-01) and completes protocol-specific
-  V-01 support. Use shared interfaces; test each mode separately before switching.
-- **Approve first:** KD-11/12 plus their KD-08/10/14/15 phase-specific response,
-  tag-allocation and contract refinements. Earlier approvals carry forward.
+- **Work / owners:** Design approved October 31. Batch 1 implements common RPC,
+  scheduler, collector, leases and durable Strong tag allocation. After this shared
+  gate, Krishna implements Strong (A-01); Juhi implements noRR (E-01). Use the
+  shared interfaces and test each mode separately before switching.
+- **Approved before implementation:** KD-11/12 plus scoped KD-08/10/14/15 phase,
+  allocation and contract refinements. KD-13/full KD-16 and final CLI/logging choices
+  remain for Step 4.
 - **Can wait:** KD-13, remaining KD-16/17 until Step 4; KD-18 until Step 6.
   Basic replica receipt/response terminal text is already mandated; emit it now.
 - **Exit evidence:** Strong passes concurrent-history, partial-write/read-writeback
@@ -148,28 +155,27 @@ are approved as C1/C2 contracts; their implementations remain future work.
 
 **Current task gate:** Batches 1–4 provide the locally reviewed storage/version,
 ring/membership, single-replica RPC, and integrated local node lifecycle foundations.
-The shared foundation can start one node and perform one remote replica read/install;
-multi-owner protocols and coordinator integration remain future work. The accepted KD directions must not be reopened
+Step 3 Batch 1 adds the locally reviewed shared coordinator primitives and one-owner
+dispatch; Strong/Eventual multi-owner operations remain future work. The accepted KD directions must not be reopened
 without a concrete specification conflict or serious correctness issue. Defer KD-11/12
 to Step 3, KD-13/full KD-16/final KD-17 to Step 4, and KD-18 to Step 6.
 
-### Step 3 design gate — prepared, awaiting Krishna's approval
+### Step 3 design gate — historical snapshot, superseded by approval below
 
-`STEP3_PROTOCOL_DESIGN.md` specifies proposed Strong multi-writer ABD, Eventual-noRR,
+`STEP3_PROTOCOL_DESIGN.md` specifies Strong multi-writer ABD, Eventual-noRR,
 shared RPC/coordinator extensions, response qualification, bounded resources,
-deadlines, failure cases, and acceptance tests. The proposal is independently
-reviewed before implementation; it is **not approved and does not authorize code**.
-KD-11 and KD-12 remain PENDING. The approved C1–C6 foundation remains intact, and
-all existing ownership, task IDs and implementation statuses remain unchanged.
+deadlines, failure cases, and acceptance tests. The design was independently reviewed
+and explicitly approved on October 31, 2026. This paragraph preserves the earlier
+pre-approval gate for history; the current approval and Batch 1 evidence are at the
+end of this plan. KD-13/full KD-16 remain pending. Ownership and C1–C6 remain intact.
 
-The proposed Step 3 implementation order is:
+The approved Step 3 implementation order is:
 
 1. **Batch 1 — Shared coordinator infrastructure (Joint boundary review; Krishna owns
-   RPC/routing changes, Juhi owns storage/version changes):** after approval of the
-   affected KD-08/10/14/15 details, add operation-ID binding, strict phase-aware RPC
+   RPC/routing changes, Juhi owns storage/version changes):** the approved KD-08/10/14/15
+   details authorize operation-ID binding, strict phase-aware RPC
    validation, distinct-owner collection, deadline handling and bounded capacity
-   reservation. Add the Strong durable counter allocator only if KD-11 allocation
-   is approved. Acceptance covers fixed five-owner dispatch, duplicate/late/wrong
+   reservation and the Strong durable counter allocator. Acceptance covers fixed five-owner dispatch, duplicate/late/wrong
    evidence rejection, timeouts vs absence, overload, shutdown and restart.
 2. **Batch 2 — Strong ABD (Krishna):** after Batch 1 interfaces integrate, implement
    two-phase PUT and GET with Q=3, bottom handling, durable tag allocation and
@@ -188,11 +194,12 @@ Batch 1 is a shared-interface gate: neither protocol coordinator should begin un
 the RPC schema/phase contract, result types, quorum-evidence predicates and resource
 reservation behavior are integrated. Strong and noRR implementation can then proceed
 in parallel against those contracts. Reviewer acceptance of this design is not
-human approval; Krishna must explicitly approve the listed pending KD questions.
+human approval; Krishna approved this design on October 31, 2026. Later implementation
+is still gated on each batch's code review, tests, and publication.
 Step 4 read repair, complete mode switching, command integration and logging remain
 deferred as already recorded below.
 
-**Design review and baseline evidence:** The independent GPT-6 Luna/high reviewer
+**Historical design review and baseline evidence:** The independent GPT-6 Luna/high reviewer
 inspected the actual specification, source, tests and proposed interfaces. The
 review found no substantive ABD or Eventual-noRR correctness blocker, and requested
 two clarifications: dispatch-time generation binding for in-flight responses and
@@ -767,9 +774,10 @@ is the initial agreement from the prompt; coordinate before cross-owner edits.
 | R-01 | Krishna | Hash/ring construction and routing | I-01; KD-02/03 | SHA-256 vectors, canonical manifest, cross-process five-owner selection, failed-owner stability | VERIFIED |
 | N-01 | Krishna | Concurrent bounded single-replica RPC client/service | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, total deadlines, response binding, overload and loopback store integration | VERIFIED |
 | S-01 | Juhi | Persistent atomic monotonic store (local Batch 1 verified; VM evidence in F-01) | I-01; KD-09/10/15 and KD-16 interface boundary (full switch in C-02) | Temporary crash/restart, value+tag atomicity, conditional install | VERIFIED |
-| V-01 | Juhi; Krishna reviews Strong tags | Shared version foundations in Step 2; protocol-specific allocation in Step 3 | I-01; KD-03/10 first; KD-11 before Strong allocation | Same-process concurrency, rollback, restart, tag immutability | IN_PROGRESS |
-| A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01; KD-11 | Adversarial multi-writer/read-writeback linearizability histories | BLOCKED_BY_DECISION |
-| E-01 | Juhi | Eventual-noRR | R-01,N-01,S-01,V-01; KD-12 | All-owner fanout, W durable acks, R max, background completion | BLOCKED_BY_DECISION |
+| V-01 | Juhi; Krishna reviews Strong tags | Shared version foundations plus durable Strong allocator; no Strong coordinator | I-01; KD-03/10; approved KD-11 allocator contract | Concurrent allocation, observed/local high-water, restart and preserving schema migration | VERIFIED |
+| SC-01 | Joint (Krishna RPC/routing; Juhi storage/version; reviewer independent) | Step 3 Batch 1 shared coordinator evidence/scheduling foundation | Approved KD-08/10/11/12/14/15; I-02 | Schema-2 strictness; distinct owner collector; bounded reservations; lease deadlines; Strong allocator; loopback; all 153 tests | VERIFIED |
+| A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01,SC-01; approved KD-11 | Adversarial multi-writer/read-writeback linearizability histories | NOT_STARTED |
+| E-01 | Juhi | Eventual-noRR | R-01,N-01,S-01,V-01,SC-01; approved KD-12 | All-owner fanout, W durable acks, R max, background completion | NOT_STARTED |
 | E-02 | Juhi | Eventual-RR | E-01; KD-13/16/17 | Early response, late max, missing/stale repairs, racing newer PUT | BLOCKED_BY_DECISION |
 | L-01 | Joint | Required operation logs and MP1 query integration | N-01,protocols; KD-17 | Real receipt/response records, local then approved VM query | BLOCKED_BY_DECISION |
 | C-01 | Joint | Actual CLI/files/multiput/output integration | Modes, L-01; KD-14; SPEC.md command/output requirements | Eight commands, empty/1 MiB files, required completion info | BLOCKED_BY_DECISION |
@@ -1186,25 +1194,65 @@ to continue.
 The Step 2 local foundation remains VERIFIED after this correction. No ten-VM test
 was run; Step 3 and the consistency protocols remain untouched.
 
-### Step 3 design-gate clarification — October 31, 2026
+### Step 3 design-gate clarifications — October 31, 2026 (approved and implemented where scoped)
 
-The design document now resolves two implementation details without changing the
-approved C1–C6 directions. For Eventual PUT, reserve all five one-shot owner attempts
-before dispatch. The coordinator's five-second foreground deadline decides when the
-client receives W success or timeout. A shared, lock-protected `AttemptLease` then
-allows accepted in-flight and queued attempts to continue until the earlier of ten
-seconds after foreground completion and fifteen seconds after admission. The current
-`ReplicaClient.call_replica` has only a fixed deadline; Step 3 implementation must add
-a lease-aware, bounded-poll socket path while preserving the existing fixed-deadline
-API. Shutdown may cancel sooner only with explicit per-owner incomplete outcomes and
-must not close SQLite under live workers. This is a proposed KD-12/KD-14 refinement,
-not implemented behavior or a changed C6 budget.
+The reviewed design was approved before Batch 1. Eventual PUT reserves all five
+one-shot owner attempts before dispatch. The five-second foreground deadline governs
+when the client receives W success or timeout; accepted in-flight and queued attempts
+continue under the shared `AttemptLease` until the earlier of ten seconds after
+foreground completion or fifteen seconds after admission. The lease-aware RPC uses
+bounded polling and preserves the existing fixed-deadline API. Bounded shutdown can
+report incomplete per-owner outcomes; it does not close SQLite beneath live workers.
+These are the approved C6/KD-12 budgets, and the shared mechanism is implemented and
+locally verified in Batch 1. The Eventual PUT coordinator that uses it remains
+NOT_STARTED.
 
-Schema-2 activation is proposed as a one-time rollout gate based on a compatible-build
-inventory for all ten fixed VM identities. It is not a health check before each
-operation. Once activated, operations contact only their five prescribed owners;
-unsupported or unavailable peers are nonqualifying, with no schema downgrade or
-owner substitution. Strong still needs three distinct compatible owners, while
-Eventual uses its configured R/W threshold. KD-11/KD-12 and protocol-specific
-extensions remain PENDING. The Step 3 design is prepared for Krishna's approval;
-implementation has not started.
+Schema-2 activation is a one-time explicit release-inventory gate for all ten fixed
+VM identities, not a per-operation health check. After activation, operations contact
+only their five prescribed owners; unsupported or unavailable peers are
+nonqualifying, with no schema downgrade or owner substitution. Strong can complete
+with three distinct compatible prescribed owners; Eventual uses configured R/W.
+This local activation/configuration boundary is implemented. It does not prove
+ten-VM rollout compatibility; no university VM was checked.
+
+## Step 3 Batch 1 execution evidence — October 31, 2026
+
+Krishna approved the reviewed Step 3 design at baseline commit
+`38a2293db54b9238d780c650276e0d3b60305e4a`. Batch 1 implements schema-2 phase-aware
+RPC while preserving schema-1 `local`, `operation_id` and request correlation, the
+explicit ten-identity compatible-release activation gate, shared result/failure
+records, five-owner distinct response collection, bounded coordinator/outbound
+scheduling, `AttemptLease`, and `Store.allocate_strong_version` with preserving
+schema-1-to-2 SQLite metadata migration. `NodeRuntime` owns these resources and offers
+single-owner dispatch; it does not expose a multi-owner consistency operation.
+
+The independent GPT-6 Luna/high reviewer found two collector defects and requested
+fixes. At W and when W was impossible, collector cancellation could have stopped
+reserved Eventual PUT fanout. `QuorumCollection.continuing` now retains the unfinished
+owner calls in both cases; Strong/read phases cancel only work that has not started
+and expose active work. New deterministic tests verify W reached and W impossible.
+The reviewer also recommended and the main agent added constructor validation for
+finite completion timestamps and canonical UUID4 result operation IDs. Reviewer made
+no source or test edits.
+
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **153 passed in 17.118s**.
+- Independent reviewer: same full suite — **153 passed in 16.871s**.
+- Main focused: `python3 -B -m unittest mp3.tests.test_coordinator -v` — **13 passed in 0.199s**.
+- Main focused: `python3 -B -m unittest mp3.tests.test_storage mp3.tests.test_rpc -v` — **36 passed in 0.769s**.
+- Independent reviewer focused coordinator suite — **13 passed in 0.195s**.
+- `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` — all exited 0.
+
+Real local loopback tests exercised schema-2 Strong read/install and Eventual-noRR
+lease-bound install from one NodeRuntime to another, through remote SQLite storage.
+Tests also verify fail-closed activation without schema downgrade, preserved Strong
+counter migration, interrupted migration rollback, concurrent durable allocation,
+three distinct-owner threshold evidence, and retained five-owner attempt futures.
+These are local unit, loopback, and subprocess results; **no university VMs were
+contacted** and no full Strong ABD or Eventual-noRR operation was run. KD-13, full
+KD-16, CLI/logging decisions and all eight user-facing KV commands remain deferred.
+
+SC-01 and V-01 are VERIFIED for the shared Batch 1 infrastructure. A-01 and E-01
+are NOT_STARTED: the next implementation batch will build the actual Strong ABD
+coordinator on top of these reviewed interfaces. Eventual-noRR follows as Batch 3.

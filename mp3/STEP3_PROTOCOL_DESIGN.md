@@ -1,10 +1,11 @@
-# Step 3 protocol design — proposed for human approval
+# Step 3 protocol design — approved design, protocols not implemented
 
-**Status: DESIGN PROPOSED / NOT IMPLEMENTED.** This document translates the
-October 21 specification and the approved C1–C6 foundation into a concrete design
-for Strong ABD and Eventual-noRR. It is a proposal for Krishna's review. KD-11 and
-KD-12 remain PENDING; the recommendations below do not approve them. No production
-protocol code is part of this handoff.
+**Status: DESIGN APPROVED by Krishna on October 31, 2026; shared Batch 1
+infrastructure is implemented and independently reviewed. Strong ABD and
+Eventual-noRR coordinator algorithms remain NOT IMPLEMENTED.** Approval references
+the reviewed design baseline `38a2293db54b9238d780c650276e0d3b60305e4a`. This document
+remains the protocol contract; Batch 1 implementation evidence is recorded in the
+implementation plan. No claims here imply that a full distributed PUT/GET works.
 
 ## 1. Authority, requirements, and current boundary
 
@@ -47,12 +48,16 @@ protocol code is part of this handoff.
   the working lifecycle; Step 3 should extend it rather than create a competing
   runtime.
 
-### New proposals
+### Approved design and implementation boundary
 
-All interfaces, phase names, qualification rules, capacities and refinements below
-are **PROPOSED — AWAITING HUMAN APPROVAL**. The two proposed coordinator protocols
-are future behavior, not implemented or locally verified. The only correctness
-claims below are informal design reasoning; they are not a formal proof.
+The protocol interfaces, phase names, qualification rules, capacity defaults and
+refinements below were approved by Krishna on October 31, 2026. KD-11 and KD-12 are
+approved as design decisions; implementation status is separate. Batch 1 implements
+schema-2 local RPC support, response evidence types/collection, bounded scheduling,
+lease-aware attempts, and durable Strong tag allocation. It does not implement either
+protocol's coordinator algorithm. KD-13, full KD-16, final logging/CLI decisions,
+deployment and benchmarking remain deferred. Correctness discussion below is
+informal design reasoning, not a formal proof.
 
 ## 2. Shared protocol model
 
@@ -310,7 +315,7 @@ other than the one captured for its own dispatch is invalid evidence.
 
 ## 4. Strong multi-writer ABD proposal (KD-11)
 
-**PROPOSED — AWAITING HUMAN APPROVAL.** Use Q=3 for both phases because 3-of-5
+**Approved by Krishna, October 31, 2026.** Use Q=3 for both phases because 3-of-5
 majorities intersect. Each phase sends concurrently to the fixed five owners; phase
 completion needs three distinct valid owner identities. The caller may return after
 the quorum threshold; remaining phase attempts are bounded and late replies are
@@ -385,7 +390,7 @@ durable responses, the GET returns TIMEOUT/ERROR and does not return the candida
 a successful Strong read. Some readback writes may have committed; the operation
 result records incomplete/unknown side effects. For an all-bottom query, there is no
 record or tagged value to write back; the explicit three-replica absence quorum can
-return NOT_FOUND. This is the proposed bottom rule, not yet approved.
+return NOT_FOUND. This is the approved bottom rule.
 
 ### 4.3 Strong completion and safety reasoning
 
@@ -433,7 +438,7 @@ owner replacement or weaken a quorum.
 
 ## 5. Eventual-noRR proposal (KD-12)
 
-**PROPOSED — AWAITING HUMAN APPROVAL.** N stays five. R and W are independently
+**Approved by Krishna, October 31, 2026.** N stays five. R and W are independently
 configurable integers 1..5, initially R=W=2. Each operation captures configuration,
 mode context and one absolute foreground deadline at admission. No read repair occurs
 in this mode.
@@ -783,8 +788,9 @@ existing schema/identity/context first, and retain record rows. Whether the coun
 is retained across a future Strong↔Eventual epoch switch is a KD-16-dependent detail;
 it must never allow an old-epoch message to pass Store's exact epoch validation.
 
-No Strong allocator exists yet. Do not use `time.time_ns()` as a substitute for the
-phase-1 maximum.
+The durable Strong allocator is implemented and locally tested in Batch 1; the Strong
+ABD coordinator that obtains the phase-1 maximum and invokes it does not exist yet.
+Do not use `time.time_ns()` as a substitute for the phase-1 maximum.
 
 ## 9. Eventual allocator adequacy
 
@@ -798,22 +804,24 @@ writer IDs. Allocation metadata commits before a tag can be sent. This is verifi
 foundation behavior, not proof of cross-machine clock accuracy; timestamps decide
 Eventual's specified LWW order, not Strong linearizability.
 
-## 10. Approval questions (only new protocol details)
+## 10. Historical approval questions and recorded answers
 
-The following are the concrete KD-11/KD-12/KD-08/KD-14 decisions requested for
-Krishna's design review. KD-01..07 and the approved C1–C6 directions are not reopened.
+This table records the concrete KD-11/KD-12/KD-08/KD-14 questions presented before
+the October 31 design approval and Krishna's recorded answers. It is decision
+provenance, not a request for another approval. KD-01..07 and settled C1–C6
+directions are not reopened.
 
-| ID | Question for Krishna | Recommended default |
+| ID | Question answered by Krishna | Recorded approved direction |
 |---|---|---|
-| KD-11-A | Approve `None` as coordinator-only Strong bottom, with all-absent majority GET returning NOT_FOUND without installing a bottom record? | Yes; never serialize/persist bottom |
-| KD-11-B | Approve phase names and schema-2 `operation_id` extension while retaining schema-1 `local` primitive only and no downgrade? | Yes; `strong_query`, `strong_write`, `strong_readback`; disable protocol against mixed versions |
-| KD-11-C | Approve counting durable `SUPERSEDED` with strictly greater stored version as Strong write/readback quorum evidence? | Yes for Strong only; never count equal-tag conflicts |
-| KD-11-D | Approve `allocate_strong_version(context, observed_max)` using a committed local counter greater than both observed counter and local high-water? | Yes; metadata migration preserves records and counter survives process restart |
-| KD-12-A | Approve Eventual PUT W evidence as exact requested version in durable INSTALLED/UNCHANGED only, with SUPERSEDED excluded? | Yes; conservative and directly proves this value/version is durably installed |
-| KD-12-B | Approve R/W defaults 2/2, first-R max selection, all-explicit-absence requirement, and no repair in noRR? | Yes; within mandated configurable 1..5 rules |
-| KD-12-C | Approve atomic reservation of all five owner attempts and applying the already approved C6 continuation to them? | Yes; reuse the approved five-second foreground, ten-second continuation, fifteen-second total cap, and one attempt per owner; no dropped accepted work/retries |
-| KD-08/14 | Approve one operation ID across phases, request ID per RPC, and the shared 16-active/64-queued outbound-attempt capacity? | Yes; reuse C6's approved single monotonic foreground deadline; overload before writes if required reservations are unavailable |
-| KD-14 | For shutdown, may a configured bound truncate accepted Eventual background attempts and report them incomplete? | Yes; preserve foreground result and never claim unfinished writes succeeded |
+| KD-11-A | Strong bottom and all-absent GET behavior | `None` is coordinator-only; three explicit absence replies may return NOT_FOUND without storing bottom |
+| KD-11-B | Phase names and schema-2 operation correlation | Strong phases are `strong_query`, `strong_write`, `strong_readback`; schema 1 remains `local` only; no downgrade |
+| KD-11-C | Strong `SUPERSEDED` evidence | Strictly greater durable stored version may qualify for Strong install/readback; conflicts never qualify |
+| KD-11-D | Strong tag allocation | Durable counter exceeds observed maximum and local high-water; migration preserves records and allocator state |
+| KD-12-A | Eventual PUT W evidence | Exact requested version with durable `INSTALLED`/`UNCHANGED`; `SUPERSEDED` excluded |
+| KD-12-B | Eventual read selection | R/W 1..5, default 2/2; max of first R distinct valid replies; all R absences mean NOT_FOUND; no noRR repair |
+| KD-12-C | Eventual fanout and continuation | Reserve five one-shot attempts; 5s foreground, 10s continuation, 15s total cap; no retries or silent loss |
+| KD-08/14 | Correlation and capacity | One operation ID across phases, fresh request ID per RPC, bounded 16-active/64-queued outbound attempts, overload before dispatch if reservation fails |
+| KD-14 | Shutdown of accepted continuation | Bounded shutdown may report incomplete per-owner work; it cannot claim unfinished writes succeeded |
 
 This approval set does **not** approve Step 4 read repair, cluster-wide mode switching,
 new command behavior, deployment, or remote VM tests. KD-13 and full KD-16 remain
@@ -822,19 +830,19 @@ roadmap steps.
 
 ## 11. Step 3 implementation batches and acceptance
 
-This is the proposed decomposition. Implementation begins only after the human
-explicitly approves the relevant decisions. The existing ownership record remains:
+This is the approved decomposition. Batch 1 is implemented and reviewed. Remaining
+protocol implementations require their own batch gates. The existing ownership record remains:
 Krishna owns membership/routing/RPC and Strong ABD; Juhi owns storage/versioning and
 Eventual-noRR; shared APIs must be jointly integrated without silently moving that
 ownership.
 
 ### Step 3 Batch 1 — Shared coordinator infrastructure
 
-**Work:** add bounded coordinator admission and outbound attempt scheduling, operation
+**Work (completed):** add bounded coordinator admission and outbound attempt scheduling, operation
 IDs, strict distinct-owner response collection, protocol result/failure types,
-context/generation evidence checks, and the schema-2 phase extension. Add the
-Strong allocator storage migration/API only if KD-11-D is approved. No Strong or
-Eventual coordinator behavior is enabled by this batch.
+context/generation evidence checks, and the schema-2 phase extension. The approved
+Strong allocator storage migration/API is implemented. No Strong or Eventual
+coordinator behavior is enabled by this batch.
 
 **Acceptance:** fixed five-owner dispatch; duplicate responses count once; wrong
 owner/request/phase/context/generation is rejected; deadline covers every phase;
@@ -896,4 +904,5 @@ Step 3. Ten-VM validation belongs to later Step 5 and is not implied by local te
 - [ ] Missing, empty, timeout, conflict, overload and uncertain completion remain distinct.
 - [ ] Every phase validates operation/request IDs, owner, context and generation.
 - [ ] Bounded resources, shutdown and no-lock-across-network rules are concrete.
-- [ ] All new decisions remain PENDING until Krishna explicitly approves them.
+- [x] KD-11/KD-12 and the scoped KD-08/10/14/15 Step 3 design were approved by Krishna on October 31, 2026.
+- [ ] Protocol implementations remain pending their own batch verification gates.

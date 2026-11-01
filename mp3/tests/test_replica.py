@@ -25,7 +25,7 @@ from mp3.replica import ReplicaService
 from mp3.ring import Endpoint, Manifest
 from mp3.rpc import (
     MAX_RPC_PAYLOAD, ReplicaClient, ReplicaRequest, ReplicaResponse, RpcOperation,
-    RpcOutcomeKind, RpcStatus, encode_response, new_request, receive_request,
+    RpcOutcomeKind, RpcStatus, encode_response, new_operation_id, new_request, receive_request,
     receive_response, send_request,
 )
 from mp3.storage import open_store
@@ -129,6 +129,18 @@ class RpcEnvironment(unittest.TestCase):
 
 
 class ReplicaIntegrationTests(RpcEnvironment):
+    def test_schema2_peer_without_activation_fails_closed_without_downgrade(self):
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=CTX.mode,
+            op=RpcOperation.READ_LOCAL, key="schema2-disabled",
+            phase="eventual_read", schema=2, operation_id=new_operation_id())
+        response = self.raw_call(request)
+        self.assertEqual((response.schema, response.phase, response.status, response.error),
+                         (2, "eventual_read", RpcStatus.ERROR, "SCHEMA2_DISABLED"))
+        self.assertEqual(self.store.read_local("schema2-disabled", context=CTX).status,
+                         LocalStatus.NOT_FOUND)
+
     def test_actual_tcp_read_install_outcomes_and_empty_vs_missing(self):
         missing = self.response(self.make_request(RpcOperation.READ_LOCAL, "photo"))
         self.assertEqual((missing.status, missing.present, missing.version, missing.value),

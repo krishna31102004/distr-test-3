@@ -12,10 +12,11 @@ import uuid
 from mp3.config import MAX_VALUE_BYTES
 from mp3.models import ConsistencyMode, Version
 from mp3.ring import Endpoint, Manifest
+from mp3.coordinator import Schema2Activation
 from mp3.rpc import (
-    MAX_JSON_BYTES, MAX_RPC_PAYLOAD, ReplicaRequest, ReplicaResponse, RpcOperation,
+    MAX_JSON_BYTES, MAX_RPC_PAYLOAD, PROTOCOL_SCHEMA_VERSION, ReplicaRequest, ReplicaResponse, RpcOperation,
     RpcProtocolError, RpcStatus, _encode_json, encode_request, encode_response,
-    new_request, receive_request, receive_response, send_request, send_response,
+    new_operation_id, new_request, receive_request, receive_response, send_request, send_response,
 )
 
 
@@ -156,6 +157,79 @@ class RpcCodecTests(unittest.TestCase):
         self.assertEqual(metadata["sender_generation"], "1")
         self.assertEqual(metadata["epoch"], "1")
         self.assertEqual(metadata["version"]["number"], "7")
+
+    def test_schema2_phase_round_trip_and_operation_correlation(self):
+        operation_id = new_operation_id()
+        one = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=ConsistencyMode.STRONG,
+            op=RpcOperation.READ_LOCAL, key="k", phase="strong_query",
+            schema=PROTOCOL_SCHEMA_VERSION, operation_id=operation_id)
+        two = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm05", epoch=1, mode=ConsistencyMode.STRONG,
+            op=RpcOperation.READ_LOCAL, key="k", phase="strong_query",
+            schema=PROTOCOL_SCHEMA_VERSION, operation_id=operation_id)
+        self.assertEqual(one.operation_id, two.operation_id)
+        self.assertNotEqual(one.request_id, two.request_id)
+        metadata = one.to_metadata()
+        self.assertIn("operation_id", metadata)
+        got = transfer(lambda sock: send_request(
+            sock, one, self.manifest, deadline=time.monotonic() + 2),
+            lambda sock: receive_request(
+                sock, self.manifest, deadline=time.monotonic() + 2))
+        self.assertEqual(got, one)
+
+        response = ReplicaResponse(
+            request_id=one.request_id, manifest_id=self.manifest.fingerprint,
+            sender_id="vm04", sender_generation=4, target_id="vm01", epoch=1,
+            mode=ConsistencyMode.STRONG, op=RpcOperation.READ_LOCAL,
+            phase="strong_query", status=RpcStatus.NOT_FOUND, present=False,
+            schema=PROTOCOL_SCHEMA_VERSION, operation_id=operation_id)
+        self.assertEqual(response.operation_id, one.operation_id)
+        with self.assertRaises(RpcProtocolError):
+            replace(response, operation_id=new_operation_id()).validate_for(
+                one, self.manifest.node("vm04"), self.manifest, 4)
+
+    def test_schema2_rejects_bad_phase_mode_ids_and_extra_fields(self):
+        operation_id = new_operation_id()
+        base = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=ConsistencyMode.STRONG,
+            op=RpcOperation.READ_LOCAL, key="k", phase="strong_query",
+            schema=PROTOCOL_SCHEMA_VERSION, operation_id=operation_id)
+        metadata = base.to_metadata()
+        for malformed in (
+            dict(metadata, surprise=True),
+            dict(metadata, operation_id="not-a-uuid"),
+            dict(metadata, phase="eventual_read"),
+            dict(metadata, sender_generation="0"),
+            {key: value for key, value in metadata.items() if key != "operation_id"},
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(RpcProtocolError):
+                    ReplicaRequest.from_metadata(malformed, b"", self.manifest)
+        with self.assertRaises(RpcProtocolError):
+            new_request(
+                manifest=self.manifest, sender_id="vm01", sender_generation=1,
+                target_id="vm04", epoch=1, mode=ConsistencyMode.EVENTUAL_RR,
+                op=RpcOperation.READ_LOCAL, key="k", phase="eventual_read",
+                schema=PROTOCOL_SCHEMA_VERSION, operation_id=operation_id)
+
+    def test_schema2_inventory_requires_all_ten_on_same_release(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "reviewed-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        self.assertTrue(activation.enabled_for(self.manifest))
+        with self.assertRaises(ValueError):
+            Schema2Activation.from_inventory(self.manifest, {
+                key: value for key, value in inventory.items() if key != "vm10"})
+        mixed = dict(inventory)
+        mixed["vm10"] = {"release_id": "older-build", "schema_version": 2}
+        with self.assertRaises(ValueError):
+            Schema2Activation.from_inventory(self.manifest, mixed)
 
     def test_rejects_wrong_uuid_schema_fields_and_integer_coercions(self):
         req = request(self.manifest)

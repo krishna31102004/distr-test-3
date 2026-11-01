@@ -1,18 +1,21 @@
-# MP3 architectural decisions — Step 2 handoff
+# MP3 architectural decisions — shared decision log
 
-Updated October 29, 2026. Authority: [SPEC.md](SPEC.md). Krishna explicitly
-approved the current C1–C6 contracts, starting defaults and qualifications in the
-Batch 1 instruction. This supersedes earlier proposed/pending-contract wording.
-Approval authorizes only the local Batch 1 types/versioning/storage implementation;
-no membership, RPC service, Strong allocator/ABD, coordinators, repair, mode switching,
-CLI integration or benchmarks are authorized. Ownership remains unchanged; scoped
-work in Juhi-owned foundations is explicitly authorized by Krishna.
+Updated October 31, 2026. Authority: [SPEC.md](SPEC.md). Krishna approved the C1–C6
+foundation contracts on October 29 and the reviewed, scoped Step 3 protocol design on
+October 31, 2026. Approval records below distinguish a design/contract approval from
+code that is implemented and verified. KD-13, full KD-16, KD-17 final logging/CLI
+choices, KD-18 and KD-01 runtime compatibility remain pending where stated.
 
-KD-01 VM compatibility remains unverified; KD-08 phase-specific qualification,
-KD-10 Strong allocation and KD-16 full switching remain unresolved beyond the
-approved foundation boundaries. KD-11/12/13/17/18 remain deferred. No runtime
-verification is inferred from approval. AI assistance is permitted. Original
-student MP1/MP2 code remains preserved; new Batch 1 code is AI-assisted work.
+**Step 3 approval record:** Krishna authorized the reviewed design at
+`38a2293db54b9238d780c650276e0d3b60305e4a`. Scope: KD-11 two-phase multi-writer ABD
+and its durable query-aware counter; KD-12 Eventual-noRR R/W and exact-version W
+qualification with five one-shot attempts and the approved bounded continuation;
+and related KD-08/10/14/15 protocol refinements. This authorizes Step 3 Batch 1
+shared infrastructure and later protocol batches under their plan gates. It does not
+claim Strong/Eventual coordinator algorithms are implemented. Ownership remains
+unchanged; Krishna's authorization covers the shared storage/RPC changes in this
+scoped batch. AI assistance is permitted. Original student MP1/MP2 sources remain
+preserved and unchanged.
 
 Useful historical explanations were recovered from the 509-line pre-handoff local
 snapshot at `/var/folders/bb/1m2v9gh114980pb82ckc9j6h0000gn/T/mp3-handoff-o2jfpurb/KEY_DECISIONS.md`.
@@ -45,7 +48,7 @@ libraries are prohibited. These requirements are not approval questions.
 
 **Remaining proposal / verification:** VM runtime compatibility and final supported Python minor; do not infer VM versions from the Mac.
 
-**Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
+**Approval record:** C1–C6 on October 29 and scoped Step 3 refinements on October 31, 2026. See the Step 3 approval record at the top of this document.
 
 **Alternatives and tradeoffs (context, not reopened directions):** Standard library only keeps setup small but requires explicit
   networking/lifecycle code. A small justified dependency can save work but introduces
@@ -123,7 +126,7 @@ libraries are prohibited. These requirements are not approval questions.
 
 **Concept / rationale:** Missing gossip suggests a failure; it does not prove a crash. Suspicion gives a live process time to refute an accusation with a newer incarnation.
 
-**Remaining proposal / verification:** Approximately 2.5s initial detection threshold is proposed, untested; same-generation refutation details in C2.
+**Implementation evidence:** The configurable 2.5s initial threshold, monotonic timers, retained suspicion, and newer-generation recovery are implemented and covered by local membership/restart tests. Ten-VM timing remains unverified.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -201,7 +204,7 @@ libraries are prohibited. These requirements are not approval questions.
 
 **Concept / rationale:** Shared sockets/workers save overhead but need ownership and limits.
 
-**Remaining proposal / verification:** KV port 65434 is proposed, availability unverified; exact endpoint manifest, capacities and overload behavior in C1/C6.
+**Remaining verification:** KV port 65434 remains configurable and university-VM availability is unverified. Endpoint parsing and approved C6 capacity limits are implemented locally.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -223,13 +226,13 @@ libraries are prohibited. These requirements are not approval questions.
 
 ## KD-08 — Deadlines, retries, and acknowledgment qualification
 
-**Status: PENDING — C1–C6 foundation approved; remaining compatibility/protocol scope deferred.**
+**Status: APPROVED — C1–C6 and scoped Step 3 protocol refinements; KD-13/full KD-16 remain deferred.**
 
 **Krishna-approved direction (October 29, 2026):** One configurable overall monotonic deadline; distinct qualifying replicas; no initial automatic retries; explicit TIMEOUT/ERROR, never infer absence from unavailability.
 
 **Concept / rationale:** An operation has a total time budget. A timeout may mean a write happened but its acknowledgment was lost; it does not mean the key is absent.
 
-**Remaining proposal / verification:** 5s default proposed; exact C5/C6 response matching; protocol-specific acknowledgment rules deferred to KD-11/12.
+**Approved defaults/contracts:** five-second foreground deadline, one absolute monotonic budget, strict response matching, no initial automatic retries, and the scoped KD-11/12 phase-specific acknowledgment rules.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -249,7 +252,7 @@ libraries are prohibited. These requirements are not approval questions.
 **Planned tests / acceptance:** Duplicate/stale replies, deadline exhaustion, delayed ack, retry
   storms, and timeout latency; confirm successful durable writes can outlive timeouts.
 
-**Step 3 protocol refinements — PENDING, awaiting Krishna's approval:** One
+**Approved Step 3 protocol refinements (October 31):** One
 `operation_id` spans all phases of one coordinator operation; every target/phase RPC
 has its own UUID4 `request_id`. Reuse the already approved C6 default of one absolute
 five-second monotonic foreground deadline from admission across queueing, both Strong
@@ -261,18 +264,18 @@ proposed.
 For Eventual PUT, the five-second deadline bounds waiting for W. Accepted remaining
 owner attempts use a distinct ten-second continuation after the client response,
 bounded by fifteen seconds from admission; they continue once each and are reported
-incomplete at expiry/shutdown. Recommended response policy: only exact-version,
+incomplete at expiry/shutdown. Approved response policy: only exact-version,
 durable INSTALLED/UNCHANGED counts for Eventual W; a strictly higher SUPERSEDED copy
 is not an acknowledgment of this value. Strong may count durable strictly-higher
 SUPERSEDED as at-least-tag evidence. Examples, status predicates and acceptance
 traces are in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
 
-**Deadline implementation clarification — still PENDING:** the current
-`ReplicaClient.call_replica(..., deadline: float)` freezes its deadline at entry, so
-it cannot by itself continue an in-flight request past the client response or observe
-a shortened shutdown budget. The proposal is one shared, lock-protected `AttemptLease`
-per Eventual PUT, created after atomic reservation of all five one-shot owner jobs.
-Each job uses a small future lease-aware RPC extension with nonblocking connect,
+**Implementation evidence:** Batch 1 adds the lease-aware RPC path and scheduler described below. The existing
+`ReplicaClient.call_replica(..., deadline: float)` keeps its fixed-deadline behavior;
+the optional lease path supports continuation after foreground completion. One shared,
+lock-protected `AttemptLease` is created per Eventual PUT after atomic reservation of
+all five one-shot owner jobs.
+Each job uses the implemented lease-aware RPC extension with nonblocking connect,
 partial-send offsets and bounded-poll receive; its effective deadline is
 `min(foreground_completion + 10s, admitted_at + 15s)`. Before foreground completion,
 the hard ceiling is admission+15s; the coordinator separately stops counting W at
@@ -280,7 +283,8 @@ admission+5s. After W or foreground timeout, remaining accepted jobs continue un
 the lease, with explicit per-owner terminal status and completion uncertainty. No
 retries are introduced. A bounded shutdown may cancel the lease early and must report
 incomplete work; SQLite remains open until workers have exited. The approved C6 time
-budgets do not change. The proposed deterministic schedules are in §5.1 of the design.
+budgets do not change. Deterministic local lease and loopback checks are recorded with
+Batch 1 evidence in the plan.
 
 ## KD-09 — Persistent storage and durability
 
@@ -290,7 +294,7 @@ budgets do not change. The proposed deterministic schedules are in §5.1 of the 
 
 **Concept / rationale:** An acknowledgment promises data and its version survive process death. Keeping a Python dictionary or only flushing a language buffer cannot make that promise.
 
-**Remaining proposal / verification:** Exact C3 transactions/schema/connection ownership and filesystem assumptions; durability settings require runtime verification, no storage implemented.
+**Remaining verification:** Filesystem and university-VM SQLite behavior remain unverified. The approved local SQLite transaction/schema behavior is implemented and covered by Batch 1 tests; see IMPLEMENTATION_PLAN.md.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -313,13 +317,13 @@ budgets do not change. The proposed deterministic schedules are in §5.1 of the 
 
 ## KD-10 — Version formats, timestamp collisions, and restart ordering
 
-**Status: PENDING — C1–C6 foundation approved; remaining compatibility/protocol scope deferred.**
+**Status: APPROVED — version directions and Step 3 Strong allocator contract; KD-16 mode-transition behavior remains deferred.**
 
-**Krishna-approved direction (October 29, 2026):** Eventual ordered (timestamp, processID), restart-safe uniqueness; Strong ordered (logicalCounter, writerID); monotonic installs and equal-tag conflict detection.
+**Krishna-approved direction (October 29 and October 31, 2026):** Eventual ordered (timestamp, processID), restart-safe uniqueness; Strong ordered (logicalCounter, writerID); monotonic installs and equal-tag conflict detection. The Step 3 counter allocator is query-aware and durable.
 
-**Concept / rationale:** A version is an ordered label telling replicas which value wins. Strong and eventual modes have different tag-generation requirements.
+**Concept / rationale:** A version is an ordered label telling replicas which value wins. Strong and Eventual modes have different tag-generation requirements.
 
-**Remaining proposal / verification:** Exact tag encoding, durable allocator and ordering in C3/C4; Strong query-aware allocation remains KD-11.
+**Implementation evidence:** Batch 1 implements `Store.allocate_eventual_version` and `Store.allocate_strong_version`, including a preserving schema-1-to-2 migration for Strong high-water metadata. Local concurrent allocation, restart, huge-counter, and interrupted-migration tests are recorded in IMPLEMENTATION_PLAN.md. This is not an implementation of Strong ABD.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -342,7 +346,7 @@ budgets do not change. The proposed deterministic schedules are in §5.1 of the 
 **Planned tests / acceptance:** Frozen/backward clocks, concurrent allocations, reboot, very large
   counters, total-order vectors, equal-tag conflicts, and cross-language JSON precision.
 
-**Step 3 allocation proposal — PENDING:** Add a durable Strong logical-counter
+**Approved Step 3 allocation contract (October 31):** Add a durable Strong logical-counter
 high-water mark. `allocate_strong_version(*, context, observed_max)` takes a short
 SQLite write transaction, validates the exact Strong context, chooses one greater
 than both the observed maximum's counter and persisted local high-water, commits,
@@ -357,23 +361,23 @@ allocator. See the interface and crash/race acceptance cases in the design docum
 
 ## KD-11 — Strong multi-writer atomic-register protocol
 
-**Status: PENDING — deferred.**
+**Status: APPROVED — design contract; coordinator implementation is not started.**
 
 **Concept:** A read must carry the newest value it sees to a majority before returning. Otherwise one read may see a partly propagated write and a later read miss it, violating the single-copy illusion.
 
-Multi-writer Strong protocol: full two-phase ABD rules, bottom/absence, tag allocation and durable phase acknowledgments await Step 3. No Strong protocol is approved by this handoff.
+The approved design is full two-phase multi-writer ABD over the five fixed owners with Q=3 in each phase, coordinator-only bottom (`None`), query-aware durable logical tags, and durable phase evidence. The algorithm remains future work; approval does not mean a Strong PUT/GET is operational.
 
-**Step 3 proposal — PENDING, awaiting Krishna's approval:** use full two-phase
+**Approved design — Krishna, October 31, 2026:** use full two-phase
 multi-writer ABD on the five fixed owners, with quorum Q=3 in each phase. PUT queries
 all five, takes the maximum actual record (or conceptual bottom), durably allocates
 a counter above that maximum and local high-water, then conditionally installs the
 new tag/value. GET queries a majority, selects the maximum record and durably writes
-that exact pair back to a majority before returning it. `None` is the proposed
+that exact pair back to a majority before returning it. `None` is the approved
 coordinator-only bottom; it is never stored or sent. Three explicit NOT_FOUND query
 replies may return NOT_FOUND without a bottom writeback; fewer than three valid
 responses cannot.
 
-The proposed `SUPERSEDED` rule is durable-at-least evidence only when the actual
+The approved `SUPERSEDED` rule is durable-at-least evidence only when the actual
 stored tag is strictly greater than the requested tag, and all response/context/
 owner/generation bindings validate. That rule can count for Strong phase 2 because
 the higher committed value orders after the attempted tag; `VERSION_CONFLICT` never
@@ -382,14 +386,10 @@ same-writer allocation is serialized by a short durable counter transaction. If
 three owners do not provide required evidence before the single operation deadline,
 return TIMEOUT/ERROR. If a write phase may have committed, report uncertain
 completion. The rationale, traces, assumptions and adversarial tests are specified
-in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). No protocol behavior is
-implemented or approved yet.
+in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). The design is approved; no
+Strong coordinator behavior is implemented yet.
 
-**Approval question:** Is this ABD procedure, bottom rule, allocation contract,
-phase naming and Strong-only `SUPERSEDED` qualification the chosen KD-11 design?
-Recommended default: yes, subject to reviewing the detailed traces and tests.
-
-**Approval record:** No engineering approval recorded.
+**Approval record:** Krishna approved the design and its scope on October 31, 2026, referencing the reviewed commit above. The actual two-phase coordinator remains NOT_STARTED until Batch 2.
 
 **Correctness conditions:** Fixed five owners; majority=3 in both phases; durable
   monotonic replica tags; unique ordered writer tags above phase-1 max; phase/replica
@@ -416,13 +416,13 @@ Recommended default: yes, subject to reviewing the detailed traces and tests.
 
 ## KD-12 — Eventual propagation and response qualification
 
-**Status: PENDING — deferred.**
+**Status: APPROVED — Eventual-noRR design contract; coordinator implementation is not started.**
 
 **Concept:** R/W choose how many replies a client waits for, not how many owners exist. Low thresholds trade freshness for availability and latency.
 
-Eventual fanout/first-R/durable-W requirements are mandated; exact coordinator qualification and lifetime rules await Step 3.
+Eventual fanout/first-R/durable-W requirements are mandated. Krishna approved the exact-version W evidence rule, first-R maximum selection, all-five reservation, one-shot owner attempts, and the C6-bounded continuation in the reviewed Step 3 design.
 
-**Approval record:** No engineering approval recorded.
+**Approval record:** Krishna, October 31, 2026; see the scoped approval record above. Actual Eventual-noRR GET/PUT coordination remains NOT_STARTED.
 
 **Correctness conditions:** R/W each 1..5; distinct qualifying replicas; write
   acks durable; max of first R qualifying reads; absent response is explicit and
@@ -443,7 +443,7 @@ Eventual fanout/first-R/durable-W requirements are mandated; exact coordinator q
 **Planned tests / acceptance:** R/W combinations, one replica replying repeatedly, post-ack fanout,
   partitions, stale replies, empty bytes, and timeout-vs-absence at multiple R values.
 
-**Step 3 proposal — PENDING, awaiting Krishna's approval:** keep R/W in 1..5 and
+**Approved design — Krishna, October 31, 2026:** keep R/W in 1..5 and
 default 2/2. GET concurrently queries all five, returns after the first R distinct
 valid replies, and chooses the maximum version among those R; all R explicit
 NOT_FOUND replies mean NOT_FOUND, while fewer than R replies mean TIMEOUT/ERROR.
@@ -453,7 +453,7 @@ different bytes fails closed.
 PUT durably allocates the existing Eventual `(timestamp, vmNN/generation)` version,
 atomically reserves all five owner-attempt slots, and dispatches one write to every
 fixed owner. Count W only when distinct replicas report durable INSTALLED or
-UNCHANGED at the exact requested version. Proposed policy excludes SUPERSEDED
+UNCHANGED at the exact requested version. The approved policy excludes SUPERSEDED
 because it confirms a newer value rather than this PUT's value. If capacity cannot
 reserve all five attempts, fail OVERLOADED before sending. If W is reached before
 the five-second foreground deadline, respond success but retain every remaining
@@ -462,12 +462,9 @@ from admission. One attempt per owner, no retries, and explicit incomplete-propa
 records at expiry. Foreground timeout after a possible commit reports unknown
 completion; it is never NOT_FOUND. A crash may lose in-memory attempts but not
 committed SQLite data. These settings reuse the approved C6 starting envelope;
-protocol-specific qualification and reservation details still require KD-12 review.
+protocol-specific qualifications and reserved-attempt handling were approved by KD-12; code status is tracked separately in IMPLEMENTATION_PLAN.md.
 
-**Approval question:** Approve exact-version W acknowledgments, all-five reservation,
-first-R read, and bounded post-ack continuation as specified? Recommended default:
-yes; this avoids false acknowledgments and dropped accepted fanout. Full examples,
-R/W failure matrix and tests are in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
+**Approval record:** The exact-version W rule, all-five reservation, first-R read, and bounded continuation were approved by Krishna on October 31, 2026. See [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) for the implementation contract and tests; algorithms remain unimplemented.
 
 ## KD-13 — Read repair and background execution
 
@@ -526,7 +523,7 @@ Read repair requirements are mandated; collection/repair scheduling and backgrou
 **Planned tests / acceptance:** Barrier-controlled same-key races, unrelated-key progress, worker
   exhaustion/deadlock, shutdown, and throughput/latency across client counts.
 
-**Step 3 proposal — PENDING, awaiting Krishna's approval:** retain C6 limits of
+**Approved Step 3 resource contract — October 31, 2026:** retain C6 limits of
 coordinator 16 active/32 queued, replica handlers 32/64, and bounded outbound
 replica-attempt/background work 16/64, with separate membership capacity. Atomic
 reservation is required before Eventual PUT dispatch, so a successful W response
@@ -535,10 +532,8 @@ capacity for both phases before starting writes. Queue exhaustion is explicit
 OVERLOADED; it must not spawn extra threads. Coordinators may wait on bounded RPC
 workers, but workers never wait on coordinator tasks. Same-key distributed operations
 overlap; only SQLite's short transaction and Strong's short durable allocator
-transaction serialize. No global/membership/key lock crosses network IO. Exact
-reservation bookkeeping and shutdown truncation/reporting are proposed for review,
-not implemented. See the resource ownership table and deadlock tests in the design.
-For Eventual PUT, the proposal keeps one reserved job per owner through the separate
+transaction serialize. No global/membership/key lock crosses network IO. The Batch 1 reservation implementation and shutdown reporting are locally tested; post-ack completion reporting still belongs to the Eventual coordinator. See the resource ownership table and deadlock tests in the design.
+For Eventual PUT, the approved design keeps one reserved job per owner through the separate
 lease deadline; queue-to-active transfer is atomic, and shutdown cancellation must
 produce terminal per-owner records before capacity is released. Socket work must be
 interruptible within the bounded polling interval, and SQLite cannot close while a
@@ -546,13 +541,13 @@ replica handler or local admitted operation remains active.
 
 ## KD-15 — Shared storage/RPC interface contract
 
-**Status: APPROVED — C1–C6 foundation contract; implementation/verification tracked separately.**
+**Status: APPROVED — C1–C6 plus the scoped Step 3 schema-2/shared interface contract; implementation/verification tracked separately.**
 
 **Krishna-approved direction (October 29, 2026):** Small concrete contracts: explicit presence/bytes/versions/errors, atomic conditional writes and epoch validation at storage boundary.
 
 **Concept / rationale:** Krishna's protocols and Juhi's storage must agree on what a response promises; returning from a function is not automatically a durable acknowledgment.
 
-**Remaining proposal / verification:** All proposed C1–C6 signatures and result semantics are approved for the scoped foundation.
+**Implementation evidence:** The C1–C6 interfaces and the scoped schema-2 shared contracts are implemented for Batch 1 and locally reviewed. Strong/Eventual coordinator algorithms remain unimplemented.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 
@@ -572,7 +567,7 @@ replica handler or local admitted operation remains active.
 **Planned tests / acceptance:** Shared contract tests against a disposable store, version ordering,
   concurrent installs, disk errors, and serialization round trips.
 
-**Step 3 protocol extension proposal — PENDING:** Preserve the C5 binary frame and
+**Approved Step 3 protocol extension — October 31, 2026:** Preserve the C5 binary frame and
 limits. Add stable `operation_id` alongside per-attempt UUID4 `request_id`; introduce
 schema 2 for protocol phases while retaining schema 1 only for the existing
 `phase="local"` path. Do not auto-downgrade. Reuse `READ_LOCAL` and
@@ -580,11 +575,10 @@ schema 2 for protocol phases while retaining schema 1 only for the existing
 `eventual_read`, and `eventual_put`. Schema-2 responses keep READ `version` as the
 actual record and INSTALL `stored_version` as the committed replica value. A
 protocol-specific predicate—not the raw status name—decides quorum qualification.
-Strong and Eventual use separate `SUPERSEDED` rules. This is an exact proposed
-envelope change, and all affected validators and mixed-version behavior are detailed
-in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
+Strong and Eventual use separate `SUPERSEDED` rules. This is the approved envelope change for Step 3; affected validators and mixed-version
+behavior are detailed in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
 
-**Schema rollout clarification — still PENDING:** protocol operations remain disabled
+**Schema rollout contract (approved October 31):** protocol operations remain disabled
 until a one-time release inventory confirms that all ten fixed VM identities have a
 schema-2-capable build; this activation check is not repeated per operation and does
 not require all peers to be reachable thereafter. Once enabled, send schema 2 only.

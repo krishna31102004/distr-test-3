@@ -107,6 +107,92 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(strong.read_local('k',context=ctx).record,record)
             with self.assertRaises(StorageError):strong.allocate_eventual_version(context=ctx)
 
+    def test_strong_allocator_uses_query_and_local_high_water_concurrently(self):
+        self.store.close()
+        path=Path(self.temp.name)/'strong-allocator.sqlite'
+        ctx=Context(1,Mode.STRONG)
+        with open_store(path,bootstrap=ctx) as strong:
+            generation=strong.start_incarnation()
+            self.assertEqual(generation,1)
+            observed=Version('strong',900,'vm10/7')
+            first=strong.allocate_strong_version(context=ctx,observed_max=observed)
+            self.assertEqual((first.number,first.writer_id),(901,'vm01/1'))
+            local_dominates=strong.allocate_strong_version(
+                context=ctx,observed_max=Version('strong',2,'vm02/1'))
+            self.assertEqual(local_dominates.number,902)
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                versions=list(pool.map(lambda _:strong.allocate_strong_version(
+                    context=ctx,observed_max=observed),range(40)))
+            self.assertEqual(sorted(v.number for v in versions),list(range(903,943)))
+            strong.close()
+        with open_store(path) as recovered:
+            self.assertEqual(recovered.start_incarnation(),2)
+            after_restart=recovered.allocate_strong_version(context=ctx,observed_max=None)
+            self.assertEqual((after_restart.number,after_restart.writer_id),(943,'vm01/2'))
+
+    def test_schema1_migration_preserves_records_and_initializes_counter(self):
+        self.store.install_if_newer('old-record',rec(4,b'keep'),context=CTX)
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM meta WHERE name='strong_counter'")
+            db.execute("UPDATE meta SET value='1' WHERE name='schema'")
+        with open_store(self.path) as migrated:
+            self.assertEqual(migrated.read_local('old-record',context=CTX).record,rec(4,b'keep'))
+            with sqlite3.connect(self.path) as db:
+                meta=dict(db.execute('SELECT name,value FROM meta'))
+            self.assertEqual(meta['schema'],'2')
+            self.assertEqual(meta['strong_counter'],'0')
+
+    def test_schema1_strong_migration_sets_counter_to_existing_maximum(self):
+        self.store.close()
+        path=Path(self.temp.name)/'legacy-strong.sqlite'
+        ctx=Context(1,Mode.STRONG)
+        legacy=open_store(path,bootstrap=ctx)
+        legacy.start_incarnation()
+        record=Record(Version('strong',123456,'vm02/5'),b'persist')
+        self.assertEqual(legacy.install_if_newer('k',record,context=ctx).status,S.INSTALLED)
+        legacy.close()
+        with sqlite3.connect(path) as db:
+            db.execute("DELETE FROM meta WHERE name='strong_counter'")
+            db.execute("UPDATE meta SET value='1' WHERE name='schema'")
+        with open_store(path) as migrated:
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT value FROM meta WHERE name='strong_counter'").fetchone()[0],
+                                 '123456')
+            self.assertEqual(migrated.read_local('k',context=ctx).record,record)
+            self.assertEqual(migrated.allocate_strong_version(context=ctx,observed_max=None).number,
+                             123457)
+
+    def test_interrupted_schema_migration_recovers_without_losing_records(self):
+        self.store.install_if_newer('legacy',rec(11,b'preserve'),context=CTX)
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM meta WHERE name='strong_counter'")
+            db.execute("UPDATE meta SET value='1' WHERE name='schema'")
+        script=r'''
+import os,signal,sqlite3,sys
+from mp3.storage import open_store
+original=sqlite3.connect
+class Crash(sqlite3.Connection):
+    def execute(self,sql,*args):
+        if sql=='COMMIT':os.kill(os.getpid(),signal.SIGKILL)
+        return super().execute(sql,*args)
+sqlite3.connect=lambda *a,**kw:original(*a,**kw,factory=Crash)
+open_store(sys.argv[1])
+'''
+        child=subprocess.run([sys.executable,'-B','-c',script,str(self.path)],
+                             cwd=ROOT,capture_output=True,timeout=10)
+        self.assertEqual(child.returncode,-9,child.stderr.decode())
+        # A kill before COMMIT leaves the complete old schema, which can be
+        # validated and migrated atomically by the next process.
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT value FROM meta WHERE name='schema'").fetchone()[0],
+                             '1')
+            self.assertIsNone(db.execute("SELECT value FROM meta WHERE name='strong_counter'").fetchone())
+        with open_store(self.path) as recovered:
+            self.assertEqual(recovered.read_local('legacy',context=CTX).record,rec(11,b'preserve'))
+            self.assertEqual(recovered.current_context(),CTX)
+
     def test_bad_input_and_closed_store_errors(self):
         for key in (None,'bad\ud800'):
             self.assertEqual(self.store.read_local(key,context=CTX).status,S.ERROR)

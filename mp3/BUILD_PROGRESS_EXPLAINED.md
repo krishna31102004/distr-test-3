@@ -394,12 +394,13 @@ It does not implement Strong ABD, Eventual-noRR, Eventual-RR, quorum coordinatio
 read repair, full distributed PUT/GET, mode switching, benchmark experiments, or the
 completed demo commands. It does not show that ten real VMs can communicate.
 
-### What comes next?
+### What comes next? (updated after the Step 3 Batch 1 gate)
 
-Step 3 is where Krishna and Juhi implement the actual consistency protocols: Strong
-ABD and Eventual-noRR, after reviewing the remaining protocol decisions. Those
-protocols can build on the tested Store, fixed owners, membership, and one-replica
-network call. The one-replica call by itself is not a distributed operation.
+The shared coordinator foundation is now in place. The next coding batch is Step 3
+Batch 2: Krishna implements the Strong ABD coordinator using query and write/readback
+phases with three-of-five evidence. Juhi's Eventual-noRR work follows in Batch 3.
+The one-replica call and Batch 1 collector by themselves are not distributed
+consistency operations.
 
 ### Final call-admission and shutdown correction
 
@@ -437,101 +438,130 @@ The Step 2 local foundation remains verified. These tests used temporary storage
 local threads/sockets; no university VM was contacted. Step 3 and all consistency
 protocols remain untouched.
 
-## Step 3 — Designing Strong and Eventual Consistency
+## Step 3 — Designing Strong and Eventual Consistency (DESIGN APPROVED / NOT IMPLEMENTED)
 
-**DESIGN PROPOSED / NOT IMPLEMENTED.** This section describes a design that still
-needs Krishna's explicit approval. Strong and Eventual-noRR do not work yet.
+Five copies help a key survive a machine failure, but they can disagree after messages
+are delayed or a machine restarts. A consistency protocol tells the machines which
+version wins and what evidence is enough to answer a client. Krishna approved the
+Strong ABD and Eventual-noRR design on October 31. The full protocols are still not
+implemented.
 
-Five machines keep copies of a key so the store can continue when some machines are
-slow or down. A **quorum** means the required number of different owners answered
-with valid evidence. With five owners, Strong uses three: any group of three shares
-at least one owner with every other group of three.
+A **quorum** is a required number of different replica machines. Strong uses three of
+the five fixed owners in each phase. Eventual lets us configure R and W from 1 to 5;
+the default is R=2 and W=2. Strong's GET writes its selected newest record back to a
+majority before returning, so later reads cannot overlook a completed write. Eventual
+GET returns the largest version among its first R different valid replies and may be
+stale. Missing data is distinct from an empty value and from a machine that did not
+answer.
 
 ### Proposed Strong flow
 
 ```text
-PUT: ask owners for current versions -> choose a newer tag -> install to 3 owners
-GET: ask owners for current versions -> choose the newest -> write it back to 3
+PUT: client -> query five owners -> learn max version
+     -> allocate a durable higher tag -> install -> 3 durable owner proofs -> reply
+GET: client -> query five owners -> select max -> write it back -> 3 proofs -> reply
 ```
 
-The read-back step matters because one replica may have seen a write that has not
-reached the others yet. Before returning that value, GET spreads the selected record
-to a majority. A missing key is represented by a special coordinator-only bottom
-state; it is not a fake stored value. Concurrent writers use unique ordered tags.
+Strong uses a logical counter plus writer identity, not a wall-clock timestamp alone.
+The conceptual empty/bottom value is local to the coordinator and is never stored on a
+replica. This is the approved design; no Strong PUT/GET coordinator exists yet.
 
 ### Proposed Eventual-noRR flow
 
 ```text
-PUT: reserve all 5 sends -> send to the 5 owners -> return after W durable saves
-                                      `-- remaining accepted sends continue briefly
-GET: ask the owners -> use the first R valid replies -> choose their newest version
+PUT -> send one attempt to each of five owners
+     -> client replies after W exact-version durable acknowledgments
+     -> remaining reserved attempts continue under their bounded lease
+GET -> query owners -> first R distinct replies -> return their maximum version
 ```
 
-At the default R=2 and W=2, a GET waits for two different replicas and chooses the
-newer version among those two. A PUT waits for two different replicas to durably
-store that exact version. Its remaining reserved one-time sends can continue after
-the client receives success, within a separate bounded window. A timestamp plus a
-stable process identity orders Eventual versions, including when timestamps tie.
-This mode does not do read repair.
+For example, with R=W=2, a PUT needs two distinct owners to confirm the exact version
+is durable. It still preserves the other three owner attempts after the client reply.
+Those attempts are bounded: 5 seconds for the foreground response, up to 10 seconds
+of continuation after response, and no later than 15 seconds after admission. Each
+owner receives at most one attempt. The existing durable timestamp allocator makes
+versions unique across local concurrency and restart. Read repair is not part of
+Eventual-noRR.
 
-### What we are designing now
+## Step 3, Batch 1 — Shared Coordinator Infrastructure (implemented and reviewed)
 
-The actual implementation already has one-node storage, ring placement, membership,
-and one-replica TCP reads/installs. The design in
-[STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) proposes how coordinators could
-use those pieces: fixed owners, unique response counting, Strong's two phases,
-Eventual's R/W, time limits, and bounded worker capacity. KD-11 and KD-12 remain
-pending for human approval. Other pending protocol-specific details are listed in
-that document. No new protocol tests or operations have been run as part of this
-design-only step.
-
-The unchanged Step 2 baseline was checked while preparing this design:
+Batch 1 built reusable parts needed by both protocols, without implementing either
+protocol. One operation has one operation ID; each replica call has its own request
+ID. A collector validates replies against the exact owner, request, operation, phase,
+context, and dispatched restart generation. It counts a VM at most once. For example,
+three different valid owners can satisfy a Strong query; three replies from one VM
+cannot. A timeout is not NOT_FOUND.
 
 ```text
-Main:     python3 -B -m unittest discover -s mp3/tests -v — 130 passed (15.330s)
-Reviewer: python3 -B -m unittest discover -s mp3/tests -v — 130 passed (14.821s)
-Main and reviewer: mp3 --smoke, mp3 --help, mp3.node --help, compileall, diff-check — passed
+             +-------------------------------------+
+Client ----> | coordinator evidence + bounded work | ----> fixed owners 1..5
+             +-------------------------------------+        (no owner substitution)
+                     | one result per owner
+                     +-- validate, count distinct, record failures
 ```
 
-These are foundation checks only; they do not test Strong or Eventual protocols.
-The independent reviewer found no substantive protocol-design blocker and asked for
-clarification on in-flight generation evidence and operation-result fields. The
-design now preserves an already issued RPC's dispatch-time generation binding (with
-no retry) and defines the result status/value/version/uncertainty rules. It also
-clarifies that Strong/Eventual GET may cancel unused attempts after returning, while
-Eventual PUT retains its five reserved one-shot attempts through the separate bounded
-continuation. Krishna still needs to approve the design before Step 3 Batch 1 begins.
+The scheduler uses bounded coordinator and outbound capacity and can reserve all five
+owner attempts atomically. Its `AttemptLease` separates client response time from
+accepted Eventual propagation. The collector leaves unfinished Eventual PUT attempts
+available to the future protocol coordinator, including if W becomes impossible; it
+does not invent a success result. Shutdown can report incomplete work. This is the
+shared mechanism only, not a full Eventual PUT.
 
-### Deadline and rollout clarifications — still proposed
+The RPC layer now supports strict schema 2 for protocol phases while preserving the
+old schema 1 local RPC. Schema 2 adds the shared operation ID; it never downgrades to
+schema 1. Protocol RPC stays disabled unless an explicit inventory lists compatible
+releases for all ten VM identities. That inventory is a local configuration assertion,
+not proof that ten deployed VMs were checked. An operation still contacts only its
+five prescribed owners, so three compatible owners can satisfy Strong even when the
+other seven are offline.
 
-The five-second clock is how long the client waits for enough PUT acknowledgments.
-It is not the deadline for every already-reserved network send. The design gives the
-five one-time owner attempts a shared timer: after the client returns success or
-timeout, remaining work can continue for up to ten more seconds, but never past
-fifteen seconds from operation admission. A small future RPC change is needed because
-today's RPC call takes one fixed deadline. The proposal uses interruptible socket
-operations and records each owner's final result; a crash or bounded shutdown can
-still leave propagation incomplete. These timers are only designed, not implemented
-or tested.
+Batch 1 also added a durable Strong logical-counter allocator. It allocates above both
+a Strong query maximum and the local saved high-water counter. The SQLite metadata
+migration preserves existing values, versions, identity, context, restart generation,
+and Eventual timestamp state. This allocator is not Strong ABD: it only prepares a
+tag for a future coordinator.
 
-Before enabling schema-2 protocol messages, the proposed rollout checks a version
-inventory for all ten VM identities once. It does not wait for all ten to be online
-for each operation. After activation, a request can still succeed using three
-compatible prescribed owners for Strong or its configured R/W count for Eventual.
-An unavailable or old-schema owner simply does not count; the system never downgrades
-the message or substitutes another owner.
+### What was implemented and where
 
-### What has NOT been implemented yet
+- `mp3/attempts.py`: shared foreground/continuation lease and cancellation.
+- `mp3/coordinator.py`: result/evidence records, `Schema2Activation`, bounded worker
+  resources, atomic reservations, one-owner dispatch, and distinct-response collection.
+- `mp3/rpc.py` and `mp3/replica.py`: schema-2 phases and operation-ID correlation;
+  remote replicas still perform only local reads and conditional installs.
+- `mp3/storage.py`: durable Strong counter allocation and preserving metadata migration.
+- `mp3/node.py`: owns the shared resources and exposes one-replica dispatch.
+- Tests in `mp3/tests/test_coordinator.py`, `test_rpc.py`, `test_replica.py`,
+  `test_storage.py`, and `test_node_runtime.py` exercise collector evidence, capacity,
+  leases, migration, and real loopback RPC.
 
-Strong ABD, Eventual-noRR, Eventual-RR, read repair, quorum counting, distributed
-client-facing PUT/GET, mode switching, and completed demo commands are all future
-work. Existing Step 2 tests remain evidence for the foundation only; they do not
-test consistency protocols.
+### Actual verification
 
-### What Step 3 Batch 1 will implement after approval
+- Main: `python3 -B -m unittest discover -s mp3/tests -v` — **153 passed in 17.118s**.
+- Independent reviewer: same suite — **153 passed in 16.871s**.
+- Main focused coordinator tests — **13 passed in 0.199s**; storage and RPC focused
+  tests — **36 passed in 0.769s**. Reviewer independently ran the coordinator tests:
+  **13 passed in 0.195s**.
+- `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` all exited successfully.
+- Local loopback tests send schema-2 requests between logical nodes and their real
+  SQLite stores. No university VMs were contacted; no real ten-VM rollout was tested.
 
-The proposed first implementation batch is shared coordinator plumbing: bounded
-operation admission, phase-aware request/response identifiers, counting each owner
-only once, deadlines, and a bounded way to reserve the network work. It will establish
-the shared interface before Krishna implements Strong and Juhi implements
-Eventual-noRR. This Batch 1 work has not started.
+The reviewer found that the collector initially canceled Eventual attempts both after
+W and when W became impossible. The fix keeps unfinished Eventual calls in
+`QuorumCollection.continuing`, with regression tests for both paths. The reviewer
+made no source edits. The main agent reran the full suite after the fix.
+
+### What Batch 1 does not implement
+
+Strong ABD phases, Eventual-noRR GET/PUT coordinators, Eventual-RR/read repair,
+quorum operations, full client-facing PUT/GET, consistency mode switching, completed
+demo commands, benchmarks, and ten-VM deployment remain future work. The existing
+commands continue to report `NOT_IMPLEMENTED` where their full behavior is absent.
+
+### What comes next
+
+Step 3 Batch 2 is the Strong ABD coordinator. It will use the reviewed two-phase
+query/write and query/readback design, majority evidence, crash/concurrency cases, and
+history-based linearizability tests. It must build on these shared primitives; Batch 1
+by itself does not make a distributed key-value operation.

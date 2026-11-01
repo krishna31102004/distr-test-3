@@ -46,7 +46,8 @@ class ReplicaService:
                  max_pending: int = DEFAULT_REPLICA_QUEUE,
                  request_timeout: float = DEFAULT_REPLICA_REQUEST_TIMEOUT,
                  overload_reply_timeout: float = DEFAULT_OVERLOAD_REPLY_TIMEOUT,
-                 logger: logging.Logger | None = None, event_stream=None):
+                 logger: logging.Logger | None = None, event_stream=None,
+                 protocol_activation=None):
         if not isinstance(manifest, Manifest) or not isinstance(membership, MembershipTable):
             raise TypeError("manifest and MembershipTable are required")
         if manifest.fingerprint != membership.manifest.fingerprint:
@@ -77,6 +78,7 @@ class ReplicaService:
         self.overload_reply_timeout = float(overload_reply_timeout)
         self.logger = logger
         self.event_stream = event_stream
+        self.protocol_activation = protocol_activation
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_pending)
         self._stop = threading.Event()
@@ -218,13 +220,18 @@ class ReplicaService:
             epoch, mode = request.epoch, request.mode
         else:
             epoch, mode = context.epoch, context.mode
+        return self._response(
+            request,
+            epoch=epoch, mode=mode, op=request.op, phase=request.phase,
+            status=RpcStatus.ERROR, present=False, durable=False, error=code)
+
+    def _response(self, request: ReplicaRequest, **fields) -> ReplicaResponse:
         return ReplicaResponse(
             request_id=request.request_id, manifest_id=self.manifest.fingerprint,
             sender_id=self.membership.self_id,
             sender_generation=self.membership.local_generation,
-            target_id=request.sender_id, epoch=epoch, mode=mode,
-            op=request.op, phase=request.phase, status=RpcStatus.ERROR,
-            present=False, durable=False, error=code,
+            target_id=request.sender_id, schema=request.schema,
+            operation_id=request.operation_id, **fields,
         )
 
     def _reply_overloaded(self, connection: socket.socket, deadline: float) -> None:
@@ -245,6 +252,10 @@ class ReplicaService:
             self.manifest.node(request.sender_id)
         except ValueError:
             return "INVALID_REQUEST"
+        if (request.schema == 2
+                and (self.protocol_activation is None
+                     or not self.protocol_activation.enabled_for(self.manifest))):
+            return "SCHEMA2_DISABLED"
         sender = next((member for member in self.membership.snapshot()
                        if member.vm_id == request.sender_id), None)
         if (sender is None or sender.restart_generation == 0
@@ -270,46 +281,30 @@ class ReplicaService:
                 actual = self.store.current_context(deadline=deadline)
             except Exception:
                 return self._error_response(request, "STORAGE_ERROR")
-            return ReplicaResponse(
-                request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-                sender_id=self.membership.self_id,
-                sender_generation=self.membership.local_generation,
-                target_id=request.sender_id, epoch=actual.epoch, mode=actual.mode,
-                op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
-                present=False, durable=False, error="STALE_EPOCH",
-            )
+            return self._response(request, epoch=actual.epoch, mode=actual.mode,
+                                  op=request.op, phase=request.phase,
+                                  status=RpcStatus.STALE_EPOCH, present=False,
+                                  durable=False, error="STALE_EPOCH")
 
         if request.op == RpcOperation.READ_LOCAL:
             result: ReadResult = self.store.read_local(request.key, context=context,
                                                        deadline=deadline)
             if result.status == LocalStatus.FOUND:
                 assert result.record is not None
-                return ReplicaResponse(
-                    request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-                    sender_id=self.membership.self_id,
-                    sender_generation=self.membership.local_generation,
-                    target_id=request.sender_id, epoch=result.context.epoch, mode=result.context.mode,
+                return self._response(
+                    request, epoch=result.context.epoch, mode=result.context.mode,
                     op=request.op, phase=request.phase, status=RpcStatus.FOUND,
-                    present=True, version=result.record.version, value=result.record.value,
-                )
+                    present=True, version=result.record.version, value=result.record.value)
             if result.status == LocalStatus.NOT_FOUND:
-                return ReplicaResponse(
-                    request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-                    sender_id=self.membership.self_id,
-                    sender_generation=self.membership.local_generation,
-                    target_id=request.sender_id, epoch=result.context.epoch, mode=result.context.mode,
+                return self._response(
+                    request, epoch=result.context.epoch, mode=result.context.mode,
                     op=request.op, phase=request.phase, status=RpcStatus.NOT_FOUND,
-                    present=False,
-                )
+                    present=False)
             if result.status == LocalStatus.STALE_EPOCH:
-                return ReplicaResponse(
-                    request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-                    sender_id=self.membership.self_id,
-                    sender_generation=self.membership.local_generation,
-                    target_id=request.sender_id, epoch=result.context.epoch, mode=result.context.mode,
+                return self._response(
+                    request, epoch=result.context.epoch, mode=result.context.mode,
                     op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
-                    present=False, durable=False, error="STALE_EPOCH",
-                )
+                    present=False, durable=False, error="STALE_EPOCH")
             return self._error_response(request, "STORAGE_ERROR")
 
         record = Record(request.version, request.value)
@@ -317,14 +312,10 @@ class ReplicaService:
                                                             context=context,
                                                             deadline=deadline)
         if result.status == LocalStatus.STALE_EPOCH:
-            return ReplicaResponse(
-                request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-                sender_id=self.membership.self_id,
-                sender_generation=self.membership.local_generation,
-                target_id=request.sender_id, epoch=result.context.epoch, mode=result.context.mode,
+            return self._response(
+                request, epoch=result.context.epoch, mode=result.context.mode,
                 op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
-                present=False, durable=False, error="STALE_EPOCH",
-            )
+                present=False, durable=False, error="STALE_EPOCH")
         status_map = {
             LocalStatus.INSTALLED: RpcStatus.INSTALLED,
             LocalStatus.UNCHANGED: RpcStatus.UNCHANGED,
@@ -333,14 +324,10 @@ class ReplicaService:
         }
         if result.status not in status_map:
             return self._error_response(request, "STORAGE_ERROR")
-        return ReplicaResponse(
-            request_id=request.request_id, manifest_id=self.manifest.fingerprint,
-            sender_id=self.membership.self_id,
-            sender_generation=self.membership.local_generation,
-            target_id=request.sender_id, epoch=result.context.epoch, mode=result.context.mode,
+        return self._response(
+            request, epoch=result.context.epoch, mode=result.context.mode,
             op=request.op, phase=request.phase, status=status_map[result.status],
-            present=False, stored_version=result.stored_version, durable=result.durable,
-        )
+            present=False, stored_version=result.stored_version, durable=result.durable)
 
     def _handle(self, connection: socket.socket, deadline: float) -> None:
         try:

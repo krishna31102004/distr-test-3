@@ -2,11 +2,11 @@
 
 **Batches 1–4 are implemented and locally tested. Distributed client-facing KV
 operations remain unfinished.** The foundation includes local SQLite WAL/FULL
-storage, fixed SHA-256 ring ownership, restart-aware membership, and a bounded
+storage, fixed SHA-256 ring ownership, restart-aware membership, a bounded
 single-replica KV TCP request/response service, and an integrated node runtime.
-Quorum coordinators, consistency
-protocols, read repair, operational command integration and mode changes remain
-future work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
+Step 3 Batch 1 adds shared schema-2 coordinator infrastructure, not the Strong or
+Eventual algorithms. Read repair, operational command integration and mode changes
+remain future work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
 
 Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [KEY_DECISIONS.md](KEY_DECISIONS.md), [AGENTS.md](AGENTS.md), and
@@ -14,9 +14,10 @@ Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [BUILD_PROGRESS_EXPLAINED.md](BUILD_PROGRESS_EXPLAINED.md). Claude Code entrypoints
 use the same shared agent rules.
 
-The proposed Strong ABD and Eventual-noRR design is in
-[STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). It awaits Krishna's explicit
-approval; no consistency protocol implementation has started.
+The Strong ABD and Eventual-noRR design in
+[STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) was approved by Krishna on
+October 31, 2026. Shared Step 3 Batch 1 infrastructure is implemented and locally
+reviewed; Strong/Eventual coordinator algorithms have not started.
 
 ## Layout
 
@@ -27,6 +28,9 @@ mp3/
   storage.py                   local SQLite WAL/FULL store and version allocation
   framing.py                   legacy-compatible and total-deadline byte framing
   rpc.py                       strict C5 request/response codecs and one-call client
+  attempts.py                  bounded mutable lifetime lease for replica attempts
+  coordinator.py               schema activation, evidence types, distinct collector,
+                                and bounded coordinator/outbound worker resources
   replica.py                   bounded local READ_LOCAL/INSTALL_IF_NEWER service
   eventlog.py                  structured logs and local replica event lines
   ring.py                      ten-node manifest, SHA-256 IDs and five owners
@@ -50,12 +54,21 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 130 tests. It uses temporary SQLite directories, fake
+The suite currently has 153 tests. It uses temporary SQLite directories, fake
 clocks, subprocesses killed with SIGKILL, and temporary loopback membership and KV
 listeners. `tests/test_node_runtime.py` starts three logical VMs on loopback and also
-tests a separate-process crash/restart path. It contacts no university VM. The verified results and limits are recorded
+tests a separate-process crash/restart path, plus schema-2 Strong and Eventual-noRR
+single-replica calls using an explicit compatibility fixture. These tests do not
+exercise either multi-owner coordinator. It contacts no university VM. The verified results and limits are recorded
 in the implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
 real VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
+
+For an explicit schema-2 local test, `mp3.node` accepts `--schema2-inventory PATH`.
+The JSON inventory must name all ten manifest identities and give each the same
+release ID with schema version 2 or newer. This is an operator-supplied configuration
+assertion; it does not check or prove compatibility of deployed VMs. Without the
+inventory, protocol-phase RPC remains disabled. Even when enabled, node methods send
+only one replica RPC and do not run Strong/Eventual coordination.
 
 ## Commands currently working
 

@@ -14,6 +14,13 @@ import time
 from typing import TextIO
 
 from .eventlog import configure_logging
+from .attempts import AttemptLease
+from .coordinator import (
+    DEFAULT_ATTEMPT_QUEUE, DEFAULT_ATTEMPT_WORKERS,
+    DEFAULT_COORDINATOR_QUEUE, DEFAULT_COORDINATOR_WORKERS,
+    CoordinatorResources, CoordinatorShutdownReport, OwnerCall, Schema2Activation,
+    dispatch_owner as _dispatch_owner,
+)
 from .membership import Member, MembershipRuntime
 from .models import ConsistencyMode, Context, Version
 from .replica import DEFAULT_REPLICA_QUEUE, DEFAULT_REPLICA_WORKERS, ReplicaService, ShutdownReport
@@ -33,6 +40,7 @@ class NodeShutdownReport:
     outstanding_rpc_calls: int
     membership_stopped: bool
     store_closed: bool
+    coordinator: CoordinatorShutdownReport | None = None
 
     @property
     def clean(self) -> bool:
@@ -42,6 +50,7 @@ class NodeShutdownReport:
             and self.store_closed
             and self.incomplete_requests == 0
             and (self.replica is None or self.replica.workers_joined)
+            and (self.coordinator is None or self.coordinator.clean)
         )
 
     @property
@@ -62,6 +71,11 @@ class NodeRuntime:
                  store_timeout: float = 5.0, store_capacity: int = 8,
                  replica_workers: int = DEFAULT_REPLICA_WORKERS,
                  replica_queue: int = DEFAULT_REPLICA_QUEUE,
+                 coordinator_workers: int = DEFAULT_COORDINATOR_WORKERS,
+                 coordinator_queue: int = DEFAULT_COORDINATOR_QUEUE,
+                 attempt_workers: int = DEFAULT_ATTEMPT_WORKERS,
+                 attempt_queue: int = DEFAULT_ATTEMPT_QUEUE,
+                 protocol_activation: Schema2Activation | None = None,
                  gossip_background: bool = True):
         if not isinstance(manifest, Manifest):
             raise TypeError("manifest must be a validated Manifest")
@@ -84,12 +98,20 @@ class NodeRuntime:
         self.store_capacity = store_capacity
         self.replica_workers = replica_workers
         self.replica_queue = replica_queue
+        self.coordinator_workers = coordinator_workers
+        self.coordinator_queue = coordinator_queue
+        self.attempt_workers = attempt_workers
+        self.attempt_queue = attempt_queue
+        if protocol_activation is not None and not protocol_activation.enabled_for(manifest):
+            raise ValueError("schema-2 activation does not match this manifest")
+        self.protocol_activation = protocol_activation
         self.gossip_background = gossip_background
 
         self.store: Store | None = None
         self.membership_runtime: MembershipRuntime | None = None
         self.replica_service: ReplicaService | None = None
         self.rpc_client: ReplicaClient | None = None
+        self.coordinator_resources: CoordinatorResources | None = None
         self.logger: logging.Logger | None = None
         self._ready = False
         self._stopping = False
@@ -103,11 +125,15 @@ class NodeRuntime:
     def from_files(cls, *, vm_id: str, manifest_path: str | Path,
                    database_path: str | Path, bootstrap: bool,
                    bootstrap_mode: ConsistencyMode | None = None,
+                   schema2_inventory_path: str | Path | None = None,
                    **kwargs) -> "NodeRuntime":
         """Load the explicit node identity and validated ten-node manifest."""
         manifest = load_manifest(manifest_path)
+        activation = (None if schema2_inventory_path is None else
+                      Schema2Activation.from_file(manifest, schema2_inventory_path))
         return cls(manifest=manifest, vm_id=vm_id, database_path=database_path,
-                   bootstrap=bootstrap, bootstrap_mode=bootstrap_mode, **kwargs)
+                   bootstrap=bootstrap, bootstrap_mode=bootstrap_mode,
+                   protocol_activation=activation, **kwargs)
 
     @property
     def ready(self) -> bool:
@@ -168,13 +194,20 @@ class NodeRuntime:
             self.replica_service = ReplicaService(
                 self.store, self.manifest, self.membership_runtime.table,
                 workers=self.replica_workers, max_pending=self.replica_queue,
-                logger=self.logger, event_stream=self.event_stream)
+                logger=self.logger, event_stream=self.event_stream,
+                protocol_activation=self.protocol_activation)
             self.replica_service.start()
 
             # Endpoint resolution is part of constructing the existing single-call
             # client. Only after all local services exist do we report local readiness.
             self.rpc_client = ReplicaClient(self.manifest,
-                                            self.membership_runtime.table)
+                                            self.membership_runtime.table,
+                                            protocol_activation=self.protocol_activation)
+            self.coordinator_resources = CoordinatorResources(
+                coordinator_workers=self.coordinator_workers,
+                coordinator_queue=self.coordinator_queue,
+                attempt_workers=self.attempt_workers,
+                attempt_queue=self.attempt_queue)
             with self._calls:
                 self._ready = True
                 self._accepting_calls = True
@@ -187,6 +220,13 @@ class NodeRuntime:
 
     def _cleanup_failed_start(self) -> None:
         """Release initialized resources while preserving the original exception."""
+        coordinator_report = None
+        if self.coordinator_resources is not None:
+            try:
+                coordinator_report = self.coordinator_resources.shutdown(
+                    timeout=2.0, force=True)
+            except BaseException:
+                pass
         replica_report = None
         if self.replica_service is not None:
             try:
@@ -199,7 +239,9 @@ class NodeRuntime:
                 membership_stopped = self.membership_runtime.stop()
             except BaseException:
                 membership_stopped = False
-        safe_to_close_store = (replica_report is None or replica_report.workers_joined)
+        safe_to_close_store = (
+            (replica_report is None or replica_report.workers_joined)
+            and (coordinator_report is None or coordinator_report.clean))
         store_closed = False
         if self.store is not None and safe_to_close_store and membership_stopped:
             try:
@@ -209,11 +251,14 @@ class NodeRuntime:
                 pass
         self._close_logger()
         self._shutdown_report = NodeShutdownReport(
-            replica_report, 0, membership_stopped, store_closed)
+            replica_report, 0, membership_stopped, store_closed, coordinator_report)
 
     def call_replica(self, target_id: str, op: RpcOperation, key: str, *,
                      deadline: float, version: Version | None = None,
-                     value: bytes = b"") -> RpcOutcome:
+                     value: bytes = b"", phase: str = "local",
+                     schema: int = 1, operation_id: str | None = None,
+                     expected_target_generation: int | None = None,
+                     attempt_lease: AttemptLease | None = None) -> RpcOutcome:
         """Send exactly one local replica RPC using this process's current identity."""
         with self._calls:
             if not self._ready or not self._accepting_calls or self.rpc_client is None:
@@ -230,13 +275,95 @@ class NodeRuntime:
                 manifest=self.manifest, sender_id=self.vm_id,
                 sender_generation=generation, target_id=target_id,
                 epoch=context.epoch, mode=context.mode, op=op, key=key,
-                version=version, value=value)
+                version=version, value=value, phase=phase, schema=schema,
+                operation_id=operation_id)
+            call_options = {}
+            if expected_target_generation is not None:
+                call_options["expected_target_generation"] = expected_target_generation
+            if attempt_lease is not None:
+                call_options["attempt_lease"] = attempt_lease
             return client.call_replica(
-                self.manifest.node(target_id), request, deadline=deadline)
+                self.manifest.node(target_id), request, deadline=deadline,
+                **call_options)
         finally:
             with self._calls:
                 self._active_calls -= 1
                 self._calls.notify_all()
+
+    def reserve_attempts(self, count: int, *, deadline: float):
+        """Atomically reserve bounded outbound capacity while the node admits work."""
+        with self._calls:
+            if (not self._ready or not self._accepting_calls
+                    or self.coordinator_resources is None):
+                raise RuntimeError("node is not accepting coordinator work")
+            resources = self.coordinator_resources
+        return resources.reserve_attempts(count, deadline=deadline)
+
+    def submit_coordinator(self, function, *args, deadline: float):
+        """Submit one bounded coordinator-side test/infrastructure task, not a KV protocol."""
+        with self._calls:
+            if (not self._ready or not self._accepting_calls
+                    or self.coordinator_resources is None):
+                raise RuntimeError("node is not accepting coordinator work")
+            resources = self.coordinator_resources
+            self._active_calls += 1
+        try:
+            future = resources.coordinators.submit(function, *args, deadline=deadline)
+            if future is None:
+                with self._calls:
+                    self._active_calls -= 1
+                    self._calls.notify_all()
+                return None
+            future.add_done_callback(self._finish_admitted_call)
+            return future
+        except BaseException:
+            self._finish_admitted_call(None)
+            raise
+
+    def dispatch_owner(self, target_id: str, op: RpcOperation, key: str, *,
+                       deadline: float, reservation=None, phase: str,
+                       operation_id: str, version: Version | None = None,
+                       value: bytes = b"", attempt_lease: AttemptLease | None = None
+                       ) -> OwnerCall:
+        """Create and dispatch one schema-2 RPC, without collecting a quorum."""
+        with self._calls:
+            if (not self._ready or not self._accepting_calls
+                    or self.rpc_client is None or self.membership_runtime is None
+                    or self.coordinator_resources is None):
+                raise RuntimeError("node is not accepting RPC calls")
+            if self.protocol_activation is None:
+                raise RuntimeError("schema-2 protocol is not activated")
+            context = self.store.current_context()
+            sender_generation = self.membership_runtime.generation
+            client = self.rpc_client
+            membership = self.membership_runtime.table.snapshot()
+            target_row = next(row for row in membership if row.vm_id == target_id)
+            expected_generation = target_row.restart_generation
+            if expected_generation <= 0:
+                raise RuntimeError("target generation is unknown")
+            self._active_calls += 1
+        try:
+            request = new_request(
+                manifest=self.manifest, sender_id=self.vm_id,
+                sender_generation=sender_generation, target_id=target_id,
+                epoch=context.epoch, mode=context.mode, op=op, key=key,
+                version=version, value=value, phase=phase, schema=2,
+                operation_id=operation_id)
+            owner_call = _dispatch_owner(
+                client, self.manifest.node(target_id), request, deadline=deadline,
+                expected_generation=expected_generation,
+                executor=self.coordinator_resources.attempts,
+                reservation=reservation, attempt_lease=attempt_lease)
+            owner_call.future.add_done_callback(self._finish_admitted_call)
+            return owner_call
+        except BaseException:
+            self._finish_admitted_call(None)
+            raise
+
+    def _finish_admitted_call(self, _future) -> None:
+        with self._calls:
+            self._active_calls -= 1
+            self._calls.notify_all()
 
     def stop(self, *, timeout: float = DEFAULT_NODE_SHUTDOWN_TIMEOUT) -> NodeShutdownReport:
         """Stop accepting calls, drain bounded work, stop services, then close Store."""
@@ -258,6 +385,10 @@ class NodeRuntime:
             self._accepting_calls = False
 
         replica_report = None
+        coordinator_report = None
+        if self.coordinator_resources is not None:
+            coordinator_report = self.coordinator_resources.shutdown(
+                timeout=max(0.0, deadline - time.monotonic()))
         if self.replica_service is not None:
             replica_report = self.replica_service.stop(
                 timeout=max(0.0, deadline - time.monotonic()))
@@ -273,6 +404,7 @@ class NodeRuntime:
 
         safe_to_close_store = (
             (replica_report is None or replica_report.workers_joined)
+            and (coordinator_report is None or coordinator_report.clean)
             and membership_stopped and outstanding_calls == 0)
         store_closed = False
         if self.store is not None and safe_to_close_store:
@@ -280,7 +412,8 @@ class NodeRuntime:
             store_closed = True
         self._close_logger()
         self._shutdown_report = NodeShutdownReport(
-            replica_report, outstanding_calls, membership_stopped, store_closed)
+            replica_report, outstanding_calls, membership_stopped, store_closed,
+            coordinator_report)
         return self._shutdown_report
 
     def _close_logger(self) -> None:
@@ -315,6 +448,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-mode", choices=[mode.value for mode in ConsistencyMode],
                         default=None,
                         help="initial mode for --bootstrap only; default: strong epoch 1")
+    parser.add_argument("--schema2-inventory",
+                        help="explicit complete ten-node compatible-release inventory")
     parser.add_argument("--log", help="optional append-only JSON-lines local log path")
     return parser
 
@@ -331,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         node = NodeRuntime.from_files(
             vm_id=args.vm_id, manifest_path=args.manifest, database_path=args.db,
             bootstrap=bootstrap, bootstrap_mode=mode, log_path=args.log,
+            schema2_inventory_path=args.schema2_inventory,
             event_stream=sys.stdout).start()
     except Exception as error:
         print(f"START_FAILED {type(error).__name__}: {error}", file=sys.stderr, flush=True)

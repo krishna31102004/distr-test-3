@@ -17,11 +17,13 @@ import unittest
 from unittest import mock
 
 from mp3.membership import GossipEnvelope, Member, MemberState, MembershipTable
+from mp3.coordinator import RpcCompletion, Schema2Activation
+from mp3.attempts import AttemptLease
 from mp3.models import ConsistencyMode, Context, LocalStatus, Version
 from mp3.node import NodeRuntime, main as node_main
 from mp3.ring import Endpoint, Manifest
 from mp3.rpc import (ReplicaClient, RpcOperation, RpcOutcomeKind, RpcStatus,
-                     new_request, receive_response, send_request)
+                     new_operation_id, new_request, receive_response, send_request)
 from mp3.storage import StorageError, open_store
 
 
@@ -119,6 +121,77 @@ class NodeRuntimeTests(unittest.TestCase):
                          gossip_background=False).start()
         self.assertEqual(node.context, Context(1, ConsistencyMode.EVENTUAL_RR))
         self.assertTrue(node.stop(timeout=3).clean)
+
+    def test_schema2_dispatch_reaches_remote_store_after_membership_converges(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "local-test-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        first = self.node("vm01", protocol_activation=activation).start()
+        second = self.node("vm02", protocol_activation=activation).start()
+        try:
+            self._wait_known_generations((first, second), ("vm01", "vm02"))
+            operation_id = new_operation_id()
+            version = first.store.allocate_strong_version(
+                context=first.context, observed_max=None)
+            write = first.dispatch_owner(
+                "vm02", RpcOperation.INSTALL_IF_NEWER, "schema-two-key",
+                deadline=time.monotonic() + 3, phase="strong_write",
+                operation_id=operation_id, version=version, value=b"remote bytes")
+            written = write.future.result(timeout=4)
+            self.assertIsInstance(written, RpcCompletion)
+            self.assertEqual(written.outcome.kind, RpcOutcomeKind.RESPONSE)
+            self.assertEqual((written.outcome.response.status,
+                              written.outcome.response.stored_version,
+                              written.outcome.response.durable),
+                             (RpcStatus.INSTALLED, version, True))
+            read = first.dispatch_owner(
+                "vm02", RpcOperation.READ_LOCAL, "schema-two-key",
+                deadline=time.monotonic() + 3, phase="strong_query",
+                operation_id=operation_id)
+            result = read.future.result(timeout=4)
+            self.assertEqual((result.outcome.response.status,
+                              result.outcome.response.version,
+                              result.outcome.response.value),
+                             (RpcStatus.FOUND, version, b"remote bytes"))
+            self.assertEqual(second.store.read_local(
+                "schema-two-key", context=second.context).record.value, b"remote bytes")
+        finally:
+            self.assertTrue(second.stop(timeout=4).clean)
+            self.assertTrue(first.stop(timeout=4).clean)
+
+    def test_eventual_schema2_dispatch_uses_attempt_lease_over_loopback(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "local-test-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        first = self.node("vm03", mode=ConsistencyMode.EVENTUAL_NO_RR,
+                          protocol_activation=activation).start()
+        second = self.node("vm04", mode=ConsistencyMode.EVENTUAL_NO_RR,
+                           protocol_activation=activation).start()
+        try:
+            self._wait_known_generations((first, second), ("vm03", "vm04"))
+            operation_id = new_operation_id()
+            version = first.store.allocate_eventual_version(context=first.context)
+            lease = AttemptLease()
+            call = first.dispatch_owner(
+                "vm04", RpcOperation.INSTALL_IF_NEWER, "leased-write",
+                deadline=lease.hard_deadline, phase="eventual_put",
+                operation_id=operation_id, version=version, value=b"lease bytes",
+                attempt_lease=lease)
+            result = call.future.result(timeout=4)
+            self.assertEqual(result.outcome.kind, RpcOutcomeKind.RESPONSE)
+            self.assertEqual((result.outcome.response.status,
+                              result.outcome.response.stored_version,
+                              result.outcome.response.durable),
+                             (RpcStatus.INSTALLED, version, True))
+            self.assertEqual(second.store.read_local(
+                "leased-write", context=second.context).record.value, b"lease bytes")
+        finally:
+            self.assertTrue(second.stop(timeout=4).clean)
+            self.assertTrue(first.stop(timeout=4).clean)
 
     def test_identity_manifest_and_bootstrap_recovery_inputs_fail_closed(self):
         with self.assertRaises(ValueError):

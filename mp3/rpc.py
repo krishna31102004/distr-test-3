@@ -7,11 +7,14 @@ from enum import Enum
 import json
 import math
 import re
+import errno
+import selectors
 import socket
 import time
 import uuid
 
 from .config import MAX_VALUE_BYTES
+from .attempts import AttemptCancelled, AttemptLease
 from .framing import HEADER, recv_exact_deadline, send_all_deadline
 from .membership import MembershipTable
 from .models import ConsistencyMode, Version
@@ -19,6 +22,7 @@ from .ring import Manifest, Node
 
 
 SCHEMA_VERSION = 1
+PROTOCOL_SCHEMA_VERSION = 2
 MAX_JSON_BYTES = 16_384
 MAX_RPC_PAYLOAD = 4 + MAX_JSON_BYTES + MAX_VALUE_BYTES
 MAX_ERROR_BYTES = 1_024
@@ -57,7 +61,33 @@ class RpcOutcomeKind(str, Enum):
     UNREACHABLE = "UNREACHABLE"
     INVALID_RESPONSE = "INVALID_RESPONSE"
     OVERLOADED = "OVERLOADED"
+    CANCELLED = "CANCELLED"
     ERROR = "ERROR"
+
+
+PROTOCOL_PHASES = frozenset({"strong_query", "strong_write", "strong_readback",
+                             "eventual_read", "eventual_put"})
+
+
+def _validate_phase(op: RpcOperation, mode: ConsistencyMode, phase: str,
+                    schema: int, operation_id: str | None) -> None:
+    if schema == SCHEMA_VERSION:
+        if phase != "local" or operation_id is not None:
+            raise RpcProtocolError("schema 1 supports only phase=local without operation_id")
+        return
+    if schema != PROTOCOL_SCHEMA_VERSION or phase not in PROTOCOL_PHASES:
+        raise RpcProtocolError("unsupported schema or protocol phase")
+    if operation_id is None:
+        raise RpcProtocolError("schema 2 requires operation_id")
+    _validate_request_id(operation_id)
+    expected_op = (RpcOperation.READ_LOCAL if phase in ("strong_query", "eventual_read")
+                   else RpcOperation.INSTALL_IF_NEWER)
+    if op != expected_op:
+        raise RpcProtocolError("operation does not match protocol phase")
+    if phase.startswith("strong_") and mode != ConsistencyMode.STRONG:
+        raise RpcProtocolError("Strong protocol phase requires Strong mode")
+    if phase.startswith("eventual_") and mode != ConsistencyMode.EVENTUAL_NO_RR:
+        raise RpcProtocolError("Eventual-noRR protocol phase requires Eventual-noRR mode")
 
 
 def _is_int(value: object) -> bool:
@@ -208,6 +238,7 @@ class ReplicaRequest:
     version: Version | None = None
     value: bytes = b""
     schema: int = SCHEMA_VERSION
+    operation_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -215,18 +246,18 @@ class ReplicaRequest:
             raise RpcProtocolError("manifest_id must be lowercase SHA-256 hex")
         _validate_vm_id(self.sender_id, "sender_id")
         _validate_vm_id(self.target_id, "target_id")
-        if not _is_int(self.schema) or self.schema != SCHEMA_VERSION:
+        if not _is_int(self.schema) or self.schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
             raise RpcProtocolError("unsupported RPC schema")
-        if not _is_int(self.sender_generation) or self.sender_generation < 0:
-            raise RpcProtocolError("sender_generation must be a nonnegative integer")
-        if not _is_int(self.epoch) or self.epoch < 0:
-            raise RpcProtocolError("epoch must be a nonnegative integer")
+        minimum = 1 if self.schema == PROTOCOL_SCHEMA_VERSION else 0
+        if not _is_int(self.sender_generation) or self.sender_generation < minimum:
+            raise RpcProtocolError("invalid sender_generation for RPC schema")
+        if not _is_int(self.epoch) or self.epoch < minimum:
+            raise RpcProtocolError("invalid epoch for RPC schema")
         if not isinstance(self.mode, ConsistencyMode):
             raise RpcProtocolError("mode must be a ConsistencyMode")
         if not isinstance(self.op, RpcOperation):
             raise RpcProtocolError("op must be a supported RpcOperation")
-        if self.phase != "local":
-            raise RpcProtocolError("only phase=local is supported in this batch")
+        _validate_phase(self.op, self.mode, self.phase, self.schema, self.operation_id)
         if not isinstance(self.key, str):
             raise RpcProtocolError("key must be a string")
         try:
@@ -242,6 +273,12 @@ class ReplicaRequest:
             raise RpcProtocolError("INSTALL_IF_NEWER requires a version")
         if self.version is not None:
             self._validate_version_kind(self.version)
+        if self.schema == PROTOCOL_SCHEMA_VERSION:
+            if self.phase in ("strong_query", "eventual_read"):
+                if self.version is not None or self.value:
+                    raise RpcProtocolError("protocol read requires null version and empty body")
+            elif self.version is None:
+                raise RpcProtocolError("protocol install requires a version")
 
     @property
     def value_len(self) -> int:
@@ -264,7 +301,7 @@ class ReplicaRequest:
             manifest.node(match.group(1))
 
     def to_metadata(self) -> dict:
-        return {
+        metadata = {
             "schema": self.schema,
             "request_id": self.request_id,
             "manifest_id": self.manifest_id,
@@ -279,15 +316,23 @@ class ReplicaRequest:
             "version": _version_to_wire(self.version),
             "value_len": self.value_len,
         }
+        if self.schema == PROTOCOL_SCHEMA_VERSION:
+            metadata["operation_id"] = self.operation_id
+        return metadata
 
     @classmethod
     def from_metadata(cls, metadata: dict, value: bytes, manifest: Manifest) -> "ReplicaRequest":
+        if not isinstance(metadata, dict) or "schema" not in metadata:
+            raise RpcProtocolError("request schema is missing")
+        schema = metadata["schema"]
+        if not _is_int(schema) or schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+            raise RpcProtocolError("unsupported RPC schema")
         required = {"schema", "request_id", "manifest_id", "sender_id", "sender_generation",
                     "target_id", "epoch", "mode", "op", "phase", "key", "version", "value_len"}
+        if schema == PROTOCOL_SCHEMA_VERSION:
+            required.add("operation_id")
         if set(metadata) != required:
             raise RpcProtocolError("request has missing or unexpected fields")
-        if not _is_int(metadata["schema"]) or metadata["schema"] != SCHEMA_VERSION:
-            raise RpcProtocolError("unsupported RPC schema")
         value_len = metadata["value_len"]
         if not _is_int(value_len) or not 0 <= value_len <= MAX_VALUE_BYTES or value_len != len(value):
             raise RpcProtocolError("request value_len is invalid or inconsistent with body")
@@ -301,6 +346,7 @@ class ReplicaRequest:
                 mode=_mode(metadata["mode"]), op=_operation(metadata["op"]),
                 phase=metadata["phase"], key=metadata["key"], version=version, value=value,
                 schema=metadata["schema"],
+                operation_id=metadata.get("operation_id"),
             )
             request.validate_manifest(manifest)
             return request
@@ -331,6 +377,7 @@ class ReplicaResponse:
     durable: bool = False
     error: str | None = None
     schema: int = SCHEMA_VERSION
+    operation_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_request_id(self.request_id)
@@ -338,16 +385,18 @@ class ReplicaResponse:
             raise RpcProtocolError("manifest_id must be lowercase SHA-256 hex")
         _validate_vm_id(self.sender_id, "sender_id")
         _validate_vm_id(self.target_id, "target_id")
-        if not _is_int(self.schema) or self.schema != SCHEMA_VERSION:
+        if not _is_int(self.schema) or self.schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
             raise RpcProtocolError("unsupported RPC schema")
-        if not _is_int(self.sender_generation) or self.sender_generation < 0:
-            raise RpcProtocolError("sender_generation must be a nonnegative integer")
-        if not _is_int(self.epoch) or self.epoch < 0:
-            raise RpcProtocolError("epoch must be a nonnegative integer")
+        minimum = 1 if self.schema == PROTOCOL_SCHEMA_VERSION else 0
+        if not _is_int(self.sender_generation) or self.sender_generation < minimum:
+            raise RpcProtocolError("invalid sender_generation for RPC schema")
+        if not _is_int(self.epoch) or self.epoch < minimum:
+            raise RpcProtocolError("invalid epoch for RPC schema")
         if not isinstance(self.mode, ConsistencyMode):
             raise RpcProtocolError("mode must be a ConsistencyMode")
-        if not isinstance(self.op, RpcOperation) or self.phase != "local":
-            raise RpcProtocolError("unsupported operation or phase")
+        if not isinstance(self.op, RpcOperation):
+            raise RpcProtocolError("unsupported operation")
+        _validate_phase(self.op, self.mode, self.phase, self.schema, self.operation_id)
         if not isinstance(self.status, RpcStatus):
             raise RpcProtocolError("status must be a RpcStatus")
         if type(self.present) is not bool or type(self.durable) is not bool:
@@ -404,7 +453,8 @@ class ReplicaResponse:
     def validate_for(self, request: ReplicaRequest, target: Node, manifest: Manifest,
                      expected_generation: int) -> None:
         """Bind this response to the exact request and dispatch-time replica generation."""
-        if self.schema != SCHEMA_VERSION or self.request_id != request.request_id:
+        if (self.schema != request.schema or self.request_id != request.request_id
+                or self.operation_id != request.operation_id):
             raise RpcProtocolError("response schema or request_id mismatch")
         if (self.manifest_id != manifest.fingerprint or request.manifest_id != manifest.fingerprint
                 or target != manifest.node(request.target_id)):
@@ -436,7 +486,7 @@ class ReplicaResponse:
                 raise RpcProtocolError("VERSION_CONFLICT must report the equal stored version")
 
     def to_metadata(self) -> dict:
-        return {
+        metadata = {
             "schema": self.schema,
             "request_id": self.request_id,
             "manifest_id": self.manifest_id,
@@ -455,16 +505,24 @@ class ReplicaResponse:
             "durable": self.durable,
             "error": self.error,
         }
+        if self.schema == PROTOCOL_SCHEMA_VERSION:
+            metadata["operation_id"] = self.operation_id
+        return metadata
 
     @classmethod
     def from_metadata(cls, metadata: dict, value: bytes, manifest: Manifest) -> "ReplicaResponse":
+        if not isinstance(metadata, dict) or "schema" not in metadata:
+            raise RpcProtocolError("response schema is missing")
+        schema = metadata["schema"]
+        if not _is_int(schema) or schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+            raise RpcProtocolError("unsupported RPC schema")
         required = {"schema", "request_id", "manifest_id", "sender_id", "sender_generation",
                     "target_id", "epoch", "mode", "op", "phase", "status", "present",
                     "version", "stored_version", "value_len", "durable", "error"}
+        if schema == PROTOCOL_SCHEMA_VERSION:
+            required.add("operation_id")
         if set(metadata) != required:
             raise RpcProtocolError("response has missing or unexpected fields")
-        if not _is_int(metadata["schema"]) or metadata["schema"] != SCHEMA_VERSION:
-            raise RpcProtocolError("unsupported RPC schema")
         value_len = metadata["value_len"]
         if not _is_int(value_len) or not 0 <= value_len <= MAX_VALUE_BYTES or value_len != len(value):
             raise RpcProtocolError("response value_len is invalid or inconsistent with body")
@@ -481,6 +539,7 @@ class ReplicaResponse:
                 stored_version=_version_from_wire(metadata["stored_version"], manifest),
                 value=value, durable=metadata["durable"], error=metadata["error"],
                 schema=metadata["schema"],
+                operation_id=metadata.get("operation_id"),
             )
             manifest.node(response.sender_id)
             manifest.node(response.target_id)
@@ -501,13 +560,25 @@ class RpcOutcome:
     completion_unknown: bool = False
 
 
+def new_operation_id() -> str:
+    """Create a canonical lowercase UUID4 for one logical client operation."""
+    return str(uuid.uuid4())
+
+
 def new_request(*, manifest: Manifest, sender_id: str, sender_generation: int,
                 target_id: str, epoch: int, mode: ConsistencyMode, op: RpcOperation,
-                key: str, version: Version | None = None, value: bytes = b"") -> ReplicaRequest:
-    """Create a fresh per-replica request ID and validate it against the manifest."""
-    request = ReplicaRequest(str(uuid.uuid4()), manifest.fingerprint, sender_id,
-                             sender_generation, target_id, epoch, mode, op, "local",
-                             key, version, value)
+                key: str, version: Version | None = None, value: bytes = b"",
+                phase: str = "local", schema: int = SCHEMA_VERSION,
+                operation_id: str | None = None) -> ReplicaRequest:
+    """Create a fresh per-RPC request ID; schema 2 callers reuse their operation ID."""
+    if schema == PROTOCOL_SCHEMA_VERSION and operation_id is None:
+        operation_id = new_operation_id()
+    request = ReplicaRequest(
+        request_id=str(uuid.uuid4()), manifest_id=manifest.fingerprint,
+        sender_id=sender_id, sender_generation=sender_generation,
+        target_id=target_id, epoch=epoch, mode=mode, op=op, phase=phase,
+        key=key, version=version, value=value, schema=schema,
+        operation_id=operation_id)
     request.validate_manifest(manifest)
     return request
 
@@ -604,16 +675,113 @@ def _request_error(kind: RpcOutcomeKind, error: BaseException | str, *,
     return RpcOutcome(kind, None, str(error)[:MAX_ERROR_BYTES], completion_unknown)
 
 
+def _lease_wait(sock: socket.socket, event: int, lease: AttemptLease) -> None:
+    """Wait for socket readiness while observing lease changes at <=50ms."""
+    with selectors.DefaultSelector() as selector:
+        selector.register(sock, event)
+        while True:
+            remaining = lease.check()
+            ready = selector.select(min(0.05, remaining))
+            if ready:
+                lease.check()
+                return
+
+
+def _lease_connect(addresses, lease: AttemptLease) -> socket.socket:
+    last_error = None
+    connecting = {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR}
+    for family, socktype, proto, sockaddr in addresses:
+        lease.check()
+        connection = socket.socket(family, socktype, proto)
+        connection.setblocking(False)
+        try:
+            result = connection.connect_ex(sockaddr)
+            if result not in (0, errno.EISCONN):
+                if result not in connecting:
+                    raise OSError(result, "nonblocking connect failed")
+                _lease_wait(connection, selectors.EVENT_WRITE, lease)
+                error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if error:
+                    raise OSError(error, "nonblocking connect failed")
+            lease.check()
+            return connection
+        except (AttemptCancelled, TimeoutError):
+            connection.close()
+            raise
+        except OSError as error:
+            connection.close()
+            last_error = error
+    if last_error is not None:
+        raise last_error
+    raise OSError("no usable cached address")
+
+
+def _lease_send_all(sock: socket.socket, data: bytes, lease: AttemptLease,
+                    before_first_send=None) -> None:
+    offset = 0
+    while offset < len(data):
+        lease.check()
+        _lease_wait(sock, selectors.EVENT_WRITE, lease)
+        if offset == 0 and before_first_send is not None:
+            before_first_send()
+        sent = sock.send(data[offset:])
+        if sent <= 0:
+            raise ConnectionError("socket closed during request send")
+        offset += sent
+    lease.check()
+
+
+def _lease_recv_exact(sock: socket.socket, size: int, lease: AttemptLease) -> bytes:
+    if type(size) is not int or size < 0:
+        raise ValueError("size must be a nonnegative integer")
+    data = bytearray()
+    while len(data) < size:
+        lease.check()
+        _lease_wait(sock, selectors.EVENT_READ, lease)
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("socket closed before expected data arrived")
+        data.extend(chunk)
+    lease.check()
+    return bytes(data)
+
+
+def _lease_receive_response(sock: socket.socket, manifest: Manifest,
+                            lease: AttemptLease) -> ReplicaResponse:
+    (outer_len,) = HEADER.unpack(_lease_recv_exact(sock, HEADER.size, lease))
+    if outer_len < HEADER.size or outer_len > MAX_RPC_PAYLOAD:
+        raise RpcProtocolError("outer RPC payload length is out of bounds")
+    (json_len,) = HEADER.unpack(_lease_recv_exact(sock, HEADER.size, lease))
+    if json_len > MAX_JSON_BYTES or HEADER.size + json_len > outer_len:
+        raise RpcProtocolError("JSON length is outside the declared RPC payload")
+    metadata = _decode_json(_lease_recv_exact(sock, json_len, lease))
+    value_len = metadata.get("value_len")
+    if not _is_int(value_len) or not 0 <= value_len <= MAX_VALUE_BYTES:
+        raise RpcProtocolError("value_len must be within the 1 MiB limit")
+    if HEADER.size + json_len + value_len != outer_len:
+        raise RpcProtocolError("declared RPC lengths do not match exactly")
+    value = _lease_recv_exact(sock, value_len, lease)
+    response = ReplicaResponse.from_metadata(metadata, value, manifest)
+    lease.check()
+    _lease_wait(sock, selectors.EVENT_READ, lease)
+    if sock.recv(1):
+        raise RpcProtocolError("unexpected bytes after the single RPC message")
+    lease.check()
+    return response
+
+
 class ReplicaClient:
     """Bounded-deadline client for exactly one replica RPC; never retries automatically."""
 
-    def __init__(self, manifest: Manifest, membership: MembershipTable):
+    def __init__(self, manifest: Manifest, membership: MembershipTable, *,
+                 protocol_activation=None):
         if not isinstance(manifest, Manifest) or not isinstance(membership, MembershipTable):
             raise TypeError("manifest and MembershipTable are required")
         if manifest.fingerprint != membership.manifest.fingerprint:
             raise ValueError("membership and RPC manifest differ")
         self.manifest = manifest
         self.membership = membership
+        self.protocol_activation = protocol_activation
         # Resolve the fixed manifest once during client setup. Per-operation calls
         # then contain no blocking DNS lookup and can share one deadline across all
         # numeric connect candidates. Resolution errors are returned per target.
@@ -653,7 +821,66 @@ class ReplicaClient:
             raise last_error
         raise OSError(f"no usable KV address for {target.vm_id}")
 
-    def call_replica(self, target: Node, request: ReplicaRequest, *, deadline: float) -> RpcOutcome:
+    def _call_replica_with_lease(self, target: Node, request: ReplicaRequest,
+                                 payload: bytes, expected_generation: int,
+                                 lease: AttemptLease) -> RpcOutcome:
+        """Run one Eventual PUT RPC against the lease's mutable deadline."""
+        addresses = self._addresses[target.vm_id]
+        if isinstance(addresses, OSError):
+            return _request_error(RpcOutcomeKind.UNREACHABLE, addresses)
+        connection = None
+        connected = False
+        install_may_have_been_sent = False
+        try:
+            connection = _lease_connect(addresses, lease)
+            connected = True
+
+            def mark_possible_install_transmission() -> None:
+                nonlocal install_may_have_been_sent
+                install_may_have_been_sent = True
+
+            frame = HEADER.pack(len(payload)) + payload
+            _lease_send_all(connection, frame, lease, mark_possible_install_transmission)
+            connection.shutdown(socket.SHUT_WR)
+            response = _lease_receive_response(connection, self.manifest, lease)
+            response.validate_for(request, target, self.manifest, expected_generation)
+            # Decoding and evidence validation are part of the attempt lifetime.
+            lease.check()
+            if response.status == RpcStatus.ERROR and response.error.startswith("OVERLOADED"):
+                return RpcOutcome(RpcOutcomeKind.OVERLOADED, response, response.error)
+            completion_unknown = (
+                request.op == RpcOperation.INSTALL_IF_NEWER
+                and response.status == RpcStatus.ERROR
+                and response.error == "STORAGE_ERROR"
+            )
+            return RpcOutcome(RpcOutcomeKind.RESPONSE, response,
+                              completion_unknown=completion_unknown)
+        except AttemptCancelled as error:
+            return _request_error(RpcOutcomeKind.CANCELLED, error,
+                                  completion_unknown=install_may_have_been_sent)
+        except TimeoutError as error:
+            return _request_error(RpcOutcomeKind.TIMEOUT, error,
+                                  completion_unknown=install_may_have_been_sent)
+        except RpcProtocolError as error:
+            return _request_error(RpcOutcomeKind.INVALID_RESPONSE, error,
+                                  completion_unknown=install_may_have_been_sent)
+        except (ConnectionRefusedError, socket.gaierror, OSError) as error:
+            kind = RpcOutcomeKind.ERROR if connected else RpcOutcomeKind.UNREACHABLE
+            return _request_error(kind, error,
+                                  completion_unknown=install_may_have_been_sent)
+        except (ValueError, TypeError, OverflowError) as error:
+            return _request_error(RpcOutcomeKind.INVALID_RESPONSE, error,
+                                  completion_unknown=install_may_have_been_sent)
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+    def call_replica(self, target: Node, request: ReplicaRequest, *, deadline: float,
+                     expected_target_generation: int | None = None,
+                     attempt_lease: AttemptLease | None = None) -> RpcOutcome:
         """Send one request, enforce its absolute deadline, and bind one response."""
         if type(deadline) not in (int, float):
             return _request_error(RpcOutcomeKind.ERROR,
@@ -665,9 +892,23 @@ class ReplicaClient:
         if not finite_deadline:
             return _request_error(RpcOutcomeKind.ERROR,
                                   "deadline must be a finite monotonic timestamp")
-        if deadline <= time.monotonic():
+        if attempt_lease is None and deadline <= time.monotonic():
             return _request_error(RpcOutcomeKind.TIMEOUT, "operation deadline expired")
-        if deadline - time.monotonic() > MAX_SOCKET_TIMEOUT_SECONDS:
+        if attempt_lease is not None:
+            if (not isinstance(attempt_lease, AttemptLease)
+                    or request.schema != PROTOCOL_SCHEMA_VERSION
+                    or request.phase != "eventual_put"
+                    or request.op != RpcOperation.INSTALL_IF_NEWER
+                    or deadline != attempt_lease.hard_deadline):
+                return _request_error(RpcOutcomeKind.ERROR,
+                                      "attempt lease is only valid for schema-2 Eventual PUT")
+            try:
+                attempt_lease.check()
+            except AttemptCancelled as error:
+                return _request_error(RpcOutcomeKind.CANCELLED, error)
+            except TimeoutError as error:
+                return _request_error(RpcOutcomeKind.TIMEOUT, error)
+        if attempt_lease is None and deadline - time.monotonic() > MAX_SOCKET_TIMEOUT_SECONDS:
             return _request_error(RpcOutcomeKind.ERROR,
                                   "deadline exceeds the supported socket timeout range")
         try:
@@ -680,16 +921,28 @@ class ReplicaClient:
                 raise RpcProtocolError("request sender_id does not match local membership identity")
             if request.sender_generation != self.membership.local_generation:
                 raise RpcProtocolError("request sender_generation does not match local generation")
+            if (request.schema == PROTOCOL_SCHEMA_VERSION
+                    and (self.protocol_activation is None
+                         or not self.protocol_activation.enabled_for(self.manifest))):
+                raise RpcProtocolError("SCHEMA2_DISABLED")
             row = next(member for member in self.membership.snapshot()
                        if member.vm_id == target.vm_id)
-            if row.restart_generation <= 0:
+            if expected_target_generation is None:
+                expected_generation = row.restart_generation
+            else:
+                if type(expected_target_generation) is not int or expected_target_generation <= 0:
+                    raise RpcProtocolError("expected target generation must be positive")
+                expected_generation = expected_target_generation
+            if expected_generation <= 0:
                 raise RpcProtocolError("target generation is unknown; wait for membership recovery")
-            expected_generation = row.restart_generation
             payload = encode_request(request, self.manifest)
-            if time.monotonic() >= deadline:
+            if attempt_lease is None and time.monotonic() >= deadline:
                 return _request_error(RpcOutcomeKind.TIMEOUT, "operation deadline expired")
         except (ValueError, TypeError, RuntimeError) as error:
             return _request_error(RpcOutcomeKind.ERROR, error)
+        if attempt_lease is not None:
+            return self._call_replica_with_lease(
+                target, request, payload, expected_generation, attempt_lease)
 
         connected = False
         install_may_have_been_sent = False
