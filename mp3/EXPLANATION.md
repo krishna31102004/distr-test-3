@@ -700,6 +700,7 @@ working methods:
 | `EventualNoRRCoordinator.get(key, *, context, deadline)` | Return max version among the first R distinct valid owner responses, or explicit NOT_FOUND/error | Future `NodeRuntime.eventual_get`; ring, RPC, response collector | PROPOSED; KD-12 pending |
 | `Store.allocate_strong_version(*, context, observed_max)` | Atomically persist and return a Strong counter above local high-water and observed maximum | Future Strong PUT; SQLite WAL/FULL transaction | PROPOSED; KD-10/11 pending |
 | `dispatch_owner(...)`, `collect_distinct(...)` | Schedule one RPC per prescribed owner and count distinct bound replies under one deadline | Future coordinators; existing `ReplicaClient.call_replica` | PROPOSED; KD-08/14/15 pending details |
+| `AttemptLease` | Admission time plus foreground completion/cancel events → lock-protected per-owner dynamic deadline, capped at admission+15s | Future Eventual PUT scheduler and proposed `ReplicaClient.call_replica(..., attempt_lease=...)` path | PROPOSED; KD-12/14 pending |
 
 The proposal connects through the existing `NodeRuntime`: it captures one Store
 context and durable local generation, passes work to the appropriate coordinator,
@@ -716,3 +717,18 @@ five owners in each required phase; Eventual GET uses the first R distinct valid
 replies and Eventual PUT uses W distinct durable exact-version acknowledgments. A
 coordinator-only `None` bottom represents initial absence in Strong; it is never
 stored or sent. The exact rules and acceptance tests await explicit human approval.
+
+For Eventual PUT only, the design proposes keeping the existing five-second client
+collector deadline separate from each reserved network attempt's `AttemptLease`. The
+current `call_replica` accepts one fixed absolute deadline and therefore needs the
+small lease-aware socket path described in §5.1 of the design; ordinary calls retain
+their fixed deadline API. Five one-shot attempts are reserved before dispatch. After
+the client returns at W or times out, accepted attempts continue until the earlier of
+foreground completion+10 seconds and admission+15 seconds, unless bounded shutdown
+cancels them sooner. This is a proposal, not an implemented behavior.
+
+The proposed schema-2 rollout is a one-time activation gate based on a full
+ten-identity release/version inventory. It is not a per-operation all-node health
+check. After activation, incompatible/offline owners do not qualify; each request
+still contacts only its five prescribed owners and may complete when its own Strong
+or Eventual response threshold is met. No schema downgrade is allowed.

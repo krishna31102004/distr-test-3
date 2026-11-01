@@ -166,11 +166,25 @@ keys; CLI limitations do not narrow the distributed storage contract.
 **Proposal:** add `operation_id` to both metadata envelopes and support protocol phase
 names by defining schema version 2. Schema 1 remains accepted only for the existing
 `phase="local"` primitive during migration/testing; no automatic downgrade is
-permitted. Version-2 coordinators fail closed against old nodes, and protocol work
-must be disabled until all ten nodes run compatible code. This avoids silently
-changing the strict schema-1 field set or confusing an operation with its individual
-RPC attempts. Request ID remains fresh per RPC; operation ID remains stable across
-the phases of one client operation.
+permitted. Use a **one-time rollout gate**, separate from request handling: deploy a
+schema-2-capable build to all ten VM identities, verify the release/version inventory
+for the full fixed manifest, then enable a cluster configuration value such as
+`protocol_schema=2` consistently on coordinators and replicas. Keep protocol
+operations disabled until this rollout check is complete. This check happens at
+rollout/activation, not before every operation, so a
+temporarily down VM does not block later quorums. No schema negotiation or ten-node
+health poll is added to the operation path. Request ID remains fresh per RPC; operation
+ID remains stable across the phases of one client operation.
+
+After the gate, coordinators send schema 2 only. Unsupported schema, a schema-1
+response, or an incompatible peer is a nonqualifying failed attempt; never downgrade
+that RPC to schema 1. Per operation, contact only the five prescribed owners. Strong
+can finish when three compatible owners among those five qualify; Eventual can finish
+when its configured R/W qualifying responses are obtained. An incompatible or
+unavailable owner counts as no response, without substituting another node. If the
+threshold cannot be reached by the deadline, return TIMEOUT/ERROR. The rollout check
+must include offline VMs via the deployment/version inventory before activation; it
+must not assume that mere membership gossip proves code compatibility.
 
 Version-2 request fields are the existing C5 fields plus `operation_id`:
 
@@ -435,28 +449,126 @@ EVENTUAL_PUT(key, value, R, W, context, admitted_at):
         concurrently to each of the five prescribed owners
     collect distinct exact-version durable replies until W, impossibility, or deadline
     count only INSTALLED or UNCHANGED with durable=True and stored_version == version
-    at W before deadline: respond OK; transfer remaining reserved jobs to continuation
-    on deadline before W: respond TIMEOUT/ERROR with completion_unknown if any install may be sent
-    continue all already accepted one-shot attempts to their per-owner deadlines;
+    at W before deadline: close foreground result; respond OK; continue the same five jobs
+    on foreground completion without W: respond TIMEOUT/ERROR; continue the same jobs
     record each owner's durable-confirmed, failed, timed-out, canceled/incomplete result
 ```
 
-The **client deadline** bounds only the foreground wait for W. It does not cancel
-work accepted before the response. The **continuation lifetime** is independent:
-start a ten-second continuation window when the foreground operation returns, with a
-maximum accepted operation lifetime of fifteen seconds from admission. Per C6, use
-the earlier of the continuation expiry and the maximum lifetime; do not reset the
-client deadline for nested calls. Initial attempts are one-shot, not retry loops.
+The **client deadline** is `admitted_at + 5s`; it bounds only when the coordinator
+may answer the client. It does not set the socket deadline for Eventual PUT attempts.
+Each reserved attempt instead has one mutable, thread-safe `AttemptLease` shared by
+the five per-owner jobs:
+
+```python
+class AttemptLease:
+    admitted_at: float
+    hard_deadline: float = admitted_at + 15.0
+    continuation_deadline: float | None = None
+    canceled: bool = False
+
+    def finish_foreground(self, completed_at: float) -> None:
+        # exactly once, under the lease lock; reject a second transition
+        continuation_deadline = min(completed_at + 10.0, hard_deadline)
+
+    def current_deadline(self) -> float:
+        if continuation_deadline is None:
+            return hard_deadline
+        return min(hard_deadline, continuation_deadline)
+```
+
+The lease lock protects `continuation_deadline` and `canceled`; `current_deadline()`
+returns a snapshot while holding that lock. Each worker invokes the existing single
+target client as `call_replica(target, request, deadline=lease.hard_deadline,
+attempt_lease=lease)`. The initial argument satisfies the current API's finite-deadline
+contract; when `attempt_lease` is present, the new socket helpers use the lease's
+current deadline instead. The coordinator's separate foreground collector uses
+`admitted_at + 5s`. It counts only validated acknowledgments received by that time.
+The lease does not permit an individual attempt to exceed its current dynamic deadline.
+
+The coordinator calls `finish_foreground()` exactly once when it returns OK at W,
+returns TIMEOUT at five seconds, or returns an earlier terminal ERROR after dispatch
+has begun. If admission fails before any dispatch (including OVERLOADED), there is
+no lease continuation to start and all reservations are released without network
+effects.
+Consequently the deadline for all remaining attempts is
+`min(foreground_completion + 10s, admitted_at + 15s)`. These are the approved C6
+durations, unchanged. If W arrives at 4.9s, the attempts may continue to 14.9s. If W
+arrives at 1s, they may continue to 11s. If the foreground times out at 5s, accepted
+attempts may continue to 15s. The client receives its response immediately at the
+foreground event; later responses update only the propagation report and cannot
+retroactively satisfy W or change client status.
+
+The existing `ReplicaClient.call_replica(..., deadline: float)` cannot implement
+this lifetime by itself: it fixes the absolute deadline at call entry, and existing
+`sendall`/`recv` waits cannot be shortened by another thread. **Smallest proposed RPC
+extension:** keep the current float-deadline path unchanged for Strong and ordinary
+RPCs, and add an optional `attempt_lease: AttemptLease | None` argument for Eventual
+PUT. In `rpc.py`/`framing.py`, route that path through lease-aware connect/send/read
+helpers. Those helpers use nonblocking sockets and `select`/`selectors` in bounded
+poll intervals (at most 50 ms):
+
+1. Before connect and each wait, read `AttemptLease.current_deadline()` and stop if
+   canceled or expired. Connect uses `connect_ex` plus writable readiness; it is not
+   an uninterruptible blocking `connect()`.
+2. Send with `socket.send()` and a retained byte offset, never `sendall()`; partial
+   writes resume at the unsent offset, so a deadline change cannot duplicate a frame.
+   Preserve the existing “possible INSTALL transmission” boundary and mark
+   completion unknown once transmission could have begun.
+3. Receive exact frame lengths with the same bounded polling and dynamic deadline.
+   On lease expiry/cancel, close the one RPC socket in its owning worker and return a
+   typed `CANCELLED`/TIMEOUT outcome with `completion_unknown=True` iff an INSTALL may
+   have reached storage. A late response is closed and does not become quorum proof.
+
+Polling observes external cancellation and updated lease deadlines within 50 ms.
+An implementation could wake selectors directly, but must preserve this bound and
+partial-send accounting. No retry or second connection is made for an owner. The
+schema and C5 frame do not change for cancellation; `CANCELLED` is a local
+`RpcOutcomeKind`, not a new wire status.
+
+Per-owner state moves once through `RESERVED -> QUEUED -> IN_FLIGHT -> terminal`.
+Terminal records are `DURABLE_ACK` (exact requested tag), `SUPERSEDED` (newer tag;
+not a W ack), `VERSION_CONFLICT`, `STALE_EPOCH`, `UNREACHABLE`, `ERROR`, `TIMEOUT`,
+`CANCELLED_UNKNOWN`, `NOT_STARTED_EXPIRED`, or `NOT_STARTED_SHUTDOWN`. The attempt
+ledger records the response/transport status and whether the INSTALL may have been
+transmitted. `completion_unknown` is true for an owner if transmission was possible
+but no validated response established the stored result; it is false when cancellation
+happens before any request bytes could be sent. Each state transition releases that
+owner's reserved capacity exactly once. `PropagationReport` becomes final only when
+all five owners are terminal; if the process is SIGKILLed, no final report is claimed.
+
+### Deterministic proposed deadline tests
+
+These are acceptance tests to implement later; they have not been run. Use an injected
+monotonic clock, an event-gated fake/loopback RPC peer per logical owner, and barriers
+for dispatch/response order. Advance the fake clock instead of sleeping to cross
+deadlines; use a real loopback socket test for the lease-aware connect/send/read
+cancellation and partial-write path.
+
+| Schedule | Controlled events | Required assertions |
+|---|---|---|
+| W at 4.9s; remaining owners finish at 8–10s | For default W=2, hold two exact durable responses until 4.9; gate the remaining three owners to finish at 8s, 9s and 10s; advance fake time in lockstep | Client receives OK at 4.9; lease expires at 14.9, not 5.0; later owner results are recorded as durable propagation, not late quorum evidence; exactly one request per owner |
+| W at 1s; one active owner stays slow | Deliver W at 1; hold one RPC after a partial response/request state; advance to 10.99 then 11.00 | Client is already OK; active socket closes by 11.05; owner is terminal TIMEOUT/CANCELLED_UNKNOWN if INSTALL bytes may have been sent; no live worker/socket remains |
+| Foreground deadline with possible commits | Deliver fewer than W acks by 5; make one owner commit but lose/delay its reply; keep other accepted jobs gated until their continuation outcomes | Client returns TIMEOUT at 5 with no value/version; `completion_unknown=True`; the lease continues to 15; later durable per-owner results do not turn the client result into success |
+| A queued owner starts after W response | Configure the test scheduler with one active slot; gate the next reserved job until the first owner response causes W and the client response event is observed; release it at fake time 6 | Queued attempt starts once after client success, reads continuation deadline 11 (for W at 1), and either durably completes before then or reports not-started/expired; its reservation is not dropped at client `Future` completion |
+
+The same test group must also assert that no attempt starts after its lease expires,
+foreground responses after five seconds never satisfy W, and the last terminal owner
+releases the fanout reservation. An explicit short shutdown deadline must cancel
+active sockets, mark queued attempts `NOT_STARTED_SHUTDOWN`, return a non-clean report,
+and keep SQLite open until replica handlers have joined.
 
 Capacity must be reserved atomically for all five prescribed owner jobs before any
-PUT can return success. Recommended implementation: bounded shared attempt capacity
+write is dispatched. Use the bounded shared attempt capacity
 of 16 active plus 64 queued, with a reservation token that atomically claims five
 slots; never enqueue five separately and risk partial admission. The reservation is
 released per owner when its single attempt reaches a terminal result or expires.
 If five slots cannot be reserved, reject with `OVERLOADED` before sending any write.
 This aligns with approved C6 background capacity and guarantees that a successful
 foreground W cannot silently lose the remaining fanout merely because the queue is
-full. Implementers must verify the exact active/queued accounting before coding.
+full. Each owner has one reserved slot and one state record; when a worker takes it,
+the reservation transfers from queued to active without a gap. A queued job started
+after the client response reads the already-updated lease and gets only the remaining
+continuation time. It is never dropped merely because its client `Future` completed.
 
 Reachability is learned by attempting the fixed owners; membership SUSPECTED is not
 proof of unreachability. An unreachable owner is recorded as such and is never
@@ -479,10 +591,18 @@ At expiry, mark unresolved owners incomplete and release their reservations.
 
 On graceful shutdown, stop new operation admission; let accepted foreground calls
 use their original deadline and accepted propagation use only its remaining
-continuation budget. At the configured bounded shutdown limit, accurately report
-unfinished attempts and release/close sockets. A forced stop or SIGKILL can truncate
-in-memory propagation; already committed data survives, but restart does not recreate
-the old jobs. A stale mode epoch is checked atomically by storage, rejects the write,
+continuation budget. `NodeRuntime.stop()` closes coordinator admission first, then
+waits for admitted coordinators/leases under its one monotonic shutdown deadline;
+the existing default stop timeout is 12s, so a caller that needs the full approved
+15s attempt lifetime must supply a sufficient timeout. A shorter configured stop
+bound is a forced truncation: cancel active lease sockets, mark queued owners
+`NOT_STARTED_SHUTDOWN`, and report `clean=False`/incomplete rather than success.
+Only after outbound workers are canceled or joined and replica handlers are drained
+may the runtime close membership sockets and SQLite; never close the Store under a
+live handler. The same lease expiry bounds resources if no explicit shutdown occurs.
+A forced stop or SIGKILL can truncate in-memory propagation; already committed data
+survives, but restart does not recreate the old jobs. A stale mode epoch is checked
+atomically by storage, rejects the write,
 and is recorded as STALE_EPOCH; no old job is retagged to a new epoch. Full cluster
 mode switching is Step 4/KD-16.
 
@@ -510,7 +630,7 @@ comparison or repair after returning.
 
 | Setting | PUT foreground success | GET success | Failure example |
 |---|---|---|---|
-| R=1, W=1 | One distinct exact-version durable ack; all five accepted attempts continue | First one qualifying FOUND/NOT_FOUND | If that one owner is unreachable before another valid response, operation times out; other owners are still attempted for PUT |
+| R=1, W=1 | One distinct exact-version durable ack; all five accepted attempts continue | First one qualifying FOUND/NOT_FOUND | Failure of one owner alone does not fail the operation: another prescribed owner can satisfy R or W=1. It times out only if no qualifying owner responds before the foreground deadline |
 | R=2, W=2 default | Two distinct exact-version durable acks | First two distinct qualifying replies; maximum of those two | One reachable read is insufficient; one durable write ack is insufficient |
 | R=3, W=3 | Three distinct exact-version durable acks | First three qualifying replies; maximum of those three | Two failed owners can still allow progress; three failures cannot |
 | R=5, W=5 | All five prescribed owners must durably acknowledge exact version | Five distinct qualifying replies required | Any one nonresponsive owner prevents the threshold before deadline |
@@ -578,9 +698,10 @@ attempts, but outbound workers never wait on coordinator workers or enqueue foll
 work into a saturated pool. A phase-2 dispatch is bounded by the same operation
 deadline and reserved capacity. Shutdown closes new coordinator admission first,
 then drains active foreground calls to their original deadlines, preserves accepted
-Eventual continuation to its own deadline subject to shutdown policy, stops replica
-services, stops membership, and only then closes Store. Reports distinguish incomplete
-operations, uncertain writes and incomplete owner propagation.
+Eventual continuation to its `AttemptLease` deadline unless the configured shutdown
+bound is shorter, stops replica services, stops membership, and only then closes
+Store. Reports distinguish incomplete operations, uncertain writes and incomplete
+owner propagation.
 
 No global operation lock, membership lock, or per-key lock is held over socket I/O.
 Storage's short `BEGIN IMMEDIATE` transaction serializes physical SQLite writes. The
@@ -591,12 +712,16 @@ endpoint; it does not bypass the replica handler or durable Store boundary.
 
 ### 6.3 Deadline and result rules
 
-- The already approved C6 initial foreground budget is five seconds from accepted
-  operation admission, subject to configuration. One absolute `time.monotonic()`
-  deadline covers queue admission, all phases, connect/send/receive and response
-  validation; nested calls never reset it.
+- The already approved C6 foreground budget is five seconds from accepted operation
+  admission. For Strong operations and Eventual GET, one absolute monotonic deadline
+  covers queue admission, all protocol phases, RPC connect/send/receive and response
+  validation; nested calls never reset it. For Eventual PUT, the client collector
+  still closes at five seconds, but each accepted RPC attempt uses the separate
+  `AttemptLease` in §5.1 so its socket can continue after that client response.
 - Do not count a response received after the deadline as an on-time quorum response.
   Strong phase transitions consume the same deadline, not a fresh five seconds.
+  Eventual PUT replies after its foreground deadline can only update the propagation
+  report; they cannot satisfy W for the already-completed client operation.
 - A timed-out Strong PUT after an install may have been sent has
   `completion_unknown=True`. A Strong PUT that times out in phase 1 has no write
   effect from that operation. A timed-out GET readback can have durable background
@@ -715,7 +840,12 @@ Eventual coordinator behavior is enabled by this batch.
 owner/request/phase/context/generation is rejected; deadline covers every phase;
 timeout is not NOT_FOUND; overload is bounded; post-ack work cannot be dropped after
 reservation; same-node RPC works; no network-spanning locks; storage stays open until
-accepted operations end. Contract, concurrency, capacity and restart tests pass.
+accepted operations end. A missing identity in the rollout inventory keeps protocol
+activation disabled. After activation, an unavailable owner is nonqualifying; an
+old-schema owner is rejected without downgrade or owner substitution. Three compatible
+prescribed owners can still satisfy Strong, and Eventual may proceed when its
+configured R/W compatible prescribed owners qualify. Contract, concurrency, capacity
+and restart tests pass.
 
 ### Step 3 Batch 2 — Strong ABD (Krishna)
 

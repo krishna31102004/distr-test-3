@@ -267,6 +267,21 @@ is not an acknowledgment of this value. Strong may count durable strictly-higher
 SUPERSEDED as at-least-tag evidence. Examples, status predicates and acceptance
 traces are in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
 
+**Deadline implementation clarification — still PENDING:** the current
+`ReplicaClient.call_replica(..., deadline: float)` freezes its deadline at entry, so
+it cannot by itself continue an in-flight request past the client response or observe
+a shortened shutdown budget. The proposal is one shared, lock-protected `AttemptLease`
+per Eventual PUT, created after atomic reservation of all five one-shot owner jobs.
+Each job uses a small future lease-aware RPC extension with nonblocking connect,
+partial-send offsets and bounded-poll receive; its effective deadline is
+`min(foreground_completion + 10s, admitted_at + 15s)`. Before foreground completion,
+the hard ceiling is admission+15s; the coordinator separately stops counting W at
+admission+5s. After W or foreground timeout, remaining accepted jobs continue under
+the lease, with explicit per-owner terminal status and completion uncertainty. No
+retries are introduced. A bounded shutdown may cancel the lease early and must report
+incomplete work; SQLite remains open until workers have exited. The approved C6 time
+budgets do not change. The proposed deterministic schedules are in §5.1 of the design.
+
 ## KD-09 — Persistent storage and durability
 
 **Status: APPROVED — C1–C6 foundation contract; implementation/verification tracked separately.**
@@ -523,6 +538,11 @@ overlap; only SQLite's short transaction and Strong's short durable allocator
 transaction serialize. No global/membership/key lock crosses network IO. Exact
 reservation bookkeeping and shutdown truncation/reporting are proposed for review,
 not implemented. See the resource ownership table and deadlock tests in the design.
+For Eventual PUT, the proposal keeps one reserved job per owner through the separate
+lease deadline; queue-to-active transfer is atomic, and shutdown cancellation must
+produce terminal per-owner records before capacity is released. Socket work must be
+interruptible within the bounded polling interval, and SQLite cannot close while a
+replica handler or local admitted operation remains active.
 
 ## KD-15 — Shared storage/RPC interface contract
 
@@ -563,6 +583,15 @@ protocol-specific predicate—not the raw status name—decides quorum qualifica
 Strong and Eventual use separate `SUPERSEDED` rules. This is an exact proposed
 envelope change, and all affected validators and mixed-version behavior are detailed
 in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md).
+
+**Schema rollout clarification — still PENDING:** protocol operations remain disabled
+until a one-time release inventory confirms that all ten fixed VM identities have a
+schema-2-capable build; this activation check is not repeated per operation and does
+not require all peers to be reachable thereafter. Once enabled, send schema 2 only.
+Unsupported or incompatible prescribed owners are nonqualifying; never downgrade or
+substitute a sixth owner. Strong can still qualify with three compatible owners, and
+Eventual can qualify at configured R/W, provided enough distinct prescribed owners
+respond before the deadline. This does not weaken fail-closed schema validation.
 
 ## KD-16 — Mode changes and stale-message fencing
 

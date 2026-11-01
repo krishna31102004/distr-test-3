@@ -1185,3 +1185,26 @@ to continue.
 
 The Step 2 local foundation remains VERIFIED after this correction. No ten-VM test
 was run; Step 3 and the consistency protocols remain untouched.
+
+### Step 3 design-gate clarification — October 31, 2026
+
+The design document now resolves two implementation details without changing the
+approved C1–C6 directions. For Eventual PUT, reserve all five one-shot owner attempts
+before dispatch. The coordinator's five-second foreground deadline decides when the
+client receives W success or timeout. A shared, lock-protected `AttemptLease` then
+allows accepted in-flight and queued attempts to continue until the earlier of ten
+seconds after foreground completion and fifteen seconds after admission. The current
+`ReplicaClient.call_replica` has only a fixed deadline; Step 3 implementation must add
+a lease-aware, bounded-poll socket path while preserving the existing fixed-deadline
+API. Shutdown may cancel sooner only with explicit per-owner incomplete outcomes and
+must not close SQLite under live workers. This is a proposed KD-12/KD-14 refinement,
+not implemented behavior or a changed C6 budget.
+
+Schema-2 activation is proposed as a one-time rollout gate based on a compatible-build
+inventory for all ten fixed VM identities. It is not a health check before each
+operation. Once activated, operations contact only their five prescribed owners;
+unsupported or unavailable peers are nonqualifying, with no schema downgrade or
+owner substitution. Strong still needs three distinct compatible owners, while
+Eventual uses its configured R/W threshold. KD-11/KD-12 and protocol-specific
+extensions remain PENDING. The Step 3 design is prepared for Krishna's approval;
+implementation has not started.

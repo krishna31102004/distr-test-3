@@ -502,6 +502,25 @@ clarifies that Strong/Eventual GET may cancel unused attempts after returning, w
 Eventual PUT retains its five reserved one-shot attempts through the separate bounded
 continuation. Krishna still needs to approve the design before Step 3 Batch 1 begins.
 
+### Deadline and rollout clarifications — still proposed
+
+The five-second clock is how long the client waits for enough PUT acknowledgments.
+It is not the deadline for every already-reserved network send. The design gives the
+five one-time owner attempts a shared timer: after the client returns success or
+timeout, remaining work can continue for up to ten more seconds, but never past
+fifteen seconds from operation admission. A small future RPC change is needed because
+today's RPC call takes one fixed deadline. The proposal uses interruptible socket
+operations and records each owner's final result; a crash or bounded shutdown can
+still leave propagation incomplete. These timers are only designed, not implemented
+or tested.
+
+Before enabling schema-2 protocol messages, the proposed rollout checks a version
+inventory for all ten VM identities once. It does not wait for all ten to be online
+for each operation. After activation, a request can still succeed using three
+compatible prescribed owners for Strong or its configured R/W count for Eventual.
+An unavailable or old-schema owner simply does not count; the system never downgrades
+the message or substitutes another owner.
+
 ### What has NOT been implemented yet
 
 Strong ABD, Eventual-noRR, Eventual-RR, read repair, quorum counting, distributed
