@@ -1,6 +1,7 @@
 """Local TCP integration tests for the Strong ABD coordinator."""
 
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import json
 import random
 from pathlib import Path
@@ -29,8 +30,11 @@ ROOT = Path(__file__).resolve().parents[2]
 MAX_VALUE_BYTES = 1_048_576
 NODE_PROCESS_SOURCE = r'''
 import json, sys
+import threading
+import time
 from mp3.models import ConsistencyMode
 from mp3.node import NodeRuntime
+from mp3.rpc import RpcOutcome, RpcOutcomeKind, RpcStatus
 
 vm_id, manifest, database, inventory = sys.argv[1:]
 node = NodeRuntime.from_files(
@@ -48,6 +52,34 @@ for line in sys.stdin:
         report = node.stop(timeout=5)
         print(json.dumps({"event": "stopped", "clean": report.clean}), flush=True)
         break
+    elif command.startswith("put-one "):
+        _, key, encoded_value = command.split(" ", 2)
+        value = __import__("base64").b64decode(encoded_value, validate=True)
+        first_owner = node.owners(key)[0].vm_id
+        original_call = node.rpc_client.call_replica
+        release = threading.Event()
+        def interrupted_call(target, request, **kwargs):
+            if request.phase != "strong_write":
+                return original_call(target, request, **kwargs)
+            if target.vm_id == first_owner:
+                outcome = original_call(target, request, **kwargs)
+                if (outcome.kind != RpcOutcomeKind.RESPONSE or outcome.response is None
+                        or outcome.response.status not in (RpcStatus.INSTALLED, RpcStatus.UNCHANGED)
+                        or not outcome.response.durable):
+                    print(json.dumps({"event": "install_failed", "owner": first_owner}),
+                          flush=True)
+                else:
+                    print(json.dumps({"event": "one_install", "owner": first_owner,
+                                      "operation_id": request.operation_id}), flush=True)
+                release.wait(60)
+                return outcome
+            # The coordinator is killed by the parent after one remote durable
+            # commit. Keep other prescribed owner attempts from sending bytes.
+            release.wait(60)
+            return RpcOutcome(RpcOutcomeKind.UNREACHABLE,
+                              error="coordinator killed after first commit")
+        node.rpc_client.call_replica = interrupted_call
+        node.strong_put(key, value, deadline=time.monotonic() + 50)
 '''
 
 
@@ -115,6 +147,13 @@ class NodeProcess:
         if reply.get("event") != "snapshot":
             raise AssertionError(f"unexpected node subprocess reply: {reply}")
         return reply["members"]
+
+    def start_one_commit_put(self, key: str, value: bytes) -> dict:
+        assert self.process.stdin is not None
+        encoded = base64.b64encode(value).decode("ascii")
+        self.process.stdin.write(f"put-one {key} {encoded}\n")
+        self.process.stdin.flush()
+        return self._read_line(15)
 
     def kill(self) -> int:
         if self.process.poll() is None:
@@ -369,6 +408,90 @@ class StrongIntegrationTests(unittest.TestCase):
                          readback_invoked, readback_responded, readback),
         ]
         self.assertTrue(check_register_history(partial_history), partial_history)
+
+    def test_sigkill_writer_after_exactly_one_replica_commit_then_get_reads_back(self):
+        """A crashed coordinator may leave one durable copy for ABD GET to find."""
+        key = "writer-crash-after-one-commit"
+        value = b"one durable partial copy"
+        owners = self.manifest.owners(key)
+        owner_ids = tuple(node.vm_id for node in owners)
+        writer_id = next(f"vm{index:02d}" for index in range(1, 11)
+                         if f"vm{index:02d}" not in owner_ids)
+        self.start_nodes(set(owner_ids))
+        writer = self.start_process(writer_id)
+        self.wait_membership(set(owner_ids) | {writer_id})
+
+        first_write = writer.start_one_commit_put(key, value)
+        self.assertEqual(first_write["event"], "one_install", first_write)
+        self.assertEqual(first_write["owner"], owner_ids[0])
+        self.assertEqual(writer.kill(), -9)
+
+        # The subprocess coordinator's phase-two wrapper only lets the first
+        # prescribed owner send. Confirm exactly one durable row exists.
+        records = {
+            vm_id: self.nodes[vm_id].store.read_local(
+                key, context=self.nodes[vm_id].context).record
+            for vm_id in owner_ids
+        }
+        self.assertIsNotNone(records[owner_ids[0]])
+        partial = records[owner_ids[0]]
+        self.assertEqual(partial.value, value)
+        self.assertEqual(sum(record is not None for record in records.values()), 1)
+
+        # Force the partial FOUND future to be the collector's first observed
+        # completion. Other calls cannot send until the collector has consumed it.
+        reader = self.nodes[owner_ids[1]]
+        actual_call = reader.rpc_client.call_replica
+        allow_other_queries = threading.Event()
+
+        def partial_first(target, request, **kwargs):
+            if request.phase != "strong_query":
+                return actual_call(target, request, **kwargs)
+            if target.vm_id == owner_ids[0]:
+                return actual_call(target, request, **kwargs)
+            if not allow_other_queries.wait(4):
+                return RpcOutcome(RpcOutcomeKind.TIMEOUT,
+                                  error="partial query was not consumed first")
+            return actual_call(target, request, **kwargs)
+
+        from concurrent.futures import FIRST_COMPLETED, wait as real_wait
+        import mp3.coordinator as coordinator_module
+        import mp3.strong as strong_module
+
+        real_collect = strong_module.collect_distinct
+
+        def partial_first_collection(calls, **kwargs):
+            if kwargs["phase"] != "strong_query":
+                return real_collect(calls, **kwargs)
+            first_call = next(call for call in calls if call.node.vm_id == owner_ids[0])
+            first_wait = True
+
+            def ordered_wait(futures, *, timeout=None, return_when=FIRST_COMPLETED):
+                nonlocal first_wait
+                if first_wait:
+                    first_wait = False
+                    return real_wait((first_call.future,), timeout=timeout,
+                                     return_when=return_when)
+                allow_other_queries.set()
+                return real_wait(futures, timeout=timeout, return_when=return_when)
+
+            with mock.patch.object(coordinator_module, "wait",
+                                   side_effect=ordered_wait):
+                return real_collect(calls, **kwargs)
+
+        with mock.patch.object(reader.rpc_client, "call_replica",
+                               side_effect=partial_first), \
+                mock.patch.object(strong_module, "collect_distinct",
+                                  side_effect=partial_first_collection):
+            result = reader.strong_get(key, deadline=time.monotonic() + 8)
+        self.assertEqual((result.status, result.value),
+                         (OperationStatus.OK, value), result)
+        self.assertEqual(result.version, partial.version)
+        copies = [self.nodes[vm_id].store.read_local(
+            key, context=self.nodes[vm_id].context).record for vm_id in owner_ids]
+        self.assertGreaterEqual(sum(
+            record is not None and record.version == partial.version
+            and record.value == value for record in copies), 3)
 
     def test_equal_version_conflicting_bytes_fails_before_readback(self):
         key = "contradictory-records"

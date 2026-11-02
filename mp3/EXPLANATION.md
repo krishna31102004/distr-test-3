@@ -834,8 +834,12 @@ bool` tries legal next operations. These are test helpers, not runtime APIs.
 `_manifest() -> Manifest` (allocate unique ephemeral endpoints and build the test ring);
 `NodeProcess.__init__(self, vm_id, manifest_path, database_path, inventory_path, *,
 bootstrap)`, `_read_line(self, timeout) -> dict`, `snapshot(self) -> dict[str, int]`,
+`start_one_commit_put(self, key: str, value: bytes) -> dict`,
 `kill(self) -> int`, `stop(self) -> bool`, and `_close_pipes(self) -> None` manage a
-disposable independent node process. `StrongIntegrationTests.setUp(self) -> None`,
+disposable independent node process. The test-only `put-one` command permits the
+first prescribed-owner phase-two RPC to commit, reports that event to the parent,
+and blocks other phase-two sends until the parent SIGKILLs the coordinator.
+`StrongIntegrationTests.setUp(self) -> None`,
 `node(self, vm_id) -> NodeRuntime`, `start_nodes(self, vm_ids)`,
 `start_process(self, vm_id, *, bootstrap=True) -> NodeProcess`,
 `wait_membership(self, participant_ids: set[str], timeout=12)`,
@@ -853,7 +857,11 @@ Its test methods are:
 `test_admission_closed_before_new_strong_operation_is_rejected(self)`;
 `test_delayed_query_and_install_responses_arrive_after_quorum_in_order(self)`;
 `test_randomized_concurrent_histories_are_linearizable_for_recorded_seeds(self)`; and
-`test_sigkill_after_commit_lost_ack_recovery_and_generation_fencing(self)`. They cover
+`test_sigkill_after_commit_lost_ack_recovery_and_generation_fencing(self)` and
+`test_sigkill_writer_after_exactly_one_replica_commit_then_get_reads_back(self)`. The
+latter kills an independent nonowner coordinator after exactly one durable owner
+commit, verifies the other prescribed owners remain absent, then runs Strong GET and
+checks readback to a quorum. They cover
 the named integration/fault schedules and use actual key owners from the manifest.
 
 `tests/test_history_checker.py` defines `HistoryCheckerTests.result(self, status, *,

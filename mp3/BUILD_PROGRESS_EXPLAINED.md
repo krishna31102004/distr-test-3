@@ -682,18 +682,25 @@ not turn that uncertainty into success.
 - `mp3/tests/test_strong.py`: real loopback TCP to the actual SQLite stores of the
   key's ring owners, two- and three-owner failures, empty/Unicode/NUL/1 MiB data,
   conflicts, concurrent writers, shutdown between phases, late replies, and a
-  subprocess SIGKILL/restart with generation checks.
+  subprocess SIGKILL/restart with generation checks. An additional deterministic
+  subprocess test now SIGKILLs a nonowner writer after exactly one owner durably
+  commits; the other phase-two attempts are held before sending. The test verifies
+  that only that one owner has the record, then checks that a later Strong GET finds
+  and writes it back to a quorum.
 - `mp3/tests/history_checker.py` and `test_history_checker.py`: a small checker that
   tests synthetic valid and invalid histories and histories recorded from actual
   Strong calls. It respects non-overlap order and lets a timed-out write possibly
   have taken effect. It checks finite histories; it is not a mathematical proof of
   all possible schedules.
 
-The main full run passed **176 tests in 45.819 seconds**. The independent reviewer
-ran the focused Strong/history suite (**13 passed**) and full suite (**176 passed in
-45.514 seconds**) and found no concrete correctness blocker. A deterministic delayed
-query/install test was added after review found that evidence gap, then the reviewer
-reran the current tests successfully. These are local loopback, subprocess and
+The original reviewed full run passed **176 tests in 45.819 seconds**. After adding
+the one-owner writer-crash regression and making the query ordering event-controlled,
+the main full run passed **177 tests in 49.206 seconds**; the focused Strong/history
+suite passed **14 tests in 30.372 seconds**, and the focused crash regression passed
+**1 test in 2.939 seconds**. The independent reviewer reran the focused regression
+(**1 passed in 2.940 seconds**) and the full suite (**177 passed in 51.471 seconds**).
+No defect was found. A deterministic delayed
+query/install test was also added after earlier review found that evidence gap. These are local loopback, subprocess and
 in-process results; no university VM was tested. Main's `python3 -B -m mp3 --smoke`,
 `python3 -B -m mp3 --help`, `python3 -B -m mp3.node --help`,
 `python3 -B -m compileall -q mp3`, and `git diff --check` each exited 0. Smoke

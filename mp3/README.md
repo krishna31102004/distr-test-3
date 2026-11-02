@@ -57,7 +57,7 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 176 tests (verified November 2, 2026). It uses temporary
+The suite currently has 177 tests (verified November 2, 2026). It uses temporary
 SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
 loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
 logical VMs on loopback and also tests a separate-process crash/restart path, plus

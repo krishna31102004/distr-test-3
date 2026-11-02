@@ -1336,3 +1336,22 @@ The local Step 3 Batch 2 acceptance gate is VERIFIED for the tested implementati
 It is not a proof of every execution and is not ten-VM validation. Juhi's E-01
 Eventual-noRR, Eventual-RR/read repair, mode switching, final CLI commands, full MP1
 log query, VM deployment, benchmarks, report, and demo readiness remain future work.
+
+### Strong Batch 2 follow-up — writer crash after one durable owner commit
+
+An additional acceptance regression was added after the initial reviewed commit:
+`test_sigkill_writer_after_exactly_one_replica_commit_then_get_reads_back` starts a
+nonowner writer as an independent local process, lets exactly the first prescribed
+owner durably install the version, blocks the other one-shot install attempts before
+transmission, and sends SIGKILL to the coordinator. The test verifies exactly one
+owner has the value, then runs Strong GET and confirms that its readback installs the
+same version/value on at least three owners. This is local subprocess/loopback evidence
+for an interrupted writer's partial effect, not a claimed successful PUT.
+
+The updated main full suite passed **177 tests in 49.206s**; the focused Strong and
+history suites passed **14 tests in 30.372s**, including the focused regression at
+**1 pass in 2.939s**. The independent reviewer reran that regression (**1 pass in
+2.940s**) and the full suite (**177 passed in 51.471s**), finding no defect. Main's
+smoke, both help commands, compileall and `git diff --check` each exited 0. The
+readback ordering is controlled by events and collector gating rather than timing
+sleep assumptions.
