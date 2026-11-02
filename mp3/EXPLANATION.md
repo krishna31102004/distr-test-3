@@ -3,10 +3,10 @@
 This guide describes the actual files. Step 2 storage, fixed ring/membership,
 single-replica RPC, and the integrated node runtime are locally verified. Step 3
 Batch 1 provides shared schema-2 evidence/scheduling and a durable Strong allocator;
-Batch 2 implements locally verified programmatic Strong ABD PUT/GET. **Eventual-noRR,
-Eventual-RR/read repair, consistency-mode switching and the final CLI operations are
-still pending.** A local replica read/install or one coordinator dispatch is not a
-distributed GET/PUT.
+Batch 2 implements locally verified programmatic Strong ABD PUT/GET; Batch 3 adds
+independently reviewed programmatic Eventual-noRR PUT/GET. **Eventual-RR/read repair,
+consistency-mode switching and the final CLI operations are still pending.** A
+local replica read/install or one coordinator dispatch is not a distributed GET/PUT.
 
 ## The system we will build
 
@@ -64,10 +64,10 @@ reads or conditionally installs the key's versioned bytes, commits durably befor
 write acknowledgment, and prints/logs receipt and response events. Coordinator
 deadlines bound failures and distinguish an unavailable quorum from an absent key.
 
-Strong PUT/GET now use the programmatic API documented below: they query and install
-through Q=3 distinct owners, with GET readback. Final file-oriented CLI commands do
-not call these APIs yet. Eventual PUT/GET and RR repair remain future implementation.
-C1–C6 contracts and KD-11 are approved; no whole-operation global lock is permitted.
+Strong PUT/GET and Eventual-noRR PUT/GET now use the programmatic APIs documented
+below. Final file-oriented CLI commands do not call these APIs yet. Eventual-RR and
+read repair remain future implementation. C1–C6 contracts and KD-11/KD-12 are
+approved; no whole-operation global lock is permitted.
 
 After a crash, disk contents remain and the process returns on the same fixed ring
 identity. The implemented durable restart generation lets peers recognize it as
@@ -162,7 +162,7 @@ tested against power loss, remote filesystems, or VM storage.
 | `Store.read_local` | key, keyword Context and optional absolute deadline → ReadResult; atomically checks context and reads one row, returns NOT_FOUND or FOUND (including empty bytes), STALE_EPOCH or ERROR | tests, ReplicaService | I; local read only, no quorum |
 | `Store.install_if_newer` | key, Record, keyword Context and optional absolute deadline → InstallResult; validates exact context and kind, compares under one short `BEGIN IMMEDIATE`, installs a higher tag, otherwise returns UNCHANGED, SUPERSEDED, or VERSION_CONFLICT with stored-version evidence; commits before durable success | tests, ReplicaService | I; local conditional install only, C3/C6 |
 | `Store.start_incarnation` | no args → next persisted positive generation; commits increment before return; caller must invoke once per boot before serving | tests; future startup admission | I; C2 local restart foundation |
-| `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; future Eventual coordinator | I; C4 eventual only |
+| `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; `EventualNoRRCoordinator._run_put` | I; C4/KD-12 eventual only |
 | `Store.allocate_strong_version(*, context, observed_max, deadline=None)` | Strong Context, optional queried maximum and deadline → committed Version above observed and local durable high-water; writer ID uses the current durable VM generation; never holds a lock over RPC | tests; `StrongCoordinator._run` during Strong PUT | I; approved KD-10/11 allocator; local protocol integration |
 | `Store.close`, `__enter__`, `__exit__` | close stops new admissions, waits for active bounded operations, releases process lock; context-manager methods return self/None and call close | tests and future owner | I; C2/C6 local lifecycle |
 | `open_store` | path, optional bootstrap, vm_id, timeout, capacity → Store | tests and future local owner | I; C2/C3 |
@@ -784,7 +784,7 @@ claimed.
 | Proposed interface | Purpose and dependencies | Status |
 |---|---|---|
 | `NodeRuntime.strong_put/strong_get` via `StrongCoordinator` | Two-phase Q=3 ABD using `dispatch_owner`, `collect_distinct`, Store allocator, and fixed owners | IMPLEMENTED; locally VERIFIED (A-01); CLI still pending |
-| `EventualNoRRCoordinator.put/get` | Configurable R/W, first-R maximum, five-owner propagation and lease supervision | DESIGN APPROVED; IMPLEMENTATION NOT_STARTED (E-01) |
+| `NodeRuntime.eventual_put/eventual_get` via `EventualNoRRCoordinator` | Configurable R/W, first-R maximum, five-owner propagation and lease supervision | IMPLEMENTED; independently locally VERIFIED (E-01); not ten-VM evidence |
 | `EventualRRCoordinator` and full mode/CLI integration | Read repair, cluster-wide epoch transition, files/commands | Deferred to Step 4; KD-13/full KD-16 pending |
 
 ## Step 3 Batch 2 — `strong.py` (implemented; KD-11)
@@ -870,3 +870,43 @@ value=None, version=None, unknown=False)` and the test methods
 `test_rejects_real_time_violation_and_wrong_read_value(self)`, and
 `test_rejects_completed_strong_write_that_moves_tag_backward(self)`. This suite checks
 the checker itself with synthetic known-valid and known-invalid histories.
+
+## Step 3 Batch 3 — `eventual.py` (Eventual-noRR implemented; KD-12)
+
+The Eventual-noRR coordinator is a programmatic library API on the existing
+`NodeRuntime`; it does not change the CLI. PUT uses the existing durable timestamp
+allocator, reserves five owner attempts before dispatch, counts only exact-version
+durable INSTALL/UNCHANGED responses, and retains accepted one-shot requests under a
+bounded continuation lease. GET returns the maximum version among the first R valid
+replies and never issues a write or read repair. Each operation captures R/W before
+its bounded coordinator task is queued.
+
+| Function or type | Exact behavior, inputs/outputs, callers and dependencies | Status |
+|---|---|---|
+| `OwnerPropagation(owner_id: str, outcome: OwnerOutcome \| None, completion_unknown: bool = False, error: str \| None = None)` | Immutable terminal evidence for one prescribed owner; used by the handle and snapshot | IMPLEMENTED; tested; C6/KD-12 |
+| `PropagationSnapshot(operation_id: str, terminal: bool, owners: tuple[OwnerPropagation, ...])`; `.completion_unknown` | Current five owner rows and aggregate uncertainty; terminal only when all five are terminal | IMPLEMENTED; tested |
+| `_ForegroundTransition.finish(completed_at: float) -> float`; `begin_dispatch() -> bool`; `.may_have_dispatched` | Exactly-once foreground-to-continuation transition and race-safe first-send gate; shared by API timeout and admitted worker; lock is never held over network IO | IMPLEMENTED; deadline-race-tested; C6 |
+| `PropagationHandle.__init__(operation_id, owners, manifest) -> None` | Creates a bounded per-owner ledger without threads; called by PUT | IMPLEMENTED; C6/KD-12 |
+| `PropagationHandle.mark_dispatching(owner_id) -> None` | Marks possible send before executor submission, so timeout cannot falsely say no side effect was possible | IMPLEMENTED; reviewer-inspected; C6 |
+| `PropagationHandle.attach(call: OwnerCall) -> None` | Retains the single accepted Future/request, registers callback; called by PUT | IMPLEMENTED; tested; C5/C6 |
+| `PropagationHandle.finish_without_dispatch(owner_id, outcome, error=None) -> None`; `finish_unsubmitted(outcome, error) -> None` | Terminally records local preflight/dispatch failures or accepted slots that were never sent; never overwrites attached futures | IMPLEMENTED; tested |
+| `PropagationHandle._finish(owner_id, future) -> None`; `_classify(owner_id, future) -> OwnerPropagation` | Converts actual future result into a validated terminal row; validates response identity/context/generation/phase; exact durable INSTALLED/UNCHANGED is DURABLE_ACK, SUPERSEDED is separate, and transport uncertainty is retained | IMPLEMENTED; loopback/fault-tested; C5/C6/KD-12 |
+| `PropagationHandle.snapshot() -> PropagationSnapshot`; `wait(timeout: float \| None = None) -> PropagationSnapshot`; `.any_dispatched` | Immediate or bounded report; completed futures are polled to close callback timing races; no monitor thread | IMPLEMENTED; tested |
+| `EventualNoRRCoordinator.__init__(runtime, *, read_quorum: int = 2, write_quorum: int = 2, foreground_seconds: float = 5.0)`; `_quorum(value, name) -> int` | Validates immutable per-coordinator R/W in 1..5 (bool rejected) and finite positive foreground budget | IMPLEMENTED; tested; KD-12 |
+| `EventualNoRRCoordinator.eventual_put(key: str, value: bytes) -> ProtocolResult` | Captures admission time, UUID4, setting snapshot and AttemptLease; checks ready/schema-2/Eventual-noRR; bounded coordinator admission; returns after W or explicit error while retaining the propagation handle | IMPLEMENTED; local loopback/subprocess-tested; C4/C5/C6/KD-12 |
+| `EventualNoRRCoordinator.eventual_get(key: str, *, deadline: float) -> ProtocolResult` | Bounded read of the same five fixed owners; max version among first R valid FOUND/NOT_FOUND responses; no repair | IMPLEMENTED; tested; C5/KD-08/12 |
+| `_validate_key(key, operation_id) -> ProtocolResult \| None`; `_external_gate(operation_id) -> ProtocolResult \| None` | Strict UTF-8 key validation (empty, NUL and Unicode accepted by existing storage policy) and readiness/schema/mode checks before dispatch | IMPLEMENTED; tested |
+| `_run_put(admission, key, value, admitted_at, lease, transition, propagation, required) -> ProtocolResult` | Atomically reserves five attempts, durably allocates one shared Eventual version, fences initial dispatch against timeout, records a per-owner synchronous preflight failure while continuing other owners, and collects exact W; queued/running calls retain their bounded lease | IMPLEMENTED; independently locally tested; C4/C6/KD-12 |
+| `_run_get(admission, key, deadline, required) -> ProtocolResult`; `_dispatch(...) -> tuple[OwnerCall, ...]` | Reserves/dispatches fixed-owner reads and computes only from the first R qualifying replies; dispatch uses existing NodeRuntime, RPC and bounded resources | IMPLEMENTED; tested; C5/C6 |
+| `_failure_status(collection) -> OperationStatus`; `_failure_text(collection, phase) -> str`; `_result(...) -> ProtocolResult` | Converts collector evidence into explicit TIMEOUT/ERROR/OVERLOADED/NOT_FOUND/OK results without faking absence; preserves operation ID, owners, propagation and uncertainty | IMPLEMENTED; tested; KD-08/12 |
+| `NodeRuntime.eventual_put(key, value, *, read_quorum=2, write_quorum=2)`; `eventual_get(key, *, deadline, read_quorum=2, write_quorum=2)` | Thin programmatic wrappers constructing the coordinator; CLI still guards distributed commands | IMPLEMENTED; loopback-tested; E-01 |
+| `NodeRuntime.submit_coordinator(..., operation_id: str \| None = None)` | Validates/preserves a supplied canonical UUID4 through `CoordinatorAdmission`; existing callers still receive generated IDs | IMPLEMENTED; tested; C5 |
+| `BoundedExecutor.reserve(..., queue_deadline=None)`; `CoordinatorResources.reserve_attempts(..., queue_deadline=None)` | Separates foreground capacity acquisition from the hard bounded lease deadline for already reserved queued attempts | IMPLEMENTED; executor/lease-tested; C6 |
+
+`tests/test_eventual.py` exercises actual loopback TCP and SQLite, including separate
+process crash/restart. The previous `AttemptLease` primitive tests in
+`tests/test_coordinator.py` check the 1s, 4.9s and 5s foreground examples; integrated
+tests cover queued-after-W starts, foreground queue/allocation expiry, overload,
+shutdown draining, lost acknowledgments, stale generation, no-read-repair, and
+concurrent coordinators. Final test evidence is recorded in `IMPLEMENTATION_PLAN.md`.
+These are local checks only; no university VM or ten-VM deployment was tested.

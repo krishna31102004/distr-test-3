@@ -718,7 +718,130 @@ contacts just one replica.
 
 ### What comes next?
 
-Step 3 Batch 3 is Juhi's Eventual-noRR coordinator. It will reuse the same fixed-owner,
-RPC, storage and bounded-worker foundations, but use configurable R/W and the
-approved timestamp-based Eventual rules. Strong is locally verified; the next batch
-must not be described as implemented until it has its own tests and review.
+At that point, Step 3 Batch 3 was planned as Juhi's Eventual-noRR coordinator. It is
+now implemented and locally reviewed, as described next.
+
+## Step 3 — Batch 3: Eventual Consistency Without Read Repair
+
+**Batch 3 is implemented and independently verified on local loopback and
+subprocesses. No university VM or ten-VM test was run.**
+
+### What does Eventual mean?
+
+Five machines own each key, but an Eventual operation can wait for a smaller number
+of replies. With the default R=2 and W=2, a PUT can return after two prescribed
+owners durably save the same version. The other copies are still sent in the
+background. Replicas can temporarily disagree, and a GET may return an older value.
+Strong ABD instead coordinates a majority in two phases so operations behave like a
+single ordered register. Eventual-noRR makes a different, less strict tradeoff; it
+does not use ABD and it does not repair on reads.
+
+`N=5` never changes: the ring designates exactly five owners. R and W only say how
+many distinct, valid replies the caller needs. A failed or suspected owner keeps its
+ring position; a sixth machine is never substituted.
+
+### Eventual PUT
+
+```text
+Client / coordinator
+        | reserve all five bounded attempts
+        | allocate one durable (timestamp, process-ID) version
+        +---- INSTALL_IF_NEWER ----------------------> owner 1
+        +---- INSTALL_IF_NEWER ----------------------> owner 2
+        +---- INSTALL_IF_NEWER ----------------------> owner 3
+        +---- INSTALL_IF_NEWER ----------------------> owner 4
+        +---- INSTALL_IF_NEWER ----------------------> owner 5
+        |<--- exact-version durable acknowledgments --+
+        | return when W distinct acknowledgments arrive
+        |       accepted remaining attempts continue under their lease
+```
+
+For R=2/W=2, suppose owners 2 and 4 confirm durable `INSTALLED` for version
+`(1710000000000, vm03/7)`. The client receives success with that version and those
+two owner IDs. If owners 1, 3 and 5 are still working, they remain accepted attempts;
+the response does not claim they have committed. Their final outcomes update the
+propagation report, not the already-returned client result.
+
+Only exact-version durable `INSTALLED` or `UNCHANGED` replies count toward W.
+`SUPERSEDED` says a newer version exists, so it does not prove this PUT's bytes were
+stored and is not counted. A lost reply can leave a value committed on disk while the
+client has no confirmed acknowledgment; a timed-out write is never described as
+rolled back.
+
+All five attempt slots are reserved before the first write is sent. The foreground
+deadline is five seconds from admission. `AttemptLease` separately permits up to ten
+seconds after foreground completion, capped at fifteen seconds total from admission.
+For example, W at 1 second gives remaining work until at most 11 seconds; W at 4.9
+seconds permits continuation until at most 14.9 seconds. If W is not reached by five
+seconds, the client gets an error/timeout, but already accepted attempts can continue
+to the 15-second cap. Each owner has one attempt; there are no retries. A queued
+attempt uses the remaining lease, not a fresh timeout. Graceful shutdown drains work
+within its bound; forced shutdown reports incomplete work. SIGKILL loses in-memory
+fanout, while SQLite commits already made remain durable.
+
+### Eventual GET
+
+```text
+Coordinator                     Five fixed owners
+    |---- READ_LOCAL --------------------->|
+    |<--- first R valid distinct replies --|
+    | choose the maximum version among those R
+    | return that record or explicit NOT_FOUND
+    | no INSTALL, repair, or later comparison
+```
+
+With R=2, if the first two valid replies contain versions v8 and v9, GET returns v9.
+Suppose a slower third owner has v10: this noRR read does not wait for it and does
+not repair the first two replicas. A later read may also see a stale value if its
+first R owners are behind. `b""` is a present value; only R actual `NOT_FOUND`
+responses can produce NOT_FOUND. Timeouts and unreachable owners are not absence.
+
+Concurrent coordinators use the existing durable Eventual timestamp/process-ID
+allocator. It gives versions a total order and preserves process-generation identity
+across restart. Clock skew can affect which concurrent value sorts higher; Eventual
+is not Strong consistency.
+
+For example, if a coordinator returns after two owners save v12 and is then killed
+with SIGKILL before its other attempts finish, those two committed copies survive.
+The remaining owners may miss v12. When a missed owner restarts, it keeps its identity
+and persisted data, but Eventual-noRR does not automatically repair its missed key.
+GET also does not repair it; Eventual-RR is later work.
+
+### What Batch 3 implemented and verified
+
+- `mp3/eventual.py`: `EventualNoRRCoordinator.eventual_put()` and
+  `.eventual_get()`, `PropagationHandle.snapshot()/wait()`, per-owner terminal
+  reports, exact-version W qualification, first-R GET selection, foreground/lease
+  transition, and explicit uncertainty.
+- `mp3/node.py`: `NodeRuntime.eventual_put()` and `.eventual_get()` pass through the
+  existing bounded runtime admission, captured context/generation and shared RPC.
+- `mp3/coordinator.py`: bounded outbound reservation now separates the time to
+  acquire capacity from the lease deadline for already-reserved queued attempts;
+  `collect_distinct()` can record a local preflight failure without preventing other
+  prescribed owners from receiving their one-shot attempt.
+- `mp3/tests/test_eventual.py`: R/W matrix, no-repair and first-R checks, empty and
+  1 MiB values, Unicode/NUL keys, overload, queue/deadline fencing, lost ack,
+  generation filtering, one/two/three owner outages, synchronous dispatch failure,
+  graceful shutdown, concurrent coordinators, local TCP traffic and subprocess
+  SIGKILL/restart.
+
+Final verification on Python 3.12.4:
+
+- Main full suite: **198 passed in 99.114 seconds**.
+- Independent reviewer full suite: **198 passed in 107.886 seconds**.
+- Main focused Eventual suite: **21 passed in 56.905 seconds**; reviewer: **21 passed
+  in 55.468 seconds**.
+- Main Strong/history regression suite: **14 passed in 30.756 seconds**.
+- Main smoke, both help commands, compileall and `git diff --check` exited 0. Smoke
+  still reports `KV NOT_IMPLEMENTED`, so the final demo command interface remains
+  explicitly unfinished.
+
+These checks use temporary SQLite files, real loopback TCP and disposable local
+subprocesses. They are not ten-VM or university-VM results.
+
+### What remains
+
+Step 3 Batch 4 is joint adversarial integration across the completed Strong and
+Eventual-noRR protocols. Later work still includes Eventual-RR/read repair, complete
+mode switching, the required file-based demo commands, full MP1 log querying, ten-VM
+deployment and fault testing, benchmark experiments, the report, and the demo.

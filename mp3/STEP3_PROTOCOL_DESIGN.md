@@ -2,7 +2,8 @@
 
 **Status: DESIGN APPROVED by Krishna on October 31, 2026; shared Batch 1
 infrastructure and Strong ABD Batch 2 are implemented and independently reviewed
-for local operation. Eventual-noRR remains NOT IMPLEMENTED.** Approval references
+for local operation. Eventual-noRR Batch 3 is implemented and independently reviewed
+for local loopback/subprocess operation.** Approval references
 the reviewed design baseline `38a2293db54b9238d780c650276e0d3b60305e4a`. This document
 remains the protocol contract; implementation and local test evidence is recorded in
 the implementation plan. No claims imply ten-VM deployment readiness.
@@ -905,13 +906,17 @@ contract were not changed. Local test and independent-review evidence is in
 IMPLEMENTATION_PLAN.md. The checker provides bounded-history evidence, not a formal
 proof, and no university VMs were used.
 
-### Step 3 Batch 3 — Eventual-noRR (Juhi)
+### Step 3 Batch 3 — Eventual-noRR (Juhi; implementation record)
 
-Implement configurable R/W, first-R selection, exact-version W acknowledgments,
-durable timestamp versions, atomic all-five capacity reservation, and bounded
-post-ack continuation. No read repair. Acceptance includes R/W 1/1, 2/2, 3/3 and 5/5,
-partial/unreachable owners, empty values, ties/conflicts, lost acks, background
-completion and lifetime/shutdown tests.
+`EventualNoRRCoordinator` and `NodeRuntime.eventual_put/eventual_get` implement the
+approved flow. PUT captures the five-second deadline at admission, reserves the five
+owner slots before writing, allocates one durable timestamp/process-ID version, and
+requires W distinct exact-version durable acknowledgments. Accepted attempts continue
+under the separate bounded lease. A timeout before first dispatch fences later sends;
+a timeout after dispatch preserves possible-commit uncertainty. GET selects the
+maximum among its first R distinct validated replies and performs no repair. The
+propagation handle reports each owner independently. Exact test/review evidence is
+tracked in IMPLEMENTATION_PLAN.md. This is local verification only, not deployment.
 
 ### Step 3 Batch 4 — Adversarial protocol integration (Joint)
 
@@ -947,4 +952,6 @@ Step 3. Ten-VM validation belongs to later Step 5 and is not implied by local te
 - [ ] Every phase validates operation/request IDs, owner, context and generation.
 - [ ] Bounded resources, shutdown and no-lock-across-network rules are concrete.
 - [x] KD-11/KD-12 and the scoped KD-08/10/14/15 Step 3 design were approved by Krishna on October 31, 2026.
-- [ ] Protocol implementations remain pending their own batch verification gates.
+- [x] Batch 2 Strong independent verification gate is complete.
+- [x] Batch 3 Eventual-noRR independent verification gate is complete for local
+  loopback/subprocess acceptance; this does not assert ten-VM readiness.

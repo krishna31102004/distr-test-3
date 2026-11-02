@@ -418,13 +418,13 @@ verified in Step 3 Batch 2 as recorded immediately below.
 
 ## KD-12 — Eventual propagation and response qualification
 
-**Status: APPROVED — Eventual-noRR design contract; coordinator implementation is not started.**
+**Status: APPROVED — Eventual-noRR design contract; implementation evidence is recorded below and in IMPLEMENTATION_PLAN.md.**
 
 **Concept:** R/W choose how many replies a client waits for, not how many owners exist. Low thresholds trade freshness for availability and latency.
 
 Eventual fanout/first-R/durable-W requirements are mandated. Krishna approved the exact-version W evidence rule, first-R maximum selection, all-five reservation, one-shot owner attempts, and the C6-bounded continuation in the reviewed Step 3 design.
 
-**Approval record:** Krishna, October 31, 2026; see the scoped approval record above. Actual Eventual-noRR GET/PUT coordination remains NOT_STARTED.
+**Approval record:** Krishna, October 31, 2026; see the scoped approval record above. Implementation status is tracked separately from this unchanged design approval.
 
 **Correctness conditions:** R/W each 1..5; distinct qualifying replicas; write
   acks durable; max of first R qualifying reads; absent response is explicit and
@@ -466,7 +466,7 @@ completion; it is never NOT_FOUND. A crash may lose in-memory attempts but not
 committed SQLite data. These settings reuse the approved C6 starting envelope;
 protocol-specific qualifications and reserved-attempt handling were approved by KD-12; code status is tracked separately in IMPLEMENTATION_PLAN.md.
 
-**Approval record:** The exact-version W rule, all-five reservation, first-R read, and bounded continuation were approved by Krishna on October 31, 2026. See [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) for the implementation contract and tests; algorithms remain unimplemented.
+**Approval record:** The exact-version W rule, all-five reservation, first-R read, and bounded continuation were approved by Krishna on October 31, 2026. See [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) for the implementation contract; implementation evidence is tracked in IMPLEMENTATION_PLAN.md. No Eventual-RR or read-repair decision has been approved here.
 
 ## KD-13 — Read repair and background execution
 
@@ -549,7 +549,7 @@ replica handler or local admitted operation remains active.
 
 **Concept / rationale:** Krishna's protocols and Juhi's storage must agree on what a response promises; returning from a function is not automatically a durable acknowledgment.
 
-**Implementation evidence:** The C1–C6 interfaces and scoped schema-2 shared contracts are implemented and locally reviewed. Strong ABD was added in Step 3 Batch 2 and passed independent local review; Eventual-noRR remains unimplemented. Evidence is in IMPLEMENTATION_PLAN.md.
+**Implementation evidence:** The C1–C6 interfaces and scoped schema-2 shared contracts are implemented and locally reviewed. Strong ABD passed independent local review in Step 3 Batch 2; Eventual-noRR implementation and current independent-review evidence are recorded in IMPLEMENTATION_PLAN.md. These implementation records do not approve Eventual-RR, read repair, or full KD-16.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 

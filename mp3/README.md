@@ -1,13 +1,14 @@
 # CS 425 MP3: distributed key-value store
 
-**Step 2 and Step 3 Batches 1–2 are implemented and locally tested.** Programmatic
-Strong ABD PUT/GET works through the integrated local runtime; file-oriented CLI
-operations and Eventual modes remain unfinished. The foundation includes local SQLite WAL/FULL
+**Step 2 and Step 3 Batches 1–3 are implemented and locally tested.** Programmatic
+Strong ABD and Eventual-noRR PUT/GET work through the integrated local runtime;
+file-oriented CLI operations and Eventual-RR remain unfinished. The foundation includes local SQLite WAL/FULL
 storage, fixed SHA-256 ring ownership, restart-aware membership, a bounded
 single-replica KV TCP request/response service, and an integrated node runtime.
 Step 3 Batch 1 adds shared schema-2 coordinator infrastructure; Batch 2 adds Strong
-ABD. Eventual-noRR/RR, read repair, command integration and mode changes remain future
-work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
+ABD; Batch 3 adds Eventual-noRR without read repair. Eventual-RR, read repair, command
+integration and mode changes remain future work. The October 21 specification in
+[SPEC.md](SPEC.md) is authoritative.
 
 Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [KEY_DECISIONS.md](KEY_DECISIONS.md), [AGENTS.md](AGENTS.md), and
@@ -18,8 +19,9 @@ use the same shared agent rules.
 The Strong ABD and Eventual-noRR design in
 [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) was approved by Krishna on
 October 31, 2026. Shared Step 3 Batch 1 infrastructure and Strong ABD Batch 2 are
-implemented and independently reviewed for local operation. Eventual-noRR remains
-unimplemented.
+implemented and independently reviewed for local operation. Eventual-noRR Batch 3
+is also independently reviewed for local loopback/subprocess operation; it is not
+ten-VM deployment evidence.
 
 ## Layout
 
@@ -33,6 +35,8 @@ mp3/
   attempts.py                  bounded mutable lifetime lease for replica attempts
   coordinator.py               schema activation, evidence types, distinct collector,
                                 and bounded coordinator/outbound worker resources
+  eventual.py                  programmatic Eventual-noRR R/W coordinator and
+                                bounded post-ack propagation report
   replica.py                   bounded local READ_LOCAL/INSTALL_IF_NEWER service
   eventlog.py                  structured logs and local replica event lines
   ring.py                      ten-node manifest, SHA-256 IDs and five owners
@@ -53,11 +57,15 @@ the repository root:
 ```bash
 python3 -B -m unittest discover -s mp3/tests -v
 python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v
+python3 -B -m unittest mp3.tests.test_eventual -v
 python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 177 tests (verified November 2, 2026). It uses temporary
+On November 2, 2026, the final main-agent full run passed **198 tests in 99.114s**;
+the independent reviewer passed **198 tests in 107.886s**. The focused Eventual
+suite passed **21 tests** (main: 56.905s; reviewer: 55.468s), and the focused
+Strong/history suite passed **14 tests in 30.756s** (main). The suite uses temporary
 SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
 loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
 logical VMs on loopback and also tests a separate-process crash/restart path, plus
@@ -237,11 +245,48 @@ response events when explicitly started by a caller. MP1
 uses `machine.<vm>.log` and port 65432; framing interoperability tests do not prove
 end-to-end MP1 queries against MP3 logs. MP1 and MP2 source remain unchanged.
 
+## Programmatic Eventual-noRR API
+
+The programmatic API works only when the node is ready, schema-2 activation is
+configured, and its persisted context is Eventual-noRR. It does not make the CLI
+commands operational.
+
+```python
+import time
+
+put = node.eventual_put("photo", b"binary-safe bytes", write_quorum=2)
+if put.status.value == "OK":
+    # The foreground result means two distinct owners durably stored this exact version.
+    print(put.version, put.qualifying_owners)
+    # A snapshot is immediate; wait is optional and bounded.
+    print(put.propagation.snapshot())
+    final = put.propagation.wait(timeout=10)
+
+get = node.eventual_get(
+    "photo", deadline=time.monotonic() + 5, read_quorum=2)
+```
+
+`read_quorum` and `write_quorum` are independent integers in 1..5 and default to
+2. An operation captures its quorum setting at admission. A PUT reserves all five
+owner attempts before sending any install. It returns when W exact-version durable
+acknowledgments arrive; the propagation handle reports each owner separately and
+does not imply that every owner committed. The continuation ends at the approved
+bounded AttemptLease deadline. A timeout may have partial write effects and is
+reported as uncertain when a request may have been dispatched. GET uses only the
+first R valid owner replies and issues no install, repair or background comparison.
+
+Run the focused local Eventual-noRR suite with:
+
+```bash
+python3 -B -m unittest mp3.tests.test_eventual -v
+```
+
 ## What remains
 
-Later work implements Eventual-noRR, Eventual-RR/read repair, mode switching, all
-command integration, ten-VM correctness, benchmarks, report, deployment and demo
-readiness. Strong ABD currently has only local loopback/subprocess verification.
+Later work implements Eventual-RR/read repair, mode switching, all command
+integration, ten-VM correctness, benchmarks, report, deployment and demo readiness.
+Strong ABD and Eventual-noRR currently have only local loopback/subprocess
+verification.
 No deployment/reset script exists. VM inventory, interpreter versions and port
 availability are unverified. Obtain explicit authorization before VM access,
 deployment or remote fault tests. The private review-repository workflow is documented

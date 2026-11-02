@@ -11,6 +11,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from typing import TextIO
 
 from .eventlog import configure_logging
@@ -73,8 +74,8 @@ class CoordinatorAdmission:
 class NodeRuntime:
     """Own one VM's Store, membership/gossip, KV replica service, and RPC client.
 
-    The runtime owns the local services and exposes programmatic Strong ABD methods.
-    Other consistency modes and the command-line PUT/GET interface remain pending.
+    The runtime owns local services and exposes programmatic Strong ABD and
+    Eventual-noRR methods. Eventual-RR and command-line PUT/GET remain pending.
     """
 
     def __init__(self, *, manifest: Manifest, vm_id: str, database_path: str | Path,
@@ -189,6 +190,21 @@ class NodeRuntime:
         """Perform an admitted two-phase Strong ABD read and durable readback."""
         from .strong import StrongCoordinator
         return StrongCoordinator(self).strong_get(key, deadline=deadline)
+
+    def eventual_put(self, key: str, value: bytes, *, read_quorum: int = 2,
+                     write_quorum: int = 2):
+        """Perform a bounded Eventual-noRR write; accepted fanout is inspectable."""
+        from .eventual import EventualNoRRCoordinator
+        return EventualNoRRCoordinator(
+            self, read_quorum=read_quorum, write_quorum=write_quorum).eventual_put(key, value)
+
+    def eventual_get(self, key: str, *, deadline: float, read_quorum: int = 2,
+                     write_quorum: int = 2):
+        """Return the maximum version among the first R replies, without repair."""
+        from .eventual import EventualNoRRCoordinator
+        return EventualNoRRCoordinator(
+            self, read_quorum=read_quorum, write_quorum=write_quorum).eventual_get(
+                key, deadline=deadline)
 
     def start(self) -> "NodeRuntime":
         """Open explicit bootstrap/recovery state, then start services in order."""
@@ -314,28 +330,50 @@ class NodeRuntime:
                 self._calls.notify_all()
 
     def reserve_attempts(self, count: int, *, deadline: float,
-                         admission: CoordinatorAdmission | None = None):
+                         admission: CoordinatorAdmission | None = None,
+                         attempt_lease: AttemptLease | None = None,
+                         queue_deadline: float | None = None):
         """Reserve bounded outbound capacity for external or admitted work."""
-        return self._reserve_attempts(count, deadline=deadline, admission=admission)
+        return self._reserve_attempts(count, deadline=deadline, admission=admission,
+                                      attempt_lease=attempt_lease,
+                                      queue_deadline=queue_deadline)
 
     def _reserve_attempts(self, count: int, *, deadline: float,
-                          admission: CoordinatorAdmission | None):
+                          admission: CoordinatorAdmission | None,
+                          attempt_lease: AttemptLease | None = None,
+                          queue_deadline: float | None = None):
         with self._calls:
             external = self._ready and self._accepting_calls
             authorized = self._admission_is_live_locked(admission, deadline)
+            if attempt_lease is not None:
+                authorized = (isinstance(admission, CoordinatorAdmission)
+                              and self._admitted_coordinators.get(id(admission)) is admission
+                              and deadline == admission.deadline
+                              and queue_deadline == attempt_lease.hard_deadline
+                              and not attempt_lease.cancelled
+                              and time.monotonic() < attempt_lease.current_deadline())
             if (not external and not authorized) or self.coordinator_resources is None:
                 raise RuntimeError("node is not accepting coordinator work")
             if admission is not None and not authorized:
                 raise RuntimeError("coordinator admission is invalid, expired, or completed")
             resources = self.coordinator_resources
-        return resources.reserve_attempts(count, deadline=deadline)
+        return resources.reserve_attempts(count, deadline=deadline,
+                                          queue_deadline=queue_deadline)
 
-    def submit_coordinator(self, function, *args, deadline: float):
+    def submit_coordinator(self, function, *args, deadline: float,
+                           operation_id: str | None = None):
         """Admit a bounded task; its callback receives a scoped CoordinatorAdmission first."""
         if not callable(function):
             raise TypeError("coordinator function must be callable")
         if type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError("coordinator deadline must be a finite monotonic timestamp")
+        if operation_id is not None:
+            try:
+                parsed = uuid.UUID(operation_id)
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ValueError("operation_id must be a canonical lowercase UUID4") from error
+            if str(parsed) != operation_id or parsed.version != 4:
+                raise ValueError("operation_id must be a canonical lowercase UUID4")
         with self._calls:
             if (not self._ready or not self._accepting_calls
                     or self.coordinator_resources is None or self.store is None
@@ -344,7 +382,8 @@ class NodeRuntime:
             resources = self.coordinator_resources
             admission = CoordinatorAdmission(
                 deadline, self.store.current_context(),
-                self.membership_runtime.generation, new_operation_id())
+                self.membership_runtime.generation,
+                operation_id or new_operation_id())
             self._admitted_coordinators[id(admission)] = admission
             self._active_calls += 1
         try:
@@ -384,7 +423,15 @@ class NodeRuntime:
         """Create and dispatch one schema-2 RPC, without collecting a quorum."""
         with self._calls:
             external = self._ready and self._accepting_calls
-            authorized = self._admission_is_live_locked(admission, deadline)
+            authorization_deadline = deadline
+            authorized = self._admission_is_live_locked(admission, authorization_deadline)
+            if attempt_lease is not None:
+                authorized = (isinstance(admission, CoordinatorAdmission)
+                              and self._admitted_coordinators.get(id(admission)) is admission
+                              and operation_id == admission.operation_id
+                              and deadline == attempt_lease.hard_deadline
+                              and not attempt_lease.cancelled
+                              and time.monotonic() < attempt_lease.current_deadline())
             if ((not external and not authorized) or self.rpc_client is None
                     or self.membership_runtime is None or self.coordinator_resources is None):
                 raise RuntimeError("node is not accepting RPC calls")

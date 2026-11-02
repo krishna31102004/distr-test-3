@@ -80,6 +80,25 @@ for line in sys.stdin:
                               error="coordinator killed after first commit")
         node.rpc_client.call_replica = interrupted_call
         node.strong_put(key, value, deadline=time.monotonic() + 50)
+    elif command.startswith("eventual-put "):
+        _, key, value_text = command.split(" ", 2)
+        value = value_text.encode("utf-8")
+        owner_ids = tuple(owner.vm_id for owner in node.owners(key))
+        original_call = node.rpc_client.call_replica
+        release = threading.Event()
+        def held_fanout(target, request, **kwargs):
+            if request.phase == "eventual_put" and target.vm_id in owner_ids[2:]:
+                release.wait(60)
+            return original_call(target, request, **kwargs)
+        node.rpc_client.call_replica = held_fanout
+        result = node.eventual_put(key, value)
+        print(json.dumps({"event": "eventual_result", "status": result.status.value,
+                          "operation_id": result.operation_id,
+                          "error": result.error,
+                          "version": None if result.version is None else {
+                              "kind": result.version.kind, "number": result.version.number,
+                              "writer_id": result.version.writer_id},
+                          "owners": list(result.qualifying_owners)}), flush=True)
 '''
 
 
@@ -111,10 +130,12 @@ class NodeProcess:
     """Independent loopback node process with a test-only membership snapshot pipe."""
 
     def __init__(self, vm_id: str, manifest_path: Path, database_path: Path,
-                 inventory_path: Path, *, bootstrap: bool):
+                 inventory_path: Path, *, bootstrap: bool, bootstrap_mode="strong"):
+        mode_arg = ("ConsistencyMode.EVENTUAL_NO_RR" if bootstrap_mode == "eventual"
+                    else "ConsistencyMode.STRONG") if bootstrap else "None"
         source = NODE_PROCESS_SOURCE.replace(
             "bootstrap=True, schema2_inventory_path=inventory",
-            f"bootstrap={bootstrap!r}, schema2_inventory_path=inventory")
+            f"bootstrap={bootstrap!r}, bootstrap_mode={mode_arg}, schema2_inventory_path=inventory")
         self.process = subprocess.Popen(
             [sys.executable, "-B", "-c", source, vm_id, str(manifest_path),
              str(database_path), str(inventory_path)],
@@ -154,6 +175,15 @@ class NodeProcess:
         self.process.stdin.write(f"put-one {key} {encoded}\n")
         self.process.stdin.flush()
         return self._read_line(15)
+
+    def start_eventual_put(self, key: str, value: str) -> dict:
+        assert self.process.stdin is not None
+        self.process.stdin.write(f"eventual-put {key} {value}\n")
+        self.process.stdin.flush()
+        reply = self._read_line(10)
+        if reply.get("event") != "eventual_result":
+            raise AssertionError(f"unexpected Eventual subprocess result: {reply}")
+        return reply
 
     def kill(self) -> int:
         if self.process.poll() is None:

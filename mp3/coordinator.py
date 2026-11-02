@@ -353,13 +353,19 @@ class BoundedExecutor:
         with self._condition:
             return len(self._active), self._queue.qsize(), self._unsubmitted
 
-    def reserve(self, count: int, *, deadline: float | None = None) -> CapacityReservation | None:
+    def reserve(self, count: int, *, deadline: float | None = None,
+                queue_deadline: float | None = None) -> CapacityReservation | None:
         if type(count) is not int or count < 1 or count > self.capacity:
             raise ValueError("reservation count exceeds bounded capacity")
         if deadline is None:
             deadline = time.monotonic() + DEFAULT_ADMISSION_WAIT_SECONDS
         elif type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError("admission deadline must be a finite monotonic timestamp")
+        if queue_deadline is None:
+            queue_deadline = deadline
+        elif (type(queue_deadline) not in (int, float)
+              or not math.isfinite(queue_deadline) or queue_deadline < deadline):
+            raise ValueError("queue deadline must be finite and no earlier than admission")
         with self._condition:
             if deadline <= time.monotonic():
                 return None
@@ -372,7 +378,7 @@ class BoundedExecutor:
                 return None
             self._used += count
             self._unsubmitted += count
-            reservation = CapacityReservation(self, count, deadline)
+            reservation = CapacityReservation(self, count, queue_deadline)
             self._reservations.add(reservation)
             return reservation
 
@@ -542,8 +548,10 @@ class CoordinatorResources:
             self.coordinators.shutdown(timeout=1.0, force=True)
             raise
 
-    def reserve_attempts(self, count: int, *, deadline: float | None = None):
-        return self.attempts.reserve(count, deadline=deadline)
+    def reserve_attempts(self, count: int, *, deadline: float | None = None,
+                         queue_deadline: float | None = None):
+        return self.attempts.reserve(count, deadline=deadline,
+                                     queue_deadline=queue_deadline)
 
     def shutdown(self, *, timeout: float, force: bool = False) -> CoordinatorShutdownReport:
         # Close operation admission first. Existing operation tasks can still use
@@ -634,6 +642,7 @@ def _qualifies(phase: str, request: ReplicaRequest,
 def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                      manifest: Manifest, required: int, operation_id: str,
                      phase: str, context: Context, deadline: float,
+                     preflight_failures: Iterable[OwnerFailure] = (),
                      clock=time.monotonic) -> QuorumCollection:
     """Collect phase-qualified evidence once per prescribed stable VM identity."""
     owner_rows = tuple(owners)
@@ -652,13 +661,20 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
     rows = tuple(calls)
     if not rows:
         raise ValueError("collector requires one call for each of the five owners")
+    local_failures = tuple(preflight_failures)
+    local_failure_by_owner = {}
+    for failure in local_failures:
+        if (not isinstance(failure, OwnerFailure) or failure.owner_id not in owner_ids
+                or failure.owner_id in local_failure_by_owner):
+            raise ValueError("preflight failures must identify distinct prescribed owners")
+        local_failure_by_owner[failure.owner_id] = failure
     first_key = rows[0].request.key
     prescribed = tuple(node.vm_id for node in manifest.owners(first_key))
     if set(owner_ids) != set(prescribed):
         raise ValueError("collector owners must be the five prescribed ring owners")
     primary: dict[str, OwnerCall] = {}
     valid_owner_call: dict[str, bool] = {}
-    failures: list[OwnerFailure] = []
+    failures: list[OwnerFailure] = list(local_failures)
     for call in rows:
         owner_id = call.node.vm_id
         if owner_id not in owner_ids:
@@ -685,8 +701,10 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
             valid_owner_call[owner_id] = False
         else:
             valid_owner_call[owner_id] = True
-    if set(primary) != set(owner_ids):
-        raise ValueError("collector requires one call for every prescribed owner")
+    if set(primary).intersection(local_failure_by_owner):
+        raise ValueError("an owner cannot have both a dispatched call and a preflight failure")
+    if set(primary).union(local_failure_by_owner) != set(owner_ids):
+        raise ValueError("collector requires one call or preflight failure per prescribed owner")
 
     pending = {call.future: call for owner_id, call in primary.items()
                if valid_owner_call[owner_id]}
