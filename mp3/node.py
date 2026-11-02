@@ -1,4 +1,4 @@
-"""Executable lifecycle wrapper for one MP3 VM (no distributed coordinator)."""
+"""Executable lifecycle wrapper and programmatic operations for one MP3 VM."""
 
 from __future__ import annotations
 
@@ -73,8 +73,8 @@ class CoordinatorAdmission:
 class NodeRuntime:
     """Own one VM's Store, membership/gossip, KV replica service, and RPC client.
 
-    This is only a local node lifecycle and single-replica RPC wrapper. It does not
-    coordinate multi-owner reads or writes and does not implement a consistency mode.
+    The runtime owns the local services and exposes programmatic Strong ABD methods.
+    Other consistency modes and the command-line PUT/GET interface remain pending.
     """
 
     def __init__(self, *, manifest: Manifest, vm_id: str, database_path: str | Path,
@@ -179,6 +179,16 @@ class NodeRuntime:
         if not self._ready or self.membership_runtime is None:
             raise RuntimeError("node is not ready")
         return self.membership_runtime.table.list_mem_ids()
+
+    def strong_put(self, key: str, value: bytes, *, deadline: float):
+        """Perform an admitted two-phase Strong ABD write; no CLI path calls this yet."""
+        from .strong import StrongCoordinator
+        return StrongCoordinator(self).strong_put(key, value, deadline=deadline)
+
+    def strong_get(self, key: str, *, deadline: float):
+        """Perform an admitted two-phase Strong ABD read and durable readback."""
+        from .strong import StrongCoordinator
+        return StrongCoordinator(self).strong_get(key, deadline=deadline)
 
     def start(self) -> "NodeRuntime":
         """Open explicit bootstrap/recovery state, then start services in order."""

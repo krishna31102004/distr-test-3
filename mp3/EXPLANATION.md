@@ -1,6 +1,12 @@
 # Understanding MP3 and its verified Batch 1–4 foundations
 
-This guide describes the actual files. Step 2 storage, fixed ring/membership, single-replica RPC, and integrated node runtime are implemented and locally reviewed. Step 3 Batch 1 now adds phase-aware schema-2 RPC, shared response evidence and bounded scheduling, attempt leases, and durable Strong tag allocation. **Full Strong ABD and Eventual-noRR coordinators, distributed client-facing GET/PUT, read repair, and mode switching are still pending.** A local replica read/install or one coordinator dispatch is not a distributed GET/PUT.
+This guide describes the actual files. Step 2 storage, fixed ring/membership,
+single-replica RPC, and the integrated node runtime are locally verified. Step 3
+Batch 1 provides shared schema-2 evidence/scheduling and a durable Strong allocator;
+Batch 2 implements locally verified programmatic Strong ABD PUT/GET. **Eventual-noRR,
+Eventual-RR/read repair, consistency-mode switching and the final CLI operations are
+still pending.** A local replica read/install or one coordinator dispatch is not a
+distributed GET/PUT.
 
 ## The system we will build
 
@@ -49,7 +55,7 @@ replies. Default R=W=2. noRR adds no read repair; RR returns after R but continu
 gathering replies, discovers the greatest reachable version and repairs stale/missing
 copies. A repair must never replace a concurrent newer write with an older value.
 
-## Planned PUT and GET paths (not implemented)
+## Client command path (not implemented)
 
 The CLI eventually reads a local input file for PUT, or writes a successful GET to
 an output file. A coordinator (any VM) computes fixed owners, sends concurrent RPCs,
@@ -58,12 +64,10 @@ reads or conditionally installs the key's versioned bytes, commits durably befor
 write acknowledgment, and prints/logs receipt and response events. Coordinator
 deadlines bound failures and distinguish an unavailable quorum from an absent key.
 
-Strong PUT first queries a majority and allocates a unique tag above what it saw,
-then installs on a majority. Strong GET queries and writes back its maximum on a
-majority before answering. Eventual PUT uses its approved timestamp/process-ID tag;
-GET uses the first R replies, with RR's repair continuation as described above.
-C1–C6 foundation contracts are approved and local storage/types are implemented;
-distributed protocol response/allocation rules remain deferred. No whole-operation global lock is permitted.
+Strong PUT/GET now use the programmatic API documented below: they query and install
+through Q=3 distinct owners, with GET readback. Final file-oriented CLI commands do
+not call these APIs yet. Eventual PUT/GET and RR repair remain future implementation.
+C1–C6 contracts and KD-11 are approved; no whole-operation global lock is permitted.
 
 After a crash, disk contents remain and the process returns on the same fixed ring
 identity. The implemented durable restart generation lets peers recognize it as
@@ -159,7 +163,7 @@ tested against power loss, remote filesystems, or VM storage.
 | `Store.install_if_newer` | key, Record, keyword Context and optional absolute deadline → InstallResult; validates exact context and kind, compares under one short `BEGIN IMMEDIATE`, installs a higher tag, otherwise returns UNCHANGED, SUPERSEDED, or VERSION_CONFLICT with stored-version evidence; commits before durable success | tests, ReplicaService | I; local conditional install only, C3/C6 |
 | `Store.start_incarnation` | no args → next persisted positive generation; commits increment before return; caller must invoke once per boot before serving | tests; future startup admission | I; C2 local restart foundation |
 | `Store.allocate_eventual_version` | keyword Context → Version; transactionally checks current Eventual context, reserves `max(time.time_ns(), last_timestamp+1)`, commits high-water before returning writer ID `vm_id/generation` | tests; future Eventual coordinator | I; C4 eventual only |
-| `Store.allocate_strong_version(*, context, observed_max, deadline=None)` | Strong Context, optional queried maximum and deadline → committed Version above observed and local durable high-water; writer ID uses the current durable VM generation; never holds a lock over RPC | tests; future Strong PUT coordinator | I; approved KD-10/11 allocator; coordinator remains future work |
+| `Store.allocate_strong_version(*, context, observed_max, deadline=None)` | Strong Context, optional queried maximum and deadline → committed Version above observed and local durable high-water; writer ID uses the current durable VM generation; never holds a lock over RPC | tests; `StrongCoordinator._run` during Strong PUT | I; approved KD-10/11 allocator; local protocol integration |
 | `Store.close`, `__enter__`, `__exit__` | close stops new admissions, waits for active bounded operations, releases process lock; context-manager methods return self/None and call close | tests and future owner | I; C2/C6 local lifecycle |
 | `open_store` | path, optional bootstrap, vm_id, timeout, capacity → Store | tests and future local owner | I; C2/C3 |
 
@@ -679,9 +683,9 @@ membership class, socketpair framing, pathlib, importlib and mock.patch clocks.
 ## Pending components have no imaginary implementation
 
 Local storage, fixed hashing/membership and single-replica KV RPC exist as described
-above. Shared distinct-response collection and bounded dispatch are implemented, but
-there is no Strong/Eventual coordinator or distributed quorum operation. All-owner
-Eventual PUT orchestration, read repair, mode manager, benchmark, plotting or deployment
+above. Shared distinct-response collection and bounded dispatch are implemented.
+Strong ABD is implemented through the programmatic API in `strong.py`; Eventual
+coordinators, read repair, mode manager, benchmarks, plotting and deployment
 implementation remain future work.
 The CLI operation entrypoints still terminate at `pending.execute`; the RPC API is a
 library foundation and does not make those commands operational. Later responsibilities
@@ -775,10 +779,86 @@ The full suite and command results are recorded at the end of IMPLEMENTATION_PLA
 those results are local only. No ten-VM validation or distributed consistency result is
 claimed.
 
-### Future protocol coordinators (not implemented)
+### Protocol coordinators
 
 | Proposed interface | Purpose and dependencies | Status |
 |---|---|---|
-| `StrongCoordinator.put/get` | Two-phase Q=3 ABD using `dispatch_owner`, `collect_distinct`, Store allocator, and fixed owners | DESIGN APPROVED; IMPLEMENTATION NOT_STARTED (A-01) |
+| `NodeRuntime.strong_put/strong_get` via `StrongCoordinator` | Two-phase Q=3 ABD using `dispatch_owner`, `collect_distinct`, Store allocator, and fixed owners | IMPLEMENTED; locally VERIFIED (A-01); CLI still pending |
 | `EventualNoRRCoordinator.put/get` | Configurable R/W, first-R maximum, five-owner propagation and lease supervision | DESIGN APPROVED; IMPLEMENTATION NOT_STARTED (E-01) |
 | `EventualRRCoordinator` and full mode/CLI integration | Read repair, cluster-wide epoch transition, files/commands | Deferred to Step 4; KD-13/full KD-16 pending |
+
+## Step 3 Batch 2 — `strong.py` (implemented; KD-11)
+
+`StrongCoordinator` is a focused coordinator over the existing node-owned workers
+and RPC/storage APIs. It does not create another executor or transport. A call enters
+through `NodeRuntime.submit_coordinator`; the resulting `CoordinatorAdmission`
+captures the operation UUID, Strong context, sender generation and absolute monotonic
+deadline. One reservation covers up to five phase-one and five phase-two owner calls.
+
+| Exact function | Inputs and outputs | Behavior, callers and dependencies | Status |
+|---|---|---|---|
+| `StrongCoordinator.__init__(self, runtime: "NodeRuntime") -> None` | One runtime → coordinator wrapper | Stores the owner runtime; no network or worker starts. Called lazily by the NodeRuntime methods. | IMPLEMENTED; KD-11 |
+| `StrongCoordinator.strong_put(self, key: str, value: bytes, *, deadline: float) -> ProtocolResult` | UTF-8 key, 0..1 MiB bytes, absolute monotonic deadline → OK with tag/owners or explicit error/timeout/overload evidence | Checks input, readiness and schema-2 activation, submits a bounded operation, then waits for its Future. Empty bytes are valid. Called by `NodeRuntime.strong_put`; uses `_run`. | IMPLEMENTED; locally tested; KD-08/11/14 |
+| `StrongCoordinator.strong_get(self, key: str, *, deadline: float) -> ProtocolResult` | UTF-8 key and absolute deadline → OK with bytes/version, NOT_FOUND, or explicit error | Same gates/admission as PUT. Only a phase-one quorum of three explicit absence responses returns NOT_FOUND. Called by `NodeRuntime.strong_get`; uses `_run`. | IMPLEMENTED; locally tested; KD-08/11/14 |
+| `StrongCoordinator._validate_operation(self, key: str, deadline: float, operation_id: str) -> ProtocolResult \| None` | Key, deadline, fallback UUID → no error or structured error | Rejects non-text/unencodable keys and nonfinite/nonnumeric deadlines; called before admission by PUT/GET. | IMPLEMENTED; tested |
+| `StrongCoordinator._external_gate(self, operation_id: str) -> ProtocolResult \| None` | Operation UUID → no error or structured failure | Requires a ready runtime and complete schema-2 activation; called by PUT/GET. `submit_coordinator` repeats the synchronized admission check. | IMPLEMENTED; tested; C5/C6 |
+| `StrongCoordinator._run(self, admission: "CoordinatorAdmission", operation: str, key: str, value: bytes \| None) -> ProtocolResult` | Admitted operation → result | Confirms Strong mode, selects the same five owners, reserves both phases, and queries concurrently. PUT allocates above observed/local maxima, then sends `strong_write`; GET returns NOT_FOUND only for three explicit absences, else sends exact-record `strong_readback`. Both phases reuse deadline/context/operation UUID; each RPC has a fresh request ID. | IMPLEMENTED; local loopback and subprocess tested; KD-11 |
+| `StrongCoordinator._dispatch_phase(self, admission: "CoordinatorAdmission", owners: tuple["Node", ...], reservation, operation: RpcOperation, key: str, phase: str, version: Version \| None, value: bytes) -> tuple[OwnerCall, ...]` | Phase data and five owners → one OwnerCall per owner | Calls `NodeRuntime.dispatch_owner` with captured admission/reservation. A local dispatch exception becomes explicit failed evidence and never quorum evidence. Called twice by `_run`. | IMPLEMENTED; local fault-tested; C5/KD-11 |
+| `StrongCoordinator._maximum_record(collection) -> Record | None` | Qualified query collection → highest FOUND record or None | Selects only actual records; transport failures never mean absence. Called after phase one. | IMPLEMENTED; tested; KD-11 |
+| `StrongCoordinator._write_completion_unknown(collection) -> bool` | Failed phase-two collection → uncertainty flag | True if any RPC is uncertain, an owner call continues, or a durable phase-two response exists. Called when phase two lacks Q=3. | IMPLEMENTED; lost-ack/partial-write tested; KD-08/11 |
+| `StrongCoordinator._collection_failure(collection, phase: str, operation_id: str, *, completion_unknown: bool) -> ProtocolResult` | Collector evidence → TIMEOUT, ERROR or OVERLOADED result | Includes phase, qualifying owners, failures and continuing calls; no failed result carries successful value/version. Called on failed quorum. | IMPLEMENTED; fault-tested; KD-08/11 |
+| `StrongCoordinator._result(status: OperationStatus, operation_id: str, *, value: bytes \| None = None, version: Version \| None = None, owners: tuple[str, ...] = (), completion_unknown: bool = False, error: str \| None = None) -> ProtocolResult` | Status and evidence → validated result | Deduplicates owner IDs and constructs the shared result. Used by all public/private paths. | IMPLEMENTED; tested |
+| `NodeRuntime.strong_put(self, key: str, value: bytes, *, deadline: float)` | Client key/value and absolute deadline → ProtocolResult | Lazily constructs `StrongCoordinator` and delegates; does not expose CLI behavior. | IMPLEMENTED; local integration-tested; A-01 |
+| `NodeRuntime.strong_get(self, key: str, *, deadline: float)` | Client key and absolute deadline → ProtocolResult | Lazily constructs `StrongCoordinator` and delegates. | IMPLEMENTED; local integration-tested; A-01 |
+
+The coordinator's response validator and durable conditional install remain in the
+existing `rpc.py`, `coordinator.py`, `replica.py` and `storage.py`; these modules were
+not rewritten for Strong. `tests/test_strong.py` uses real loopback RPC and SQLite;
+`tests/history_checker.py` checks finite register histories against real-time
+precedence and version order. The checker is a bounded test aid, not a proof for every
+execution. Eventual coordinator APIs remain proposed/not implemented.
+
+### Test-only helpers added for Batch 2
+
+`tests/history_checker.py` defines `HistoryEntry(operation_id: str, coordinator_id:
+str, key: str, operation: str, input_value: bytes | None, invoked_at: float,
+responded_at: float, result: ProtocolResult)`. `check_register_history(entries:
+Iterable[HistoryEntry]) -> bool` groups by key and checks whether a legal sequential
+register order respects real-time precedence, versions and returned values; an
+ambiguous failed PUT can be absent or take effect within its call interval.
+`_check_one_key(rows: list[HistoryEntry]) -> bool` performs the per-key backtracking;
+its nested `visit(done: frozenset[int], state: tuple[bytes, object | None] | None) ->
+bool` tries legal next operations. These are test helpers, not runtime APIs.
+
+`tests/test_strong.py` helpers are `_free_port(reserved: set[int]) -> int` and
+`_manifest() -> Manifest` (allocate unique ephemeral endpoints and build the test ring);
+`NodeProcess.__init__(self, vm_id, manifest_path, database_path, inventory_path, *,
+bootstrap)`, `_read_line(self, timeout) -> dict`, `snapshot(self) -> dict[str, int]`,
+`kill(self) -> int`, `stop(self) -> bool`, and `_close_pipes(self) -> None` manage a
+disposable independent node process. `StrongIntegrationTests.setUp(self) -> None`,
+`node(self, vm_id) -> NodeRuntime`, `start_nodes(self, vm_ids)`,
+`start_process(self, vm_id, *, bootstrap=True) -> NodeProcess`,
+`wait_membership(self, participant_ids: set[str], timeout=12)`,
+`_process_by_id(self) -> dict[str, NodeProcess]`, `close_cluster(self)`, and
+`participants_for(self, key: str, *, coordinators: tuple[str, ...]=())` provide
+temporary state and await actual local membership.
+
+Its test methods are:
+`test_nonowner_coordinator_empty_binary_replacement_and_one_mib_value(self)`;
+`test_quorum_succeeds_with_two_unavailable_and_never_fakes_absence(self)`;
+`test_failed_put_with_lost_acks_is_unknown_and_get_reads_back_partial_write(self)`;
+`test_equal_version_conflicting_bytes_fails_before_readback(self)`;
+`test_two_writers_same_observation_order_tags_and_remain_linearizable(self)`;
+`test_admitted_put_can_dispatch_phase_two_after_shutdown_closes_admission(self)`;
+`test_admission_closed_before_new_strong_operation_is_rejected(self)`;
+`test_delayed_query_and_install_responses_arrive_after_quorum_in_order(self)`;
+`test_randomized_concurrent_histories_are_linearizable_for_recorded_seeds(self)`; and
+`test_sigkill_after_commit_lost_ack_recovery_and_generation_fencing(self)`. They cover
+the named integration/fault schedules and use actual key owners from the manifest.
+
+`tests/test_history_checker.py` defines `HistoryCheckerTests.result(self, status, *,
+value=None, version=None, unknown=False)` and the test methods
+`test_accepts_valid_register_order_and_ambiguous_write_effect(self)`,
+`test_rejects_real_time_violation_and_wrong_read_value(self)`, and
+`test_rejects_completed_strong_write_that_moves_tag_backward(self)`. This suite checks
+the checker itself with synthetic known-valid and known-invalid histories.

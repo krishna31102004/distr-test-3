@@ -1,12 +1,13 @@
 # CS 425 MP3: distributed key-value store
 
-**Batches 1–4 are implemented and locally tested. Distributed client-facing KV
-operations remain unfinished.** The foundation includes local SQLite WAL/FULL
+**Step 2 and Step 3 Batches 1–2 are implemented and locally tested.** Programmatic
+Strong ABD PUT/GET works through the integrated local runtime; file-oriented CLI
+operations and Eventual modes remain unfinished. The foundation includes local SQLite WAL/FULL
 storage, fixed SHA-256 ring ownership, restart-aware membership, a bounded
 single-replica KV TCP request/response service, and an integrated node runtime.
-Step 3 Batch 1 adds shared schema-2 coordinator infrastructure, not the Strong or
-Eventual algorithms. Read repair, operational command integration and mode changes
-remain future work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
+Step 3 Batch 1 adds shared schema-2 coordinator infrastructure; Batch 2 adds Strong
+ABD. Eventual-noRR/RR, read repair, command integration and mode changes remain future
+work. The October 21 specification in [SPEC.md](SPEC.md) is authoritative.
 
 Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [KEY_DECISIONS.md](KEY_DECISIONS.md), [AGENTS.md](AGENTS.md), and
@@ -16,8 +17,9 @@ use the same shared agent rules.
 
 The Strong ABD and Eventual-noRR design in
 [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md) was approved by Krishna on
-October 31, 2026. Shared Step 3 Batch 1 infrastructure is implemented and locally
-reviewed; Strong/Eventual coordinator algorithms have not started.
+October 31, 2026. Shared Step 3 Batch 1 infrastructure and Strong ABD Batch 2 are
+implemented and independently reviewed for local operation. Eventual-noRR remains
+unimplemented.
 
 ## Layout
 
@@ -50,16 +52,19 @@ the repository root:
 
 ```bash
 python3 -B -m unittest discover -s mp3/tests -v
+python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v
 python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 163 tests (verified November 2, 2026). It uses temporary
+The suite currently has 176 tests (verified November 2, 2026). It uses temporary
 SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
 loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
-logical VMs on loopback and also tests a separate-process crash/restart path, plus schema-2 Strong and Eventual-noRR
-single-replica calls using an explicit compatibility fixture. These tests do not
-exercise either multi-owner coordinator. The current Batch 1 regression suite also
+logical VMs on loopback and also tests a separate-process crash/restart path, plus
+schema-2 Strong and Eventual-noRR single-replica calls using an explicit compatibility
+fixture. Strong multi-owner behavior is covered separately by `tests/test_strong.py`
+and `tests/test_history_checker.py`; those are local tests, not ten-VM evidence. The
+Batch 1 regression suite also
 checks admitted coordinator work during shutdown, fixed-owner checks at dispatch and
 replicas, prompt impossible-threshold handling, and explicit durable-ack tracking.
 It contacts no university VM. The verified results and limits are recorded in the
@@ -178,9 +183,34 @@ python3 -B -m mp3.node --help
 For local integration, `NodeRuntime.from_files(...)` reads the manifest; `start()`
 performs ordered startup; `owners(key)`, `membership`, `generation`, and
 `call_replica(...)` expose diagnostics and one remote READ_LOCAL or INSTALL_IF_NEWER
-operation; `stop()` returns a `NodeShutdownReport`. A call reaches one replica only.
-Strong ABD, Eventual coordinators, quorum behavior, all-owner propagation and repair
-remain future work.
+operation; `stop()` returns a `NodeShutdownReport`.
+
+## Programmatic Strong ABD API
+
+With a running Strong-mode `NodeRuntime` and an explicit compatible schema-2 release
+inventory, call:
+
+```python
+import time
+
+deadline = time.monotonic() + 5.0
+put_result = runtime.strong_put("photo", b"image bytes", deadline=deadline)
+get_result = runtime.strong_get("photo", deadline=time.monotonic() + 5.0)
+```
+
+The methods return `ProtocolResult`. Strong PUT and GET query the same five fixed
+owners and require Q=3 in both phases. GET performs durable readback before returning
+a present value; three explicit absent replies produce `NOT_FOUND`. Empty bytes are
+valid. Failure results distinguish timeout/error and may report
+`completion_unknown=True` when a write may have committed. The exact local setup and
+adversarial examples are in `tests/test_strong.py`; the bounded history checker is
+`tests/history_checker.py`.
+
+These are programmatic coordinator APIs, not completed `python3 -m mp3 put/get`
+commands. The user-facing file commands remain `NOT_IMPLEMENTED`; Eventual
+coordinators, all-owner Eventual propagation, read repair and consistency-mode
+switching remain future work. Local loopback success does not establish deployment
+readiness across the ten university VMs.
 
 ## Single-replica RPC foundation
 
@@ -209,9 +239,9 @@ end-to-end MP1 queries against MP3 logs. MP1 and MP2 source remain unchanged.
 
 ## What remains
 
-Later work implements Strong ABD, Eventual-noRR, Eventual-RR/read repair, mode
-switching, all command integration, ten-VM correctness, benchmarks, report,
-deployment and demo readiness.
+Later work implements Eventual-noRR, Eventual-RR/read repair, mode switching, all
+command integration, ten-VM correctness, benchmarks, report, deployment and demo
+readiness. Strong ABD currently has only local loopback/subprocess verification.
 No deployment/reset script exists. VM inventory, interpreter versions and port
 availability are unverified. Obtain explicit authorization before VM access,
 deployment or remote fault tests. The private review-repository workflow is documented

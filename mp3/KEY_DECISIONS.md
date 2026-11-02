@@ -1,6 +1,6 @@
 # MP3 architectural decisions — shared decision log
 
-Updated October 31, 2026. Authority: [SPEC.md](SPEC.md). Krishna approved the C1–C6
+Updated November 2, 2026. Authority: [SPEC.md](SPEC.md). Krishna approved the C1–C6
 foundation contracts on October 29 and the reviewed, scoped Step 3 protocol design on
 October 31, 2026. Approval records below distinguish a design/contract approval from
 code that is implemented and verified. KD-13, full KD-16, KD-17 final logging/CLI
@@ -11,11 +11,12 @@ choices, KD-18 and KD-01 runtime compatibility remain pending where stated.
 and its durable query-aware counter; KD-12 Eventual-noRR R/W and exact-version W
 qualification with five one-shot attempts and the approved bounded continuation;
 and related KD-08/10/14/15 protocol refinements. This authorizes Step 3 Batch 1
-shared infrastructure and later protocol batches under their plan gates. It does not
-claim Strong/Eventual coordinator algorithms are implemented. Ownership remains
-unchanged; Krishna's authorization covers the shared storage/RPC changes in this
-scoped batch. AI assistance is permitted. Original student MP1/MP2 sources remain
-preserved and unchanged.
+shared infrastructure and later protocol batches under their plan gates. At the
+original approval time it did not itself mean that Strong/Eventual coordinators were
+implemented; Strong was implemented in Batch 2 as recorded below, while Eventual
+remains pending. Ownership remains unchanged; Krishna's authorization covers the
+shared storage/RPC changes in this scoped batch. AI assistance is permitted. Original
+student MP1/MP2 sources remain preserved and unchanged.
 
 Useful historical explanations were recovered from the 509-line pre-handoff local
 snapshot at `/var/folders/bb/1m2v9gh114980pb82ckc9j6h0000gn/T/mp3-handoff-o2jfpurb/KEY_DECISIONS.md`.
@@ -361,11 +362,11 @@ allocator. See the interface and crash/race acceptance cases in the design docum
 
 ## KD-11 — Strong multi-writer atomic-register protocol
 
-**Status: APPROVED — design contract; coordinator implementation is not started.**
+**Status: APPROVED — design contract. Strong ABD coordinator implementation is locally VERIFIED in Step 3 Batch 2; ten-VM behavior is unverified.**
 
 **Concept:** A read must carry the newest value it sees to a majority before returning. Otherwise one read may see a partly propagated write and a later read miss it, violating the single-copy illusion.
 
-The approved design is full two-phase multi-writer ABD over the five fixed owners with Q=3 in each phase, coordinator-only bottom (`None`), query-aware durable logical tags, and durable phase evidence. The algorithm remains future work; approval does not mean a Strong PUT/GET is operational.
+The approved design is full two-phase multi-writer ABD over the five fixed owners with Q=3 in each phase, coordinator-only bottom (`None`), query-aware durable logical tags, and durable phase evidence. Design approval alone did not imply implementation; Step 3 Batch 2 now implements programmatic Strong PUT/GET and verifies them locally.
 
 **Approved design — Krishna, October 31, 2026:** use full two-phase
 multi-writer ABD on the five fixed owners, with quorum Q=3 in each phase. PUT queries
@@ -386,10 +387,11 @@ same-writer allocation is serialized by a short durable counter transaction. If
 three owners do not provide required evidence before the single operation deadline,
 return TIMEOUT/ERROR. If a write phase may have committed, report uncertain
 completion. The rationale, traces, assumptions and adversarial tests are specified
-in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). The design is approved; no
-Strong coordinator behavior is implemented yet.
+in [STEP3_PROTOCOL_DESIGN.md](STEP3_PROTOCOL_DESIGN.md). This is the approved KD-11
+contract; programmatic Strong coordinator behavior is locally implemented and
+verified in Step 3 Batch 2 as recorded immediately below.
 
-**Approval record:** Krishna approved the design and its scope on October 31, 2026, referencing the reviewed commit above. The actual two-phase coordinator remains NOT_STARTED until Batch 2.
+**Approval record:** Krishna approved the design and its scope on October 31, 2026, referencing the reviewed commit above. The actual coordinator was implemented by Krishna in Step 3 Batch 2 and independently reviewed November 2, 2026; evidence and test results are in IMPLEMENTATION_PLAN.md. This implementation record does not change any deferred decision.
 
 **Correctness conditions:** Fixed five owners; majority=3 in both phases; durable
   monotonic replica tags; unique ordered writer tags above phase-1 max; phase/replica
@@ -547,7 +549,7 @@ replica handler or local admitted operation remains active.
 
 **Concept / rationale:** Krishna's protocols and Juhi's storage must agree on what a response promises; returning from a function is not automatically a durable acknowledgment.
 
-**Implementation evidence:** The C1–C6 interfaces and the scoped schema-2 shared contracts are implemented for Batch 1 and locally reviewed. Strong/Eventual coordinator algorithms remain unimplemented.
+**Implementation evidence:** The C1–C6 interfaces and scoped schema-2 shared contracts are implemented and locally reviewed. Strong ABD was added in Step 3 Batch 2 and passed independent local review; Eventual-noRR remains unimplemented. Evidence is in IMPLEMENTATION_PLAN.md.
 
 **Approval record:** Krishna approved the applicable C1–C6 exact foundation details and defaults in the Batch 1 instruction (October 29). Deferred protocol decisions remain outside that approval.
 

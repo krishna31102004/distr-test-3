@@ -333,8 +333,10 @@ uses VM06.
       |                           |                          |
 ```
 
-The picture shows one request to one replica. A full distributed GET must contact the
-prescribed replicas and apply Strong or Eventual rules; that is future work.
+The picture shows one request to one replica. Step 3 Batch 2 now adds a programmatic
+Strong GET that contacts the five prescribed owners, selects a Q=3 maximum and writes
+that record back durably to Q=3 before returning. Eventual coordination and the
+file-oriented demo GET command remain future work.
 
 ### What happens when VM4 crashes?
 
@@ -388,18 +390,18 @@ Initial Batch 4 local results before the final concurrency correction:
 - `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
   `python3 -B -m compileall -q mp3`, and `git diff --check` — all passed.
 
-### What Batch 4 does not implement yet
+### What Batch 4 did not implement then (historical Step 2 status)
 
-It does not implement Strong ABD, Eventual-noRR, Eventual-RR, quorum coordination,
-read repair, full distributed PUT/GET, mode switching, benchmark experiments, or the
-completed demo commands. It does not show that ten real VMs can communicate.
+At the Step 2/Batch 4 gate, it did not implement Strong ABD, Eventual-noRR,
+Eventual-RR, quorum coordination, read repair, full distributed PUT/GET, mode
+switching, benchmark experiments, or the completed demo commands. It also did not
+show that ten real VMs can communicate.
 
-### What comes next? (updated after the Step 3 Batch 1 gate)
+### What was next at the Step 3 Batch 1 gate (historical)
 
-The shared coordinator foundation is now in place. The next coding batch is Step 3
-Batch 2: Krishna implements the Strong ABD coordinator using query and write/readback
-phases with three-of-five evidence. Juhi's Eventual-noRR work follows in Batch 3.
-The one-replica call and Batch 1 collector by themselves are not distributed
+At that gate, the shared coordinator foundation was in place and Step 3 Batch 2 was
+the next coding batch. Batch 2 is now complete and locally verified as explained
+below. The one-replica call and Batch 1 collector by themselves are not distributed
 consistency operations.
 
 ### Final call-admission and shutdown correction
@@ -438,13 +440,15 @@ The Step 2 local foundation remains verified. These tests used temporary storage
 local threads/sockets; no university VM was contacted. Step 3 and all consistency
 protocols remain untouched.
 
-## Step 3 — Designing Strong and Eventual Consistency (DESIGN APPROVED / NOT IMPLEMENTED)
+## Step 3 — Designing Strong and Eventual Consistency (approved design; status updated below)
 
 Five copies help a key survive a machine failure, but they can disagree after messages
 are delayed or a machine restarts. A consistency protocol tells the machines which
 version wins and what evidence is enough to answer a client. Krishna approved the
-Strong ABD and Eventual-noRR design on October 31. The full protocols are still not
-implemented.
+Strong ABD and Eventual-noRR design on October 31. Strong ABD was implemented and
+locally reviewed in Batch 2; Eventual-noRR is still not implemented. The proposed
+diagrams in this design section explain the algorithm and are not themselves test
+evidence.
 
 A **quorum** is a required number of different replica machines. Strong uses three of
 the five fixed owners in each phase. Eventual lets us configure R and W from 1 to 5;
@@ -583,7 +587,131 @@ commands continue to report `NOT_IMPLEMENTED` where their full behavior is absen
 
 ### What comes next
 
-Step 3 Batch 2 is the Strong ABD coordinator. It will use the reviewed two-phase
-query/write and query/readback design, majority evidence, crash/concurrency cases, and
-history-based linearizability tests. It must build on these shared primitives; Batch 1
-by itself does not make a distributed key-value operation.
+Step 3 Batch 2 is now implemented and locally reviewed: it adds the Strong ABD
+coordinator using the approved two-phase query/write and query/readback design,
+majority evidence, crash/concurrency tests, and bounded history checking. Batch 3 is
+Eventual-noRR and remains future work.
+
+## Step 3 — Batch 2: Strong Consistency Using ABD
+
+**Implemented and independently reviewed locally; not ten-VM verified.**
+
+Linearizability means that even when computers act at the same time, completed
+operations can be arranged as if one computer handled them one at a time, while
+preserving the order of operations that did not overlap.
+
+Simply writing to three of five copies is not enough. A concurrent reader might see a
+partly written value and leave without making that value visible to a later reader.
+ABD uses two rounds. In each round, the coordinator contacts the five fixed owners
+and needs three distinct valid replies. Three out of five is a majority (Q=3); any
+two majorities overlap in at least one owner.
+
+### Strong PUT
+
+The coordinator first asks the five owners what they have. It waits for Q=3 valid
+FOUND or explicit NOT_FOUND responses and selects the greatest version. If all three
+are absent, the current value is conceptually “bottom”; bottom is never stored.
+The coordinator then durably reserves a new tag above the observed and local tag
+high-water marks, and asks the same five owners to install the tag and bytes. It tells
+the caller OK after three durable qualifying replies. An owner that durably stores a
+strictly greater version may also confirm that the attempted older tag cannot win.
+
+```text
+Client          Coordinator                 Five fixed owners
+  | PUT(photo)      |                              |
+  |---------------->| READ_LOCAL strong_query ---->|
+  |                 |<---- Q=3 version/absence ----|
+  |                 | allocate durable new tag     |
+  |                 | INSTALL strong_write ------->|
+  |                 |<---- Q=3 durable evidence ---|
+  |<---- OK --------|                              |
+```
+
+For example, the first round may return versions 7, 7, and NOT_FOUND. The coordinator
+chooses version 7, allocates version 8, and asks owners to install version 8. If three
+distinct owners durably confirm version 8 or a greater version, PUT succeeds.
+If only two qualify by the deadline, PUT returns an error or timeout; if some writes
+may have committed, `completion_unknown` explains that side effect is uncertain.
+
+### Strong GET and readback
+
+GET asks the five owners and chooses the greatest version among three valid replies.
+If all three explicitly say absent, it returns NOT_FOUND. If a record exists, GET
+writes that exact version and value back to three owners before returning it. A
+present empty byte string is still a value; only explicit absence is NOT_FOUND.
+
+```text
+Client          Coordinator                 Five fixed owners
+  | GET(photo)       |                              |
+  |---------------->| READ_LOCAL strong_query ---->|
+  |                 |<---- Q=3 records/absence ----|
+  |                 | INSTALL strong_readback --->|
+  |                 |<---- Q=3 durable evidence ---|
+  |<---- value -----|                              |
+```
+
+Two writers can both query the same old maximum. They still get different ordered
+tags: for example `(8, vm01/1)` and `(8, vm02/1)`. The counter is durably allocated
+locally, while writer identity breaks equal-counter ties. The short SQLite allocation
+transaction does not stay open during network calls. In a controlled test, the
+lower-tag writer pauses before phase two while the other writer completes a higher
+tag. The first writer then gets durable-at-least evidence, and a later Strong GET
+returns the higher writer's bytes.
+
+If two owners crash, three remain and may still make a majority. If three crash, only
+two remain and neither query nor install quorum can succeed. Owners are not replaced
+with other machines. If one write reaches only one replica and its coordinator dies,
+the write was not reported successful. A later GET that sees that record among its
+three replies writes it to a majority before returning it.
+
+SQLite keeps the value and version together durably. A process that is killed after a
+commit but before its reply may have changed disk even though the caller has no
+confirmed acknowledgment. On restart it opens the same database and advances its
+restart generation; the ring owner identity is unchanged. Shutdown after an operation
+has been admitted lets that operation use its authorized second phase within the
+original deadline. A timeout can leave an in-flight write uncertain; shutdown does
+not turn that uncertainty into success.
+
+### What was implemented and tested
+
+- `mp3/strong.py`: `StrongCoordinator.strong_put`, `strong_get`, the shared two-phase
+  runner, fixed-owner dispatch, maximum-record selection, and failure/uncertainty
+  results.
+- `mp3/node.py`: `NodeRuntime.strong_put` and `.strong_get` expose the programmatic
+  API through existing bounded admission and RPC resources.
+- `mp3/tests/test_strong.py`: real loopback TCP to the actual SQLite stores of the
+  key's ring owners, two- and three-owner failures, empty/Unicode/NUL/1 MiB data,
+  conflicts, concurrent writers, shutdown between phases, late replies, and a
+  subprocess SIGKILL/restart with generation checks.
+- `mp3/tests/history_checker.py` and `test_history_checker.py`: a small checker that
+  tests synthetic valid and invalid histories and histories recorded from actual
+  Strong calls. It respects non-overlap order and lets a timed-out write possibly
+  have taken effect. It checks finite histories; it is not a mathematical proof of
+  all possible schedules.
+
+The main full run passed **176 tests in 45.819 seconds**. The independent reviewer
+ran the focused Strong/history suite (**13 passed**) and full suite (**176 passed in
+45.514 seconds**) and found no concrete correctness blocker. A deterministic delayed
+query/install test was added after review found that evidence gap, then the reviewer
+reran the current tests successfully. These are local loopback, subprocess and
+in-process results; no university VM was tested. Main's `python3 -B -m mp3 --smoke`,
+`python3 -B -m mp3 --help`, `python3 -B -m mp3.node --help`,
+`python3 -B -m compileall -q mp3`, and `git diff --check` each exited 0. Smoke
+reported its narrow foundation check and `KV NOT_IMPLEMENTED`; it does not verify
+Strong. The final main focused Strong/history rerun passed **13 tests in 26.834
+seconds**.
+
+### What Batch 2 does not implement
+
+Eventual-noRR/RR, read repair, global mode switching, the required file-oriented demo
+commands, all-owner Eventual propagation, benchmarks, report plots, and ten-VM
+deployment remain unfinished. A local single-replica RPC is different from Strong:
+the Strong API coordinates two quorum phases across the five owners, while one RPC
+contacts just one replica.
+
+### What comes next?
+
+Step 3 Batch 3 is Juhi's Eventual-noRR coordinator. It will reuse the same fixed-owner,
+RPC, storage and bounded-worker foundations, but use configurable R/W and the
+approved timestamp-based Eventual rules. Strong is locally verified; the next batch
+must not be described as implemented until it has its own tests and review.

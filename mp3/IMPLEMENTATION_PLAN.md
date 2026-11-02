@@ -5,13 +5,14 @@ Prepared October 22, 2026; roadmap reconciled with the local October 21 specific
 reviewed. Step 3 design KD-11/KD-12 and scoped KD-08/10/14/15 refinements were
 approved October 31, 2026. Step 3 Batch 1 shared infrastructure is implemented and
 independently reviewed, including final concurrency/ownership/evidence corrections;
-the current local suite has 163 passing tests. Strong/Eventual coordinator algorithms
-remain unimplemented.
-This is not ten-VM deployment verification.** Read AGENTS.md and
+the Strong ABD coordinator is now implemented and independently reviewed for local
+operation; the current local suite has 176 passing tests. Eventual-noRR remains
+unimplemented. This is not ten-VM deployment verification.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
 completed so far is local storage/versioning, fixed ring/membership/recovery,
-single-replica KV RPC, and their integrated local node runtime; it does not include distributed consistency protocols. At bootstrap the
+single-replica KV RPC, the integrated local node runtime, and programmatic Strong ABD.
+Eventual coordinators, repair, and final client commands remain unfinished. At bootstrap the
 snapshot lacked Git metadata, MP3, agent instructions and the specification; these
 now exist, and `mp3/SPEC.md` is authoritative.
 MP1/MP2 remain read-only references. No university VM was contacted and no dependency
@@ -39,9 +40,9 @@ Evaluation: demo 60%, report 30%, code quality 10%.
 
 Follow the steps in order; use the detailed checklist, audit and task table below
 for specifics. Approvals are entry gates before implementation, not extra phases.
-Step 2 Batches 1–4 are complete for the local foundation and Step 3 Batch 1 shared
-infrastructure is verified. Strong/Eventual multi-owner protocol coordinators, ten-VM
-validation, and Steps 4–6 remain future work. Task statuses below reflect verified local work.
+Step 2 Batches 1–4 and Step 3 Batches 1–2 are verified for the local foundation and
+Strong protocol. Eventual-noRR, ten-VM validation, and Steps 4–6 remain future work.
+Task statuses below reflect verified local work.
 KD direction approvals and C1–C6 contract approvals remain recorded; deferred protocol
 decisions remain pending.
 
@@ -54,7 +55,8 @@ KD-13, full KD-16, final KD-17 choices, KD-18 and VM runtime verification remain
 recovery, concurrent operations without global locks, the three consistency guarantees,
 mode-clear semantics, command/output requirements and experiments come from SPEC.md.
 Humans approve their implementation choices under the KDs. A multi-writer atomic
-register is required; the two-phase ABD design is approved under KD-11 but not implemented. Infinite-suspicion recovery and
+register is required; the approved two-phase ABD design under KD-11 is now locally
+implemented and verified. Infinite-suspicion recovery and
 SHA-256 are Krishna-approved directions; exact detector and hashing contracts below
 are approved as C1/C2 contracts; their implementations remain future work.
 
@@ -96,9 +98,10 @@ are approved as C1/C2 contracts; their implementations remain future work.
 ### Step 3 — Build Strong and Eventual-noRR in parallel
 
 - **Work / owners:** Design approved October 31. Batch 1 implements common RPC,
-  scheduler, collector, leases and durable Strong tag allocation. After this shared
-  gate, Krishna implements Strong (A-01); Juhi implements noRR (E-01). Use the
-  shared interfaces and test each mode separately before switching.
+  scheduler, collector, leases and durable Strong tag allocation. Krishna's Strong
+  coordinator (A-01) is implemented and locally reviewed; Juhi's Eventual-noRR
+  coordinator (E-01) remains the next owned protocol task. Both still require later
+  adversarial integration before ten-VM readiness can be assessed.
 - **Approved before implementation:** KD-11/12 plus scoped KD-08/10/14/15 phase,
   allocation and contract refinements. KD-13/full KD-16 and final CLI/logging choices
   remain for Step 4.
@@ -158,7 +161,7 @@ are approved as C1/C2 contracts; their implementations remain future work.
 **Current task gate:** Batches 1–4 provide the locally reviewed storage/version,
 ring/membership, single-replica RPC, and integrated local node lifecycle foundations.
 Step 3 Batch 1 adds the locally reviewed shared coordinator primitives and one-owner
-dispatch; Strong/Eventual multi-owner operations remain future work. The accepted KD directions must not be reopened
+dispatch; Batch 2 adds locally verified Strong ABD; Eventual coordinators remain future work. The accepted KD directions must not be reopened
 without a concrete specification conflict or serious correctness issue. Defer KD-11/12
 to Step 3, KD-13/full KD-16/final KD-17 to Step 4, and KD-18 to Step 6.
 
@@ -777,8 +780,8 @@ is the initial agreement from the prompt; coordinate before cross-owner edits.
 | N-01 | Krishna | Concurrent bounded single-replica RPC client/service | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, total deadlines, response binding, overload and loopback store integration | VERIFIED |
 | S-01 | Juhi | Persistent atomic monotonic store (local Batch 1 verified; VM evidence in F-01) | I-01; KD-09/10/15 and KD-16 interface boundary (full switch in C-02) | Temporary crash/restart, value+tag atomicity, conditional install | VERIFIED |
 | V-01 | Juhi; Krishna reviews Strong tags | Shared version foundations plus durable Strong allocator; no Strong coordinator | I-01; KD-03/10; approved KD-11 allocator contract | Concurrent allocation, observed/local high-water, restart and preserving schema migration | VERIFIED |
-| SC-01 | Joint (Krishna RPC/routing; Juhi storage/version; reviewer independent) | Step 3 Batch 1 shared coordinator evidence/scheduling foundation | Approved KD-08/10/11/12/14/15; I-02 | Schema-2 strictness; distinct owner collector; bounded reservations; lease deadlines; fixed-owner dispatch; admitted shutdown drain; Strong allocator; loopback; current 163-test suite | VERIFIED |
-| A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01,SC-01; approved KD-11 | Adversarial multi-writer/read-writeback linearizability histories | NOT_STARTED |
+| SC-01 | Joint (Krishna RPC/routing; Juhi storage/version; reviewer independent) | Step 3 Batch 1 shared coordinator evidence/scheduling foundation | Approved KD-08/10/11/12/14/15; I-02 | Schema-2 strictness; distinct owner collector; bounded reservations; lease deadlines; fixed-owner dispatch; admitted shutdown drain; Strong allocator; loopback; 163-test suite at SC-01 verification | VERIFIED |
+| A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01,SC-01; approved KD-11 | Local TCP PUT/GET, Q=3 phases, concurrent writers, crash/recovery, bounded history checker | VERIFIED |
 | E-01 | Juhi | Eventual-noRR | R-01,N-01,S-01,V-01,SC-01; approved KD-12 | All-owner fanout, W durable acks, R max, background completion | NOT_STARTED |
 | E-02 | Juhi | Eventual-RR | E-01; KD-13/16/17 | Early response, late max, missing/stale repairs, racing newer PUT | BLOCKED_BY_DECISION |
 | L-01 | Joint | Required operation logs and MP1 query integration | N-01,protocols; KD-17 | Real receipt/response records, local then approved VM query | BLOCKED_BY_DECISION |
@@ -1288,6 +1291,48 @@ Eventual W impossibility with remaining attempts; and terminal ack/release accou
   checks successfully.
 
 These are local Python tests using temporary databases and loopback sockets. No
-university VM, ten-node deployment, Strong ABD operation, or Eventual coordinator
-was tested or implemented. SC-01 remains VERIFIED for shared infrastructure only;
-A-01 and E-01 remain NOT_STARTED.
+university VM or ten-node deployment was tested. At the Batch 1 correction gate,
+SC-01 was VERIFIED for shared infrastructure and A-01/E-01 were NOT_STARTED.
+
+## Step 3 Batch 2 execution evidence — November 2, 2026
+
+Krishna implemented A-01, the Strong ABD programmatic coordinator, on the approved
+schema-2 and Batch 1 contracts. `NodeRuntime.strong_put()` and `.strong_get()` enter
+through bounded coordinator admission; `StrongCoordinator` uses the same five fixed
+owners, one operation ID and captured context/deadline across both phases, Q=3 distinct
+evidence, and the existing durable `Store.allocate_strong_version()` allocator. PUT
+queries then installs; GET queries then writes back its exact selected record. Only
+three explicit NOT_FOUND query replies can produce GET NOT_FOUND. A failed phase-two
+quorum reports explicit failure and conservatively preserves possible-write
+uncertainty. No CLI command, Eventual coordinator, repair, or mode transition was added.
+
+New files are `strong.py`, `tests/test_strong.py`, `tests/history_checker.py`, and
+`tests/test_history_checker.py`; `node.py` exposes the two programmatic methods. The
+loopback suite starts the actual five ring owners for each key, checks a nonowner
+coordinator, empty/NUL/Unicode and 1 MiB values, replacement, two-owner and
+three-owner outages, equal-tag conflicts, partial writes/readback, concurrent writers
+and GETs, shutdown after admission, deterministic late query/install replies, and a
+separate-process SIGKILL/recovery with generation fencing. The bounded history checker
+respects real-time precedence, orders versioned successful operations, and models an
+ambiguous failed PUT as either absent or an effect within its call interval. It checked
+synthetic valid/invalid histories and actual concurrent/lost-ack Strong histories at
+recorded seeds. This is bounded history evidence, not a formal proof.
+
+- Main, Python 3.12.4: `python3 -B -m unittest discover -s mp3/tests -v` —
+  **176 passed in 45.819s**.
+- Independent GPT-6 Luna/high reviewer: focused Strong/history checker — **13 passed
+  in 26.831s**; full suite — **176 passed in 45.514s**. The reviewer found no concrete
+  ABD correctness blocker; the request for deterministic delayed/out-of-order
+  response evidence was addressed with a gate-controlled regression and reviewed.
+- Main focused delayed response test — **1 passed in 2.146s**; main synthetic history
+  checker — **3 passed**; final `python3 -B -m unittest mp3.tests.test_strong
+  mp3.tests.test_history_checker -v` — **13 passed in 26.834s**.
+- Main `python3 -B -m mp3 --smoke` exited 0 and printed `Phase 0 smoke OK: framing,
+  inventory, successors; KV NOT_IMPLEMENTED`. Main `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` also each exited 0.
+
+The local Step 3 Batch 2 acceptance gate is VERIFIED for the tested implementation.
+It is not a proof of every execution and is not ten-VM validation. Juhi's E-01
+Eventual-noRR, Eventual-RR/read repair, mode switching, final CLI commands, full MP1
+log query, VM deployment, benchmarks, report, and demo readiness remain future work.

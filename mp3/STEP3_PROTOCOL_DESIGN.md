@@ -1,11 +1,11 @@
-# Step 3 protocol design — approved design, protocols not implemented
+# Step 3 protocol design — approved design and implementation record
 
 **Status: DESIGN APPROVED by Krishna on October 31, 2026; shared Batch 1
-infrastructure is implemented and independently reviewed. Strong ABD and
-Eventual-noRR coordinator algorithms remain NOT IMPLEMENTED.** Approval references
+infrastructure and Strong ABD Batch 2 are implemented and independently reviewed
+for local operation. Eventual-noRR remains NOT IMPLEMENTED.** Approval references
 the reviewed design baseline `38a2293db54b9238d780c650276e0d3b60305e4a`. This document
-remains the protocol contract; Batch 1 implementation evidence is recorded in the
-implementation plan. No claims here imply that a full distributed PUT/GET works.
+remains the protocol contract; implementation and local test evidence is recorded in
+the implementation plan. No claims imply ten-VM deployment readiness.
 
 ## 1. Authority, requirements, and current boundary
 
@@ -781,7 +781,7 @@ endpoint; it does not bypass the replica handler or durable Store boundary.
 | Mixed epoch or mode evidence | Reject as nonqualifying; return error/timeout if threshold cannot be reached | Prevents combining incomparable database generations; KD-16 full transition remains deferred |
 | Restart generation changes during an operation | A reply not matching its dispatch-time expected generation is invalid; no retry/substitution in same operation | Preserves C5 binding; later operation uses converged generation |
 | Bounded queue exhausted | Reject before writes as OVERLOADED; Eventual PUT must atomically reserve five accepted attempts | No unbounded growth or silently discarded propagation |
-| Shutdown during a Strong phase | Stop new admission; accepted call retains context/deadline and drains. On bound expiry report incomplete; don't close Store under live accepted work | Matches verified NodeRuntime lifecycle; future protocol tasks need equivalent accounting |
+| Shutdown during a Strong phase | Stop new admission; accepted call retains context/deadline and drains. On bound expiry report incomplete; don't close Store under live accepted work | Strong Batch 2 uses the verified NodeRuntime admission boundary; Eventual must supervise its own continuing attempts |
 | Shutdown after Eventual W but before fanout completes | Client success stays success; accepted jobs drain to continuation/shutdown bound and report any unfinished owners | Separate client and background lifetime; shutdown refinement needs approval |
 | Higher version discovered during Strong readback | SUPERSEDED higher-tag evidence may count toward readback; return selected version if three durable-at-least responses and linearizability ordering permits | Concurrent higher write can overlap the GET; tag conflict still aborts |
 | Equal tag, conflicting bytes | Abort affected operation with ERROR and preserve replica data; do not choose by arrival order | Existing C3 invariant and no silent corruption |
@@ -816,9 +816,9 @@ existing schema/identity/context first, and retain record rows. Whether the coun
 is retained across a future Strong↔Eventual epoch switch is a KD-16-dependent detail;
 it must never allow an old-epoch message to pass Store's exact epoch validation.
 
-The durable Strong allocator is implemented and locally tested in Batch 1; the Strong
-ABD coordinator that obtains the phase-1 maximum and invokes it does not exist yet.
-Do not use `time.time_ns()` as a substitute for the phase-1 maximum.
+The durable Strong allocator was implemented and locally tested in Batch 1. Batch 2
+now invokes it after the phase-1 maximum and implements Strong ABD locally. Do not use
+`time.time_ns()` as a substitute for the phase-1 maximum.
 
 ## 9. Eventual allocator adequacy
 
@@ -883,13 +883,27 @@ prescribed owners can still satisfy Strong, and Eventual may proceed when its
 configured R/W compatible prescribed owners qualify. Contract, concurrency, capacity
 and restart tests pass.
 
-### Step 3 Batch 2 — Strong ABD (Krishna)
+### Step 3 Batch 2 — Strong ABD (Krishna; implemented and locally verified)
 
 Implement the two-phase PUT and GET rules above with majority 3, durable-at-least
 phase-2 evidence, bottom/absence, unique query-aware tags, and exact-context fencing.
 Acceptance includes sequential operations, concurrent multi-writer races, delayed and
 out-of-order replies, partial writes, read writeback, process crashes/restarts, quorum
 loss, lost acknowledgments, and history-based linearizability checking.
+
+**Implementation record (November 2, 2026):** `NodeRuntime.strong_put(key, value,
+*, deadline)` and `NodeRuntime.strong_get(key, *, deadline)` are the programmatic
+entrypoints. They use `CoordinatorAdmission`, reserve bounded capacity for both
+five-owner phases, dispatch schema-2 requests through `dispatch_owner`, and evaluate
+responses with `collect_distinct`. `StrongCoordinator._run` implements PUT query →
+durable `Store.allocate_strong_version` → `strong_write`, and GET query → either
+three explicit absences or exact-record `strong_readback`. It shares one captured
+operation ID/context/deadline across phases and each RPC receives a fresh request ID.
+Failed second phases return no successful value and conservatively report possible
+write effects. The approved C5 wire format, KD-11 qualification rules, and fixed-owner
+contract were not changed. Local test and independent-review evidence is in
+IMPLEMENTATION_PLAN.md. The checker provides bounded-history evidence, not a formal
+proof, and no university VMs were used.
 
 ### Step 3 Batch 3 — Eventual-noRR (Juhi)
 
