@@ -313,6 +313,34 @@ live table and retroactively invalidate it. Do not retry/reissue within that ope
 Later operations use the newer converged generation. A response from any generation
 other than the one captured for its own dispatch is invalid evidence.
 
+#### Batch 1 implementation refinements (implemented; still no protocol coordinator)
+
+The current shared implementation adds a runtime-issued `CoordinatorAdmission` to
+`NodeRuntime.submit_coordinator(function, *args, deadline=...)`. The callback receives
+that capability as its first argument. It is registered by object identity, binds the
+original monotonic deadline, context, sender generation and operation ID, and becomes
+invalid when the callback completes. The callback can pass it to
+`NodeRuntime.reserve_attempts(..., admission=...)` and
+`NodeRuntime.dispatch_owner(..., admission=...)` to issue its own remaining phase
+after shutdown has closed external admission. New external operations remain rejected;
+network I/O occurs outside the admission condition. Store closure waits for admitted
+callbacks and attempts or reports shutdown incomplete.
+
+The implemented `coordinator.dispatch_owner(..., manifest=...)` rejects a schema-2
+target outside `manifest.owners(request.key)` before queueing. `ReplicaService` applies
+the same fixed-owner check before touching storage. Schema-1 `phase="local"` retains
+its existing compatibility. Neither check consults ALIVE/SUSPECTED state or substitutes
+an owner. Such a preflight rejection is carried as `OwnerDispatchError.failure` with
+`OwnerOutcome.NOT_PRESCRIBED_OWNER`.
+
+`collect_distinct` recalculates `qualifying + still_possible` after terminal outcomes
+and stops once the requested threshold cannot be met. Strong/read phases cancel only
+queued calls that actually cancel; Eventual PUT returns all remaining accepted calls in
+`QuorumCollection.continuing`, even when W is impossible. `OwnerOutcome.DURABLE_ACK`
+records a confirmed exact-version durable success in `AttemptLedger`; uncertain,
+superseded and failed outcomes remain distinct. These primitives do not themselves
+decide a consistency operation's result.
+
 ## 4. Strong multi-writer ABD proposal (KD-11)
 
 **Approved by Krishna, October 31, 2026.** Use Q=3 for both phases because 3-of-5

@@ -256,6 +256,10 @@ class ReplicaService:
                 and (self.protocol_activation is None
                      or not self.protocol_activation.enabled_for(self.manifest))):
             return "SCHEMA2_DISABLED"
+        if (request.schema == 2
+                and self.membership.self_id not in {
+                    owner.vm_id for owner in self.manifest.owners(request.key)}):
+            return "NOT_PRESCRIBED_OWNER"
         sender = next((member for member in self.membership.snapshot()
                        if member.vm_id == request.sender_id), None)
         if (sender is None or sender.restart_generation == 0

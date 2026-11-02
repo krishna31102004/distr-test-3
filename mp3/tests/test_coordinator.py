@@ -5,7 +5,10 @@ import time
 import unittest
 
 from mp3.attempts import AttemptLease
-from mp3.coordinator import BoundedExecutor, OwnerCall, OwnerOutcome, RpcCompletion, collect_distinct
+from mp3.coordinator import (
+    AttemptLedger, AttemptState, BoundedExecutor, OwnerCall, OwnerDispatchError,
+    OwnerOutcome, RpcCompletion, collect_distinct, dispatch_owner,
+)
 from mp3.models import ConsistencyMode, Context, Version
 from mp3.ring import Endpoint, Manifest
 from mp3.rpc import (PROTOCOL_SCHEMA_VERSION, ReplicaResponse, RpcOutcome,
@@ -115,6 +118,42 @@ class BoundedExecutorTests(unittest.TestCase):
         queued.result(timeout=2)
         self.assertTrue(executor.shutdown(timeout=2).clean)
 
+
+class AttemptLedgerTests(unittest.TestCase):
+    def test_durable_ack_is_terminal_and_releases_once(self):
+        manifest = manifest_fixture()
+        released = []
+        ledger = AttemptLedger(manifest.owners("ledger-key"), release=released.append)
+        owner = manifest.owners("ledger-key")[0].vm_id
+        ledger.transition(owner, AttemptState.QUEUED)
+        ledger.transition(owner, AttemptState.IN_FLIGHT)
+        ledger.finish(owner, OwnerOutcome.DURABLE_ACK)
+        report = ledger.report()
+        self.assertFalse(report.terminal)
+        self.assertEqual(dict((vm_id, (outcome, unknown))
+                              for vm_id, outcome, unknown in report.outcomes)[owner],
+                         (OwnerOutcome.DURABLE_ACK, False))
+        with self.assertRaises(RuntimeError):
+            ledger.finish(owner, OwnerOutcome.DURABLE_ACK)
+        self.assertEqual(released, [owner])
+
+    def test_canceled_and_completed_attempts_cannot_release_twice(self):
+        manifest = manifest_fixture()
+        released = []
+        owners = manifest.owners("ledger-key")
+        ledger = AttemptLedger(owners, release=released.append)
+        ledger.transition(owners[0].vm_id, AttemptState.QUEUED)
+        ledger.finish(owners[0].vm_id, OwnerOutcome.CANCELLED)
+        ledger.finish(owners[1].vm_id, OwnerOutcome.NOT_STARTED_SHUTDOWN)
+        for owner in owners[2:]:
+            ledger.finish(owner.vm_id, OwnerOutcome.ERROR)
+        self.assertTrue(ledger.report().terminal)
+        self.assertEqual(set(released), {owner.vm_id for owner in owners})
+        self.assertEqual(len(released), 5)
+        with self.assertRaises(RuntimeError):
+            ledger.finish(owners[0].vm_id, OwnerOutcome.CANCELLED)
+        self.assertEqual(len(released), 5)
+
     def test_forced_shutdown_reports_active_and_cancels_queued(self):
         executor = BoundedExecutor(workers=1, max_pending=2, name="force-test")
         started, release = threading.Event(), threading.Event()
@@ -140,6 +179,29 @@ class CollectorTests(unittest.TestCase):
         self.manifest = manifest_fixture()
         self.owners = self.manifest.owners("alpha")
         self.operation_id = new_operation_id()
+
+    def test_shared_dispatch_rejects_nonowner_before_queueing(self):
+        key = "shared-nonowner"
+        owner_ids = {owner.vm_id for owner in self.manifest.owners(key)}
+        nonowner = next(node for node in self.manifest.nodes if node.vm_id not in owner_ids)
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id=nonowner.vm_id, epoch=1, mode=ConsistencyMode.STRONG,
+            op=RpcOperation.READ_LOCAL, key=key, phase="strong_query", schema=2,
+            operation_id=self.operation_id)
+        executor = BoundedExecutor(workers=1, max_pending=1, name="owner-preflight")
+        try:
+            with self.assertRaises(OwnerDispatchError) as rejected:
+                dispatch_owner(
+                    object(), nonowner, request, manifest=self.manifest,
+                    deadline=time.monotonic() + 2, expected_generation=1,
+                    executor=executor)
+            self.assertEqual(rejected.exception.failure.owner_id, nonowner.vm_id)
+            self.assertEqual(rejected.exception.failure.outcome,
+                             OwnerOutcome.NOT_PRESCRIBED_OWNER)
+            self.assertEqual(executor.counts, (0, 0, 0))
+        finally:
+            self.assertTrue(executor.shutdown(timeout=2).clean)
 
     def collect(self, calls, phase="strong_query", required=3):
         return collect_distinct(
@@ -261,13 +323,59 @@ class CollectorTests(unittest.TestCase):
                     time.monotonic()))
             calls.append(OwnerCall(owner, request, 3, future))
         result = collect_distinct(
-            calls, owners=self.owners, manifest=self.manifest, required=3,
+            calls, owners=self.owners, manifest=self.manifest, required=4,
             operation_id=self.operation_id, phase="eventual_put",
             context=Context(1, ConsistencyMode.EVENTUAL_NO_RR),
             deadline=time.monotonic() + 0.02)
         self.assertFalse(result.reached)
+        self.assertEqual(len(result.failures), 2)
         self.assertEqual(len(result.continuing), 3)
         self.assertTrue(all(not call.future.cancelled() for call in result.continuing))
+
+    def test_impossible_required_four_stops_after_two_failures(self):
+        calls = [call_fixture(self.manifest, owner, self.operation_id,
+                              status=RpcStatus.ERROR)
+                 for owner in self.owners[:2]]
+        for owner in self.owners[2:]:
+            completed = call_fixture(
+                self.manifest, owner, self.operation_id,
+                version=Version("strong", 5, "vm02/1"))
+            calls.append(OwnerCall(completed.node, completed.request,
+                                   completed.expected_generation, Future()))
+        started = threading.Event()
+        result_box = []
+
+        def collect():
+            started.set()
+            result_box.append(collect_distinct(
+                calls, owners=self.owners, manifest=self.manifest, required=4,
+                operation_id=self.operation_id, phase="strong_query",
+                context=Context(1, ConsistencyMode.STRONG),
+                deadline=time.monotonic() + 60))
+
+        thread = threading.Thread(target=collect, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive(), "impossible quorum waited for the long deadline")
+        result = result_box[0]
+        self.assertFalse(result.reached)
+        self.assertEqual(len(result.failures), 5)
+        self.assertEqual(len(result.continuing), 0)
+        self.assertTrue(all(call.future.cancelled() for call in calls[2:]))
+
+    def test_required_three_remains_possible_after_two_failures(self):
+        calls = [call_fixture(
+            self.manifest, owner, self.operation_id,
+            status=RpcStatus.ERROR if index < 2 else RpcStatus.FOUND,
+            version=Version("strong", index + 5, "vm02/1"))
+            for index, owner in enumerate(self.owners)]
+        result = collect_distinct(
+            calls, owners=self.owners, manifest=self.manifest, required=3,
+            operation_id=self.operation_id, phase="strong_query",
+            context=Context(1, ConsistencyMode.STRONG), deadline=time.monotonic() + 2)
+        self.assertTrue(result.reached)
+        self.assertEqual(len(result.qualifying), 3)
 
 
 if __name__ == "__main__":

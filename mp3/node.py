@@ -18,14 +18,16 @@ from .attempts import AttemptLease
 from .coordinator import (
     DEFAULT_ATTEMPT_QUEUE, DEFAULT_ATTEMPT_WORKERS,
     DEFAULT_COORDINATOR_QUEUE, DEFAULT_COORDINATOR_WORKERS,
-    CoordinatorResources, CoordinatorShutdownReport, OwnerCall, Schema2Activation,
+    CoordinatorResources, CoordinatorShutdownReport, OwnerCall, OwnerDispatchError,
+    OwnerFailure, OwnerOutcome, Schema2Activation,
     dispatch_owner as _dispatch_owner,
 )
 from .membership import Member, MembershipRuntime
 from .models import ConsistencyMode, Context, Version
 from .replica import DEFAULT_REPLICA_QUEUE, DEFAULT_REPLICA_WORKERS, ReplicaService, ShutdownReport
 from .ring import Manifest, Node, load_manifest
-from .rpc import ReplicaClient, ReplicaRequest, RpcOperation, RpcOutcome, new_request
+from .rpc import (ReplicaClient, ReplicaRequest, RpcOperation, RpcOutcome,
+                  new_operation_id, new_request)
 from .storage import Store, open_store
 
 
@@ -56,6 +58,16 @@ class NodeShutdownReport:
     @property
     def incomplete_requests(self) -> int:
         return 0 if self.replica is None else self.replica.incomplete_requests
+
+
+@dataclass(frozen=True, eq=False)
+class CoordinatorAdmission:
+    """Unforgeable, one-operation authority issued by an accepting NodeRuntime."""
+
+    deadline: float
+    context: Context
+    sender_generation: int
+    operation_id: str
 
 
 class NodeRuntime:
@@ -120,6 +132,7 @@ class NodeRuntime:
         self._calls = threading.Condition()
         self._accepting_calls = False
         self._active_calls = 0
+        self._admitted_coordinators: dict[int, CoordinatorAdmission] = {}
 
     @classmethod
     def from_files(cls, *, vm_id: str, manifest_path: str | Path,
@@ -290,51 +303,103 @@ class NodeRuntime:
                 self._active_calls -= 1
                 self._calls.notify_all()
 
-    def reserve_attempts(self, count: int, *, deadline: float):
-        """Atomically reserve bounded outbound capacity while the node admits work."""
+    def reserve_attempts(self, count: int, *, deadline: float,
+                         admission: CoordinatorAdmission | None = None):
+        """Reserve bounded outbound capacity for external or admitted work."""
+        return self._reserve_attempts(count, deadline=deadline, admission=admission)
+
+    def _reserve_attempts(self, count: int, *, deadline: float,
+                          admission: CoordinatorAdmission | None):
         with self._calls:
-            if (not self._ready or not self._accepting_calls
-                    or self.coordinator_resources is None):
+            external = self._ready and self._accepting_calls
+            authorized = self._admission_is_live_locked(admission, deadline)
+            if (not external and not authorized) or self.coordinator_resources is None:
                 raise RuntimeError("node is not accepting coordinator work")
+            if admission is not None and not authorized:
+                raise RuntimeError("coordinator admission is invalid, expired, or completed")
             resources = self.coordinator_resources
         return resources.reserve_attempts(count, deadline=deadline)
 
     def submit_coordinator(self, function, *args, deadline: float):
-        """Submit one bounded coordinator-side test/infrastructure task, not a KV protocol."""
+        """Admit a bounded task; its callback receives a scoped CoordinatorAdmission first."""
+        if not callable(function):
+            raise TypeError("coordinator function must be callable")
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("coordinator deadline must be a finite monotonic timestamp")
         with self._calls:
             if (not self._ready or not self._accepting_calls
-                    or self.coordinator_resources is None):
+                    or self.coordinator_resources is None or self.store is None
+                    or self.membership_runtime is None):
                 raise RuntimeError("node is not accepting coordinator work")
             resources = self.coordinator_resources
+            admission = CoordinatorAdmission(
+                deadline, self.store.current_context(),
+                self.membership_runtime.generation, new_operation_id())
+            self._admitted_coordinators[id(admission)] = admission
             self._active_calls += 1
         try:
-            future = resources.coordinators.submit(function, *args, deadline=deadline)
+            future = resources.coordinators.submit(
+                function, admission, *args, deadline=deadline)
             if future is None:
-                with self._calls:
-                    self._active_calls -= 1
-                    self._calls.notify_all()
+                self._finish_coordinator_admission(admission)
                 return None
-            future.add_done_callback(self._finish_admitted_call)
+            future.add_done_callback(lambda _future: self._finish_coordinator_admission(admission))
             return future
         except BaseException:
-            self._finish_admitted_call(None)
+            self._finish_coordinator_admission(admission)
             raise
+
+    def _admission_is_live_locked(self, admission, deadline: float) -> bool:
+        if not isinstance(admission, CoordinatorAdmission):
+            return False
+        if self._admitted_coordinators.get(id(admission)) is not admission:
+            return False
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or deadline > admission.deadline or time.monotonic() >= deadline):
+            return False
+        return True
+
+    def _finish_coordinator_admission(self, admission: CoordinatorAdmission) -> None:
+        with self._calls:
+            if self._admitted_coordinators.pop(id(admission), None) is admission:
+                self._active_calls -= 1
+                self._calls.notify_all()
 
     def dispatch_owner(self, target_id: str, op: RpcOperation, key: str, *,
                        deadline: float, reservation=None, phase: str,
                        operation_id: str, version: Version | None = None,
-                       value: bytes = b"", attempt_lease: AttemptLease | None = None
+                       value: bytes = b"", attempt_lease: AttemptLease | None = None,
+                       admission: CoordinatorAdmission | None = None,
                        ) -> OwnerCall:
         """Create and dispatch one schema-2 RPC, without collecting a quorum."""
         with self._calls:
-            if (not self._ready or not self._accepting_calls
-                    or self.rpc_client is None or self.membership_runtime is None
-                    or self.coordinator_resources is None):
+            external = self._ready and self._accepting_calls
+            authorized = self._admission_is_live_locked(admission, deadline)
+            if ((not external and not authorized) or self.rpc_client is None
+                    or self.membership_runtime is None or self.coordinator_resources is None):
                 raise RuntimeError("node is not accepting RPC calls")
+            if admission is not None and not authorized:
+                raise RuntimeError("coordinator admission is invalid, expired, or completed")
             if self.protocol_activation is None:
                 raise RuntimeError("schema-2 protocol is not activated")
-            context = self.store.current_context()
-            sender_generation = self.membership_runtime.generation
+            if admission is not None and operation_id != admission.operation_id:
+                raise RuntimeError("RPC operation ID does not match its coordinator admission")
+            try:
+                target_node = self.manifest.node(target_id)
+            except ValueError:
+                raise OwnerDispatchError(OwnerFailure(
+                    target_id, OwnerOutcome.NOT_PRESCRIBED_OWNER,
+                    f"{target_id!r} is not a manifest owner for key {key!r}")) from None
+            if target_id not in {owner.vm_id for owner in self.manifest.owners(key)}:
+                raise OwnerDispatchError(OwnerFailure(
+                    target_id, OwnerOutcome.NOT_PRESCRIBED_OWNER,
+                    f"{target_id} is not a prescribed owner for key {key!r}"))
+            if admission is None:
+                context = self.store.current_context()
+                sender_generation = self.membership_runtime.generation
+            else:
+                context = admission.context
+                sender_generation = admission.sender_generation
             client = self.rpc_client
             membership = self.membership_runtime.table.snapshot()
             target_row = next(row for row in membership if row.vm_id == target_id)
@@ -350,7 +415,7 @@ class NodeRuntime:
                 version=version, value=value, phase=phase, schema=2,
                 operation_id=operation_id)
             owner_call = _dispatch_owner(
-                client, self.manifest.node(target_id), request, deadline=deadline,
+                client, target_node, request, manifest=self.manifest, deadline=deadline,
                 expected_generation=expected_generation,
                 executor=self.coordinator_resources.attempts,
                 reservation=reservation, attempt_lease=attempt_lease)

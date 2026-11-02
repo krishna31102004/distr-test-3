@@ -4,7 +4,9 @@ Prepared October 22, 2026; roadmap reconciled with the local October 21 specific
 **Current gate: Step 2 Batches 1–4 local foundation is VERIFIED and independently
 reviewed. Step 3 design KD-11/KD-12 and scoped KD-08/10/14/15 refinements were
 approved October 31, 2026. Step 3 Batch 1 shared infrastructure is implemented and
-independently reviewed; Strong/Eventual coordinator algorithms remain unimplemented.
+independently reviewed, including final concurrency/ownership/evidence corrections;
+the current local suite has 163 passing tests. Strong/Eventual coordinator algorithms
+remain unimplemented.
 This is not ten-VM deployment verification.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
@@ -775,7 +777,7 @@ is the initial agreement from the prompt; coordinate before cross-owner edits.
 | N-01 | Krishna | Concurrent bounded single-replica RPC client/service | I-01; KD-06/07/08/14/15 | Binary roundtrip, limits, total deadlines, response binding, overload and loopback store integration | VERIFIED |
 | S-01 | Juhi | Persistent atomic monotonic store (local Batch 1 verified; VM evidence in F-01) | I-01; KD-09/10/15 and KD-16 interface boundary (full switch in C-02) | Temporary crash/restart, value+tag atomicity, conditional install | VERIFIED |
 | V-01 | Juhi; Krishna reviews Strong tags | Shared version foundations plus durable Strong allocator; no Strong coordinator | I-01; KD-03/10; approved KD-11 allocator contract | Concurrent allocation, observed/local high-water, restart and preserving schema migration | VERIFIED |
-| SC-01 | Joint (Krishna RPC/routing; Juhi storage/version; reviewer independent) | Step 3 Batch 1 shared coordinator evidence/scheduling foundation | Approved KD-08/10/11/12/14/15; I-02 | Schema-2 strictness; distinct owner collector; bounded reservations; lease deadlines; Strong allocator; loopback; all 153 tests | VERIFIED |
+| SC-01 | Joint (Krishna RPC/routing; Juhi storage/version; reviewer independent) | Step 3 Batch 1 shared coordinator evidence/scheduling foundation | Approved KD-08/10/11/12/14/15; I-02 | Schema-2 strictness; distinct owner collector; bounded reservations; lease deadlines; fixed-owner dispatch; admitted shutdown drain; Strong allocator; loopback; current 163-test suite | VERIFIED |
 | A-01 | Krishna | Strong ABD | R-01,N-01,S-01,V-01,SC-01; approved KD-11 | Adversarial multi-writer/read-writeback linearizability histories | NOT_STARTED |
 | E-01 | Juhi | Eventual-noRR | R-01,N-01,S-01,V-01,SC-01; approved KD-12 | All-owner fanout, W durable acks, R max, background completion | NOT_STARTED |
 | E-02 | Juhi | Eventual-RR | E-01; KD-13/16/17 | Early response, late max, missing/stale repairs, racing newer PUT | BLOCKED_BY_DECISION |
@@ -1256,3 +1258,36 @@ KD-16, CLI/logging decisions and all eight user-facing KV commands remain deferr
 SC-01 and V-01 are VERIFIED for the shared Batch 1 infrastructure. A-01 and E-01
 are NOT_STARTED: the next implementation batch will build the actual Strong ABD
 coordinator on top of these reviewed interfaces. Eventual-noRR follows as Batch 3.
+
+## Step 3 Batch 1 final correctness corrections — November 2, 2026
+
+The main agent corrected four shared-infrastructure details without starting either
+protocol coordinator. An identity-registered `CoordinatorAdmission` lets a callback
+already admitted before shutdown submit its own remaining phase requests under the
+captured context, generation, operation ID and original deadline; external new work
+is rejected after shutdown closes admission. Schema-2 dispatch now checks the key's
+five prescribed owners before sending, and `ReplicaService` repeats the check before
+storage access. Schema-1 `local` requests remain compatible. The distinct-response
+collector now stops promptly when terminal outcomes make the requested threshold
+impossible, while preserving unfinished accepted Eventual PUT attempts. Finally,
+`AttemptLedger` reports `DURABLE_ACK` as a terminal exact-version durable success,
+separate from superseded or uncertain outcomes.
+
+Deterministic regressions cover shutdown between coordinator phases; invalid or
+reused admission; sender- and receiver-side nonowner rejection; ownership retention
+for suspected/unreachable owners; required=4 versus required=3 after two failures;
+Eventual W impossibility with remaining attempts; and terminal ack/release accounting.
+
+- Main agent (Python 3.12.4): `python3 -B -m unittest discover -s mp3/tests -v` —
+  **163 passed in 19.624s**.
+- Independent GPT-6 Luna/high reviewer: focused coordinator/runtime/replica suites —
+  **72 passed in 17.818s**; full suite — **163 passed in 19.287s**.
+- Main agent: `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` — each exited 0. The reviewer independently ran those same
+  checks successfully.
+
+These are local Python tests using temporary databases and loopback sockets. No
+university VM, ten-node deployment, Strong ABD operation, or Eventual coordinator
+was tested or implemented. SC-01 remains VERIFIED for shared infrastructure only;
+A-01 and E-01 remain NOT_STARTED.

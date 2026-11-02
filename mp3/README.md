@@ -54,13 +54,16 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-The suite currently has 153 tests. It uses temporary SQLite directories, fake
-clocks, subprocesses killed with SIGKILL, and temporary loopback membership and KV
-listeners. `tests/test_node_runtime.py` starts three logical VMs on loopback and also
-tests a separate-process crash/restart path, plus schema-2 Strong and Eventual-noRR
+The suite currently has 163 tests (verified November 2, 2026). It uses temporary
+SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
+loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
+logical VMs on loopback and also tests a separate-process crash/restart path, plus schema-2 Strong and Eventual-noRR
 single-replica calls using an explicit compatibility fixture. These tests do not
-exercise either multi-owner coordinator. It contacts no university VM. The verified results and limits are recorded
-in the implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
+exercise either multi-owner coordinator. The current Batch 1 regression suite also
+checks admitted coordinator work during shutdown, fixed-owner checks at dispatch and
+replicas, prompt impossible-threshold handling, and explicit durable-ack tracking.
+It contacts no university VM. The verified results and limits are recorded in the
+implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
 real VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
 
 For an explicit schema-2 local test, `mp3.node` accepts `--schema2-inventory PATH`.

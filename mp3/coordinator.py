@@ -43,7 +43,9 @@ class OperationStatus(str, Enum):
 
 
 class OwnerOutcome(str, Enum):
+    DURABLE_ACK = "DURABLE_ACK"
     SUPERSEDED = "SUPERSEDED"
+    NOT_PRESCRIBED_OWNER = "NOT_PRESCRIBED_OWNER"
     VERSION_CONFLICT = "VERSION_CONFLICT"
     STALE_EPOCH = "STALE_EPOCH"
     UNREACHABLE = "UNREACHABLE"
@@ -124,6 +126,14 @@ class OwnerFailure:
     completion_unknown: bool = False
 
 
+class OwnerDispatchError(ValueError):
+    """A local preflight rejection with explicit failure evidence and no RPC sent."""
+
+    def __init__(self, failure: OwnerFailure):
+        self.failure = failure
+        super().__init__(failure.error or failure.outcome.value)
+
+
 @dataclass(frozen=True)
 class QuorumCollection:
     qualifying: tuple[QualifiedReply, ...]
@@ -182,6 +192,12 @@ class AttemptLedger:
 
     def finish(self, owner_id: str, outcome: OwnerOutcome, *,
                completion_unknown: bool = False) -> None:
+        if not isinstance(outcome, OwnerOutcome):
+            raise TypeError("outcome must be an OwnerOutcome")
+        if type(completion_unknown) is not bool:
+            raise TypeError("completion_unknown must be a boolean")
+        if outcome == OwnerOutcome.DURABLE_ACK and completion_unknown:
+            raise ValueError("a confirmed durable acknowledgment cannot be uncertain")
         with self._lock:
             current = self._states.get(owner_id)
             if current not in (AttemptState.RESERVED, AttemptState.QUEUED,
@@ -541,14 +557,25 @@ class CoordinatorResources:
         return CoordinatorShutdownReport(coordinator_report, attempt_report)
 
 
-def dispatch_owner(client, node: Node, request: ReplicaRequest, *, deadline: float,
+def dispatch_owner(client, node: Node, request: ReplicaRequest, *, manifest: Manifest,
+                   deadline: float,
                    expected_generation: int, executor: BoundedExecutor,
                    reservation: CapacityReservation | None = None,
                    attempt_lease: AttemptLease | None = None) -> OwnerCall:
     """Dispatch exactly one RPC with dispatch-time generation evidence."""
+    if not isinstance(manifest, Manifest):
+        raise TypeError("dispatch requires the validated owner manifest")
     if (not isinstance(node, Node) or request.target_id != node.vm_id
             or type(expected_generation) is not int or expected_generation <= 0):
         raise ValueError("owner call target and expected generation are invalid")
+    if request.schema == PROTOCOL_SCHEMA_VERSION:
+        prescribed_ids = {owner.vm_id for owner in manifest.owners(request.key)}
+        if node.vm_id not in prescribed_ids:
+            raise OwnerDispatchError(OwnerFailure(
+                node.vm_id, OwnerOutcome.NOT_PRESCRIBED_OWNER,
+                f"{node.vm_id} is not a prescribed owner for key {request.key!r}"))
+    if request.manifest_id != manifest.fingerprint:
+        raise ValueError("owner request belongs to a different manifest")
 
     def invoke() -> RpcCompletion:
         outcome = client.call_replica(
@@ -667,8 +694,12 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
     seen_versions: dict[Version, bytes] = {}
     fatal_error = None
     deadline_expired = False
+    threshold_impossible = len(qualifying) + len(pending) < required
 
-    while pending and len(qualifying) < required:
+    def impossible_with_remaining() -> bool:
+        return len(qualifying) + len(pending) < required
+
+    while pending and len(qualifying) < required and not threshold_impossible:
         remaining = deadline - clock()
         if remaining <= 0:
             deadline_expired = True
@@ -697,15 +728,24 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                     raise TypeError("future must return RpcCompletion")
             except BaseException as error:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.ERROR, str(error)))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             outcome = completion.outcome
             if completion.completed_at > deadline:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.LATE,
                                              "response completed after foreground deadline",
                                              outcome.completion_unknown))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if outcome.kind != RpcOutcomeKind.RESPONSE or outcome.response is None:
                 failures.append(_failure_from_outcome(owner_id, outcome))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             response = outcome.response
             try:
@@ -714,10 +754,16 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
             except (RpcProtocolError, ValueError, TypeError) as error:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.INVALID_RESPONSE,
                                              str(error), outcome.completion_unknown))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if response.operation_id != operation_id or response.phase != phase:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.INVALID_RESPONSE,
                                              "operation ID or phase mismatch"))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if response.status == RpcStatus.VERSION_CONFLICT:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.VERSION_CONFLICT,
@@ -727,20 +773,32 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
             if response.status == RpcStatus.STALE_EPOCH:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.STALE_EPOCH,
                                              response.error))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if response.status == RpcStatus.SUPERSEDED and phase == "eventual_put":
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.SUPERSEDED,
                                              "higher version does not acknowledge this Eventual PUT"))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if not _qualifies(phase, call.request, response):
                 outcome_map = {
                     RpcStatus.ERROR: OwnerOutcome.ERROR,
                     RpcStatus.SUPERSEDED: OwnerOutcome.SUPERSEDED,
                 }
+                if (response.status == RpcStatus.ERROR
+                        and response.error == "NOT_PRESCRIBED_OWNER"):
+                    outcome_map[RpcStatus.ERROR] = OwnerOutcome.NOT_PRESCRIBED_OWNER
                 failures.append(OwnerFailure(
                     owner_id, outcome_map.get(response.status, OwnerOutcome.ERROR),
                     response.error or f"{response.status.value} is not qualifying evidence",
                     outcome.completion_unknown))
+                threshold_impossible = impossible_with_remaining()
+                if threshold_impossible:
+                    break
                 continue
             if response.status == RpcStatus.FOUND:
                 assert response.version is not None
@@ -755,18 +813,22 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                 owner_id, call.request, response, completion.completed_at))
             if len(qualifying) >= required:
                 break
+            if impossible_with_remaining():
+                threshold_impossible = True
+                break
         if fatal_error:
             break
+        if threshold_impossible:
+            break
 
-    if len(qualifying) < required and pending and phase != "eventual_put":
-        # A bounded phase may stop as soon as the remaining unique owners cannot
-        # meet the threshold; no replacement owner is submitted.
-        if len(qualifying) + len(pending) < required:
-            for future, call in tuple(pending.items()):
-                future.cancel()
+    if threshold_impossible and phase != "eventual_put":
+        # A bounded phase may stop as soon as terminal outcomes prove the
+        # threshold impossible; no replacement owner is submitted.
+        for future, call in tuple(pending.items()):
+            if future.cancel():
                 failures.append(OwnerFailure(call.node.vm_id, OwnerOutcome.CANCELLED,
                                              "threshold is no longer reachable"))
-            pending.clear()
+                pending.pop(future, None)
     if len(qualifying) < required and clock() >= deadline:
         deadline_expired = True
     continuing = []

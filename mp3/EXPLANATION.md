@@ -250,7 +250,7 @@ READ_LOCAL or INSTALL_IF_NEWER. It does not schedule replication or repair.
 | `._accept_loop` | Accept sockets, assign one accepted-request deadline, reserve bounded queue capacity or return bounded OVERLOADED | I; C6 |
 | `._worker`, `._finish` | Polls the bounded queue so stop wakes idle workers even when worker count exceeds queue capacity; drains accepted work on graceful stop, preserves task accounting on handler/close errors, and releases sockets/outstanding count in `finally` | I; C6 |
 | `._error_response`, `._reply_overloaded` | Validated request or bounded overload connection → explicit non-durable ERROR response; malformed identity cannot be trusted | I; C5/C6 |
-| `._validate_identity` | Request → None or INVALID_REQUEST reason; checks manifest, target, sender membership and current sender generation | I; C2/C5 |
+| `._validate_identity` | Request → None or rejection reason; checks manifest, target, sender membership/current generation and, for schema 2, fixed ownership by the five manifest successors before storage dispatch; schema-1 local compatibility is unchanged | I; C1/C2/C5 |
 | `._emit` | Request and receive/respond phase → professor terminal line plus optional structured log; key control chars escaped, values omitted | I; KD-17 primitive only |
 | `._process` | Valid request and absolute deadline → mapped storage response; passes same deadline to storage so admission and SQLite lock waits cannot restart the RPC budget | I; C3/C5/C6 |
 | `._handle` | Socket and deadline → fully validates, logs receipt, dispatches once, sends actual response only within the deadline, then closes | I; C5/C6 |
@@ -359,6 +359,11 @@ change the eight command guards.
 | `start()` | No inputs → this ready runtime; explicitly opens/recovers Store/context, configures logging, starts MembershipRuntime (the sole durable generation increment), then replica listener, then client, and finally marks local readiness. Any failure attempts cleanup while preserving the startup error | CLI `main`, context manager, tests; storage, membership, replica, rpc | I; KD-03/04/05/07/09/14/16 local epoch, C1–C6 |
 | `_cleanup_failed_start()` | No inputs → None; stops whichever services started and closes Store only when membership and replica workers joined; cleanup exceptions do not replace the original startup failure | `start` exception path; membership/replica/store | I; KD-03/07/14, C2/C3/C6 |
 | `call_replica(target_id, op, key, deadline, version?, value?)` | One prescribed target and absolute monotonic deadline → one `RpcOutcome`; under the call condition it checks admission, snapshots context/generation/client, and increments active-call accounting. It releases the lock before building/sending the request and decrements accounting in `finally`. A shutdown that starts after admission cannot invalidate the captured request identity; it does not gather owners or calculate a quorum | callers/tests; `new_request`, `ReplicaClient`, live membership table | I; KD-03/06/07/08/10/14/15/16, C3/C5/C6 |
+| `CoordinatorAdmission` | Runtime-issued identity-registered capability → captures the original absolute deadline, context, sender generation and operation ID for one admitted coordinator callback; reconstructed or completed tokens fail validation | `submit_coordinator`, `reserve_attempts`, `dispatch_owner` | I; KD-08/14/15, C6 |
+| `submit_coordinator(function, *args, deadline)` | An external callback and absolute deadline → bounded Future or explicit admission failure; admits only while ready, injects a one-use admission capability as the callback's first argument, and accounts the callback until completion | future protocol coordinators/tests; `CoordinatorResources` | I; KD-08/14/15, C6; no protocol coordinator |
+| `reserve_attempts(count, *, deadline, admission=None)` | Count and absolute deadline → atomic bounded attempt reservation; an external call requires open readiness, while a live callback token permits already-admitted work during graceful drain | future protocol coordinators/tests; `CoordinatorResources` | I; KD-08/14/15, C6 |
+| `dispatch_owner(..., admission=None)` | One target, op/key/phase/operation ID and deadline → one schema-2 owner call; checks fixed five-owner placement before dispatch and captures context/generation. During shutdown, only the matching live token may authorize its own operation's next phase | future protocol coordinators/tests; `ReplicaClient`, manifest, attempt executor | I; KD-02/08/14/15, C1/C5/C6; no coordinator |
+| `_admission_is_live_locked`, `_finish_coordinator_admission` | Token and child deadline → bool / terminal cleanup; requires object identity in the runtime registry, forbids deadlines beyond the admitted deadline, removes authority exactly once at callback completion | coordinator admission paths; `_calls` condition | I; C6 |
 | `stop(timeout)` | Nonnegative finite shutdown budget → `NodeShutdownReport`; atomically closes readiness and call admission under the same condition used by `call_replica`, then drains/forces replica work, stops membership, waits client calls and closes Store only after workers and calls are done. An incomplete stop can be retried; later reports refresh joins/work and release the DB lock after work exits | CLI signal path, context manager, tests | I; KD-07/08/14, C6 |
 | `_close_logger()` | No inputs → None; removes/closes this runtime's handlers | startup rollback and stop | I; KD-17 |
 | `__enter__`, `__exit__` | Context-manager entry starts; exit stops and raises if shutdown remains incomplete without an earlier exception | Python `with` users | I; KD-14, C6 |
@@ -372,6 +377,11 @@ this one node's local services bound successfully; peers may still be unavailabl
 On partial startup, started listeners and locks are released. If forced shutdown
 cannot join workers immediately, the Store stays open and a later `stop()` retry can
 finish cleanup; callers must not report clean shutdown before that succeeds.
+An admitted coordinator retains only the bounded authority it received at admission:
+shutdown rejects new callbacks, but an accepted callback may dispatch its next
+same-operation phase until the original deadline. Admission and dispatch release
+`_calls` before network I/O; worker drain keeps the Store open until accepted callback
+and replica work finish or are reported incomplete.
 `MembershipRuntime.stop()` reports thread joins and can retry a failed join; it
 skips joining a thread whose `start()` itself failed.
 
@@ -713,14 +723,14 @@ that issues Strong phases or decides client-facing Eventual results.
 | `ProtocolResult.__post_init__` | Validate status/value/version shape and canonical UUID4 operation ID | I; future coordinator result contract |
 | `RpcCompletion.__post_init__` | Require typed `RpcOutcome` and finite monotonic completion time | I; `collect_distinct` |
 | `QualifiedReply`, `OwnerFailure`, `QuorumCollection`, `OwnerCall`, `AttemptReport` | Carry response/request evidence, explicit failures, threshold result and any still-running owner calls | I; future coordinators |
-| `AttemptLedger` | Five distinct owner IDs → one validated per-owner state machine with terminal outcome and release callback | I; C6 shared tracking |
+| `AttemptLedger` | Five distinct owner IDs → one validated per-owner state machine with terminal outcome and release callback; `DURABLE_ACK` is a confirmed exact-version durable success distinct from `SUPERSEDED`, errors, and uncertain completion | I; C6 shared tracking |
 | `Schema2Activation.from_inventory`, `.from_file`, `.enabled_for` | Manifest and complete ten-identity, same-release schema inventory → explicit activation object; this is a deployment assertion, not a per-operation health check | I; approved rollout contract; local fixtures only |
 | `CapacityReservation.submit`, `.close`, `.remaining` | Reserved count and tasks → queued tasks or released unused slots; no unbounded thread/queue growth | I; KD-14/C6 |
 | `BoundedExecutor.reserve`, `.submit`, `._submit_reserved`, `._release_unused`, `._worker`, `._finish_job`, `._cancel_queued`, `.shutdown` | Fixed worker count, bounded queue and deadline → atomic capacity reservation, Future, explicit overload/timeout or shutdown report; exact active/queued/unsubmitted accounting | I; approved 16/32 coordinator and 16/64 attempt defaults |
 | `CoordinatorResources.reserve_attempts`, `.shutdown` | Node-owned worker groups and total shutdown budget → separate coordinator/attempt reservations and combined report | I; KD-14/C6 |
-| `dispatch_owner(client, node, request, *, deadline, expected_generation, executor, reservation=None, attempt_lease=None)` | One validated request → one Future-backed RPC with generation captured at dispatch; no retry and no quorum decision | I; NodeRuntime, future coordinators |
+| `dispatch_owner(client, node, request, *, manifest, deadline, expected_generation, executor, reservation=None, attempt_lease=None)` | One validated request → one Future-backed RPC with generation captured at dispatch; schema-2 requests must target one of the key's five manifest owners before a worker is queued; returns structured `OwnerDispatchError.failure` on local ownership rejection; no retry or quorum decision | I; NodeRuntime, future coordinators |
 | `_qualifies(phase, request, response)` | Phase and validated request/response → protocol-specific evidence bool: Strong at-least durable rules, Eventual exact-version W rule, or valid read result | I; approved KD-11/12 predicates, not a coordinator |
-| `collect_distinct(...)` | Exactly five prescribed owner calls, threshold, phase/context/operation and absolute deadline → `QuorumCollection`; validates request/response binding, counts each identity once, stops at threshold, and keeps Eventual PUT attempts in `continuing` even after W or when W is impossible | I; approved KD-08/11/12/15 shared collector |
+| `collect_distinct(...)` | Exactly five prescribed owner calls, threshold, phase/context/operation and absolute deadline → `QuorumCollection`; validates request/response binding, counts each identity once, stops at threshold or once terminal outcomes make it mathematically impossible, and keeps all accepted Eventual PUT attempts in `continuing` even when W is impossible | I; approved KD-08/11/12/15 shared collector |
 
 `QuorumCollection.continuing` is important: an Eventual PUT caller must supervise those
 owner futures until each attempt has a terminal outcome or the separate lease/shutdown
@@ -735,7 +745,9 @@ implementing the Eventual coordinator.
 approved protocol phase set. Schema 1 remains valid only for `phase="local"` and carries
 no operation ID. `ReplicaService` handles schema-2 READ_LOCAL/INSTALL_IF_NEWER through
 the existing Store methods only when passed a complete compatible-release activation;
-it never decides quorum success. `NodeRuntime` owns separate bounded coordinator and
+it independently rejects schema-2 requests addressed to a VM outside the key's five
+prescribed owners before storage access. Schema-1 local primitives retain their prior
+non-owner-compatible behavior. The service never decides quorum success. `NodeRuntime` owns separate bounded coordinator and
 outbound-attempt executors, can reserve outbound capacity, and can dispatch one schema-2
 owner call. Activation is supplied explicitly with `--schema2-inventory`; no operation
 contacts all ten VMs for a compatibility check. All paths still use the same NodeRuntime.

@@ -21,6 +21,7 @@ from mp3.config import MAX_VALUE_BYTES
 from mp3.framing import HEADER
 from mp3.membership import GossipEnvelope, Member, MemberState, MembershipService, MembershipTable
 from mp3.models import ConsistencyMode, Context, LocalStatus, Version
+from mp3.coordinator import Schema2Activation
 from mp3.replica import ReplicaService
 from mp3.ring import Endpoint, Manifest
 from mp3.rpc import (
@@ -140,6 +141,39 @@ class ReplicaIntegrationTests(RpcEnvironment):
                          (2, "eventual_read", RpcStatus.ERROR, "SCHEMA2_DISABLED"))
         self.assertEqual(self.store.read_local("schema2-disabled", context=CTX).status,
                          LocalStatus.NOT_FOUND)
+
+    def test_schema2_nonowner_install_is_rejected_before_storage_mutation(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "test-release", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        self.service.protocol_activation = Schema2Activation.from_inventory(
+            self.manifest, inventory)
+        key = next(f"replica-nonowner-{index}" for index in range(100)
+                   if "vm04" not in {node.vm_id for node in
+                                     self.manifest.owners(f"replica-nonowner-{index}")})
+        request = new_request(
+            manifest=self.manifest, sender_id="vm01", sender_generation=1,
+            target_id="vm04", epoch=1, mode=CTX.mode,
+            op=RpcOperation.INSTALL_IF_NEWER, key=key,
+            version=Version("eventual", 11, "vm01/1"), value=b"must not persist",
+            phase="eventual_put", schema=2, operation_id=new_operation_id())
+        response = self.raw_call(request)
+        self.assertEqual((response.status, response.error),
+                         (RpcStatus.ERROR, "NOT_PRESCRIBED_OWNER"))
+        self.assertEqual(self.store.read_local(key, context=CTX).status,
+                         LocalStatus.NOT_FOUND)
+
+    def test_schema1_local_replica_primitive_still_accepts_nonowner(self):
+        key = next(f"legacy-nonowner-{index}" for index in range(100)
+                   if "vm04" not in {node.vm_id for node in
+                                     self.manifest.owners(f"legacy-nonowner-{index}")})
+        version = Version("eventual", 12, "vm01/1")
+        response = self.response(self.make_request(
+            RpcOperation.INSTALL_IF_NEWER, key, version=version, value=b"legacy local"))
+        self.assertEqual(response.status, RpcStatus.INSTALLED)
+        self.assertEqual(self.store.read_local(key, context=CTX).record.value,
+                         b"legacy local")
 
     def test_actual_tcp_read_install_outcomes_and_empty_vs_missing(self):
         missing = self.response(self.make_request(RpcOperation.READ_LOCAL, "photo"))

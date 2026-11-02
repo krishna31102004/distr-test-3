@@ -17,7 +17,9 @@ import unittest
 from unittest import mock
 
 from mp3.membership import GossipEnvelope, Member, MemberState, MembershipTable
-from mp3.coordinator import RpcCompletion, Schema2Activation
+from mp3.coordinator import (
+    OwnerDispatchError, OwnerOutcome, RpcCompletion, Schema2Activation,
+)
 from mp3.attempts import AttemptLease
 from mp3.models import ConsistencyMode, Context, LocalStatus, Version
 from mp3.node import NodeRuntime, main as node_main
@@ -128,15 +130,18 @@ class NodeRuntimeTests(unittest.TestCase):
             for index in range(1, 11)
         }
         activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        key = "schema-two-key"
+        target_id = next(owner.vm_id for owner in self.manifest.owners(key)
+                         if owner.vm_id != "vm01")
         first = self.node("vm01", protocol_activation=activation).start()
-        second = self.node("vm02", protocol_activation=activation).start()
+        second = self.node(target_id, protocol_activation=activation).start()
         try:
-            self._wait_known_generations((first, second), ("vm01", "vm02"))
+            self._wait_known_generations((first, second), ("vm01", target_id))
             operation_id = new_operation_id()
             version = first.store.allocate_strong_version(
                 context=first.context, observed_max=None)
             write = first.dispatch_owner(
-                "vm02", RpcOperation.INSTALL_IF_NEWER, "schema-two-key",
+                target_id, RpcOperation.INSTALL_IF_NEWER, key,
                 deadline=time.monotonic() + 3, phase="strong_write",
                 operation_id=operation_id, version=version, value=b"remote bytes")
             written = write.future.result(timeout=4)
@@ -147,7 +152,7 @@ class NodeRuntimeTests(unittest.TestCase):
                               written.outcome.response.durable),
                              (RpcStatus.INSTALLED, version, True))
             read = first.dispatch_owner(
-                "vm02", RpcOperation.READ_LOCAL, "schema-two-key",
+                target_id, RpcOperation.READ_LOCAL, key,
                 deadline=time.monotonic() + 3, phase="strong_query",
                 operation_id=operation_id)
             result = read.future.result(timeout=4)
@@ -156,10 +161,176 @@ class NodeRuntimeTests(unittest.TestCase):
                               result.outcome.response.value),
                              (RpcStatus.FOUND, version, b"remote bytes"))
             self.assertEqual(second.store.read_local(
-                "schema-two-key", context=second.context).record.value, b"remote bytes")
+                key, context=second.context).record.value, b"remote bytes")
         finally:
             self.assertTrue(second.stop(timeout=4).clean)
             self.assertTrue(first.stop(timeout=4).clean)
+
+    def test_schema2_nonowner_dispatch_is_rejected_before_client_call(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "local-test-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        first = self.node("vm01", protocol_activation=activation).start()
+        try:
+            key = "nonowner-preflight"
+            owner_ids = {owner.vm_id for owner in first.owners(key)}
+            nonowner_id = next(f"vm{index:02d}" for index in range(1, 11)
+                               if f"vm{index:02d}" not in owner_ids)
+            with mock.patch.object(first.rpc_client, "call_replica",
+                                   wraps=first.rpc_client.call_replica) as rpc_call:
+                with self.assertRaises(OwnerDispatchError) as rejected:
+                    first.dispatch_owner(
+                        nonowner_id, RpcOperation.INSTALL_IF_NEWER, key,
+                        deadline=time.monotonic() + 2, phase="strong_write",
+                        operation_id=new_operation_id(),
+                        version=Version("strong", 3, "vm01/1"), value=b"must not send")
+            self.assertEqual(rejected.exception.failure.outcome,
+                             OwnerOutcome.NOT_PRESCRIBED_OWNER)
+            rpc_call.assert_not_called()
+        finally:
+            self.assertTrue(first.stop(timeout=4).clean)
+
+    def test_schema2_suspected_owner_remains_designated_and_attemptable(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "local-test-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        key = "suspected-owner-key"
+        target_id = next(owner.vm_id for owner in self.manifest.owners(key)
+                         if owner.vm_id != "vm01")
+        first = self.node("vm01", protocol_activation=activation).start()
+        second = self.node(target_id, protocol_activation=activation).start()
+        try:
+            self._wait_known_generations((first, second), ("vm01", target_id))
+            table = first.membership_runtime.table
+            rows = list(table.snapshot())
+            target_row = next(row for row in rows if row.vm_id == target_id)
+            replace_row(rows, Member(target_id, target_row.restart_generation,
+                                     target_row.incarnation, target_row.heartbeat,
+                                     MemberState.SUSPECTED))
+            sender_id = next(f"vm{index:02d}" for index in range(1, 11)
+                             if f"vm{index:02d}" not in {"vm01", target_id})
+            sender_row = next(row for row in rows if row.vm_id == sender_id)
+            replace_row(rows, Member(sender_id, 1, sender_row.incarnation,
+                                     sender_row.heartbeat, MemberState.ALIVE))
+            table.merge_gossip(GossipEnvelope(
+                self.manifest.fingerprint, sender_id, 1, tuple(rows)))
+            self.assertEqual(self._member(first, target_id).status, MemberState.SUSPECTED)
+            self.assertIn(target_id, {owner.vm_id for owner in first.owners(key)})
+
+            call = first.dispatch_owner(
+                target_id, RpcOperation.READ_LOCAL, key,
+                deadline=time.monotonic() + 3, phase="strong_query",
+                operation_id=new_operation_id())
+            result = call.future.result(timeout=4)
+            self.assertEqual(result.outcome.kind, RpcOutcomeKind.RESPONSE)
+            self.assertEqual(result.outcome.response.status, RpcStatus.NOT_FOUND)
+
+            self.assertTrue(second.stop(timeout=4).clean)
+            failed_owner_call = first.dispatch_owner(
+                target_id, RpcOperation.READ_LOCAL, key,
+                deadline=time.monotonic() + 3, phase="strong_query",
+                operation_id=new_operation_id())
+            failed_owner = failed_owner_call.future.result(timeout=4)
+            self.assertEqual(failed_owner.outcome.kind, RpcOutcomeKind.UNREACHABLE)
+            self.assertIn(target_id, {owner.vm_id for owner in first.owners(key)})
+        finally:
+            self.assertTrue(second.stop(timeout=4).clean)
+            self.assertTrue(first.stop(timeout=4).clean)
+
+    def test_admitted_coordinator_can_dispatch_second_phase_during_graceful_stop(self):
+        inventory = {
+            f"vm{index:02d}": {"release_id": "local-test-build", "schema_version": 2}
+            for index in range(1, 11)
+        }
+        activation = Schema2Activation.from_inventory(self.manifest, inventory)
+        key = "shutdown-between-phases"
+        target_id = next(owner.vm_id for owner in self.manifest.owners(key)
+                         if owner.vm_id != "vm01")
+        first = self.node("vm01", protocol_activation=activation).start()
+        second = self.node(target_id, protocol_activation=activation).start()
+        try:
+            self._wait_known_generations((first, second), ("vm01", target_id))
+            phase_one_done = threading.Event()
+            allow_phase_two = threading.Event()
+            admission_box = []
+
+            def two_phase_harness(admission):
+                admission_box.append(admission)
+                forged = type(admission)(admission.deadline, admission.context,
+                                          admission.sender_generation,
+                                          admission.operation_id)
+                with self.assertRaises(RuntimeError):
+                    first.dispatch_owner(
+                        target_id, RpcOperation.READ_LOCAL, key,
+                        deadline=admission.deadline, phase="strong_query",
+                        operation_id=admission.operation_id, admission=forged)
+                query = first.dispatch_owner(
+                    target_id, RpcOperation.READ_LOCAL, key,
+                    deadline=admission.deadline, phase="strong_query",
+                    operation_id=admission.operation_id, admission=admission)
+                queried = query.future.result(timeout=4)
+                self.assertEqual(queried.outcome.response.status, RpcStatus.NOT_FOUND)
+                phase_one_done.set()
+                if not allow_phase_two.wait(4):
+                    raise TimeoutError("test did not release phase two")
+                version = first.store.allocate_strong_version(
+                    context=admission.context, observed_max=None)
+                write = first.dispatch_owner(
+                    target_id, RpcOperation.INSTALL_IF_NEWER, key,
+                    deadline=admission.deadline, phase="strong_write",
+                    operation_id=admission.operation_id, version=version,
+                    value=b"phase two survived shutdown admission closure",
+                    admission=admission)
+                return write.future.result(timeout=4)
+
+            operation = first.submit_coordinator(
+                two_phase_harness, deadline=time.monotonic() + 8)
+            self.assertIsNotNone(operation)
+            self.assertTrue(phase_one_done.wait(4), "phase one did not finish")
+
+            stop_started = threading.Event()
+            stopped = []
+
+            def stop_first():
+                stop_started.set()
+                stopped.append(first.stop(timeout=7))
+
+            stopper = threading.Thread(target=stop_first, daemon=True)
+            stopper.start()
+            self.assertTrue(stop_started.wait(1))
+            wait_until(lambda: not first.ready, description="shutdown admission closure")
+            with self.assertRaises(RuntimeError):
+                first.submit_coordinator(lambda _admission: None,
+                                         deadline=time.monotonic() + 2)
+            allow_phase_two.set()
+
+            second_phase = operation.result(timeout=6)
+            self.assertEqual(second_phase.outcome.kind, RpcOutcomeKind.RESPONSE)
+            self.assertEqual(second_phase.outcome.response.status, RpcStatus.INSTALLED)
+            stopper.join(timeout=7)
+            self.assertFalse(stopper.is_alive())
+            self.assertTrue(stopped[0].clean, stopped[0])
+            self.assertTrue(stopped[0].store_closed)
+
+            admission = admission_box[0]
+            with self.assertRaises(RuntimeError):
+                first.dispatch_owner(
+                    target_id, RpcOperation.READ_LOCAL, key,
+                    deadline=admission.deadline, phase="strong_query",
+                    operation_id=admission.operation_id, admission=admission)
+        finally:
+            if "allow_phase_two" in locals():
+                allow_phase_two.set()
+            if "stopper" in locals():
+                stopper.join(timeout=8)
+            self.assertTrue(second.stop(timeout=4).clean)
+            if (first.store is not None and
+                    (first._shutdown_report is None or not first._shutdown_report.clean)):
+                first.stop(timeout=4)
 
     def test_eventual_schema2_dispatch_uses_attempt_lease_over_loopback(self):
         inventory = {

@@ -552,6 +552,28 @@ W and when W became impossible. The fix keeps unfinished Eventual calls in
 `QuorumCollection.continuing`, with regression tests for both paths. The reviewer
 made no source edits. The main agent reran the full suite after the fix.
 
+### Final Batch 1 corrections — reviewed, local verification only
+
+Four small gaps were fixed without building Strong or Eventual PUT/GET. First, when
+a coordinator was accepted before shutdown, the node now gives that callback a
+registered one-operation pass. The callback may use it to send its next phase under
+the same deadline and identity, even after new work has been blocked. Second, both
+the sender and receiving replica check that a schema-2 request goes to one of the
+key's five assigned owners. A suspected or unreachable owner remains on that list;
+we do not substitute another VM. Third, the collector stops waiting once failures
+make its required number of replies impossible. If the operation is an Eventual PUT,
+its already accepted attempts are still kept for later completion. Finally, the
+attempt record can now clearly say `DURABLE_ACK`, separate from “a higher version is
+already stored” (`SUPERSEDED`) or an uncertain result.
+
+The main agent ran the full suite under Python 3.12.4: **163 passed in 19.624s**.
+The independent reviewer separately ran the full suite: **163 passed in 19.287s**,
+and the focused coordinator/runtime/replica tests: **72 passed in 17.818s**. The
+reviewer found no supported defect and made no code changes. These were local tests
+using temporary databases and loopback sockets, not university VM tests. Step 3
+Batch 1 shared infrastructure is VERIFIED; Strong ABD and Eventual-noRR coordinators
+are still NOT_IMPLEMENTED.
+
 ### What Batch 1 does not implement
 
 Strong ABD phases, Eventual-noRR GET/PUT coordinators, Eventual-RR/read repair,
