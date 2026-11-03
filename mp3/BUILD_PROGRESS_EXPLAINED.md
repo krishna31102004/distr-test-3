@@ -825,7 +825,7 @@ GET also does not repair it; Eventual-RR is later work.
   graceful shutdown, concurrent coordinators, local TCP traffic and subprocess
   SIGKILL/restart.
 
-Final verification on Python 3.12.4:
+Original Batch 3 acceptance verification on Python 3.12.4:
 
 - Main full suite: **198 passed in 99.114 seconds**.
 - Independent reviewer full suite: **198 passed in 107.886 seconds**.
@@ -838,6 +838,27 @@ Final verification on Python 3.12.4:
 
 These checks use temporary SQLite files, real loopback TCP and disposable local
 subprocesses. They are not ten-VM or university-VM results.
+
+### Final Eventual GET dispatch correction
+
+If one owner cannot even be contacted because the local dispatch step fails, that
+owner counts as a failed attempt. It does not stop the coordinator from asking the
+other four owners. For example, an R=2 read can still succeed if two of those four
+reply with valid records. With R=5, one failed owner makes success impossible, so
+the coordinator reports an error instead of waiting for the whole timeout or calling
+another, unprescribed machine. If all five dispatches fail, the collector reports the
+five failures directly; it does not make up fake NOT_FOUND replies. An empty value
+still differs from an explicit NOT_FOUND response. Reads remain read-only and use the
+same fixed five owners.
+
+This correction changes only Eventual GET dispatch and its shared failure accounting;
+Strong ABD and Eventual PUT are unchanged. The focused suite now passes **25 tests in
+73.176 seconds**; the Strong/history suite passes **14 tests in 28.738 seconds**; and
+the full suite passes **202 tests in 118.088 seconds**. Smoke, both help commands,
+compileall and `git diff --check` exited successfully. The independent reviewer passed
+the focused suite (**25 tests in 68.561 seconds**) and full suite (**202 tests in
+116.737 seconds**) and found no blocker. These are local tests, not university VM
+verification.
 
 ### What remains
 

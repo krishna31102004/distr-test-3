@@ -62,10 +62,13 @@ python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 ```
 
-On November 2, 2026, the final main-agent full run passed **198 tests in 99.114s**;
-the independent reviewer passed **198 tests in 107.886s**. The focused Eventual
-suite passed **21 tests** (main: 56.905s; reviewer: 55.468s), and the focused
-Strong/history suite passed **14 tests in 30.756s** (main). The suite uses temporary
+The original Batch 3 acceptance baseline on November 2 passed **198 tests** (main:
+99.114s; independent reviewer: 107.886s). The final Eventual GET dispatch correction
+adds four regressions. Current correction verification on Python 3.12.4 passed
+**202 tests in 118.088s** (main), including **25 Eventual tests in 73.176s** and
+**14 Strong/history tests in 28.738s**. The independent reviewer also passed **202
+tests in 116.737s**, including **25 Eventual tests in 68.561s**, and found no blocker.
+The suite uses temporary
 SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
 loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
 logical VMs on loopback and also tests a separate-process crash/restart path, plus

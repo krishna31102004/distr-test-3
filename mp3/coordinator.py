@@ -643,6 +643,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                      manifest: Manifest, required: int, operation_id: str,
                      phase: str, context: Context, deadline: float,
                      preflight_failures: Iterable[OwnerFailure] = (),
+                     key: str | None = None,
                      clock=time.monotonic) -> QuorumCollection:
     """Collect phase-qualified evidence once per prescribed stable VM identity."""
     owner_rows = tuple(owners)
@@ -659,8 +660,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
         raise ValueError("deadline must be a finite monotonic timestamp")
     rows = tuple(calls)
-    if not rows:
-        raise ValueError("collector requires one call for each of the five owners")
     local_failures = tuple(preflight_failures)
     local_failure_by_owner = {}
     for failure in local_failures:
@@ -668,7 +667,16 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                 or failure.owner_id in local_failure_by_owner):
             raise ValueError("preflight failures must identify distinct prescribed owners")
         local_failure_by_owner[failure.owner_id] = failure
-    first_key = rows[0].request.key
+    if rows:
+        first_key = rows[0].request.key
+        if key is not None and key != first_key:
+            raise ValueError("explicit key does not match dispatched owner requests")
+    elif isinstance(key, str):
+        # A complete set of local preflight failures is terminal evidence too;
+        # no synthetic network call should be fabricated just to collect it.
+        first_key = key
+    else:
+        raise ValueError("collector requires calls or an explicit key with failures")
     prescribed = tuple(node.vm_id for node in manifest.owners(first_key))
     if set(owner_ids) != set(prescribed):
         raise ValueError("collector owners must be the five prescribed ring owners")

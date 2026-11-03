@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING
 from .attempts import AttemptLease
 from .config import MAX_VALUE_BYTES
 from .coordinator import (
-    OperationStatus, OwnerCall, OwnerFailure, OwnerOutcome, ProtocolResult, RpcCompletion,
+    OperationStatus, OwnerCall, OwnerDispatchError, OwnerFailure, OwnerOutcome,
+    ProtocolResult, RpcCompletion,
     collect_distinct,
 )
 from .models import ConsistencyMode, Record
@@ -438,12 +439,14 @@ class EventualNoRRCoordinator:
             return self._result(OperationStatus.OVERLOADED, operation_id,
                                 error="cannot reserve read attempts")
         try:
-            calls = self._dispatch(admission, owners, reservation, key,
-                                   RpcOperation.READ_LOCAL, "eventual_read", None, b"")
+            calls, preflight_failures = self._dispatch(
+                admission, owners, reservation, key,
+                RpcOperation.READ_LOCAL, "eventual_read", None, b"")
             collection = collect_distinct(
                 calls, owners=owners, manifest=self.runtime.manifest,
                 required=required, operation_id=operation_id,
-                phase="eventual_read", context=context, deadline=deadline)
+                phase="eventual_read", context=context, deadline=deadline,
+                preflight_failures=preflight_failures, key=key)
             if not collection.reached:
                 return self._result(
                     self._failure_status(collection), operation_id,
@@ -469,13 +472,27 @@ class EventualNoRRCoordinator:
 
     def _dispatch(self, admission, owners, reservation, key, op, phase, version, value):
         calls = []
+        preflight_failures = []
         for owner in owners:
-            calls.append(self.runtime.dispatch_owner(
-                owner.vm_id, op, key, deadline=admission.deadline,
-                reservation=reservation, phase=phase,
-                operation_id=admission.operation_id, version=version,
-                value=value, admission=admission))
-        return tuple(calls)
+            try:
+                calls.append(self.runtime.dispatch_owner(
+                    owner.vm_id, op, key, deadline=admission.deadline,
+                    reservation=reservation, phase=phase,
+                    operation_id=admission.operation_id, version=version,
+                    value=value, admission=admission))
+            except Exception as error:
+                if isinstance(error, OwnerDispatchError):
+                    failure = error.failure
+                    if failure.owner_id != owner.vm_id:
+                        failure = OwnerFailure(
+                            owner.vm_id, OwnerOutcome.ERROR,
+                            "dispatch failure identified a different owner")
+                else:
+                    outcome = (OwnerOutcome.TIMEOUT if isinstance(error, TimeoutError)
+                               else OwnerOutcome.ERROR)
+                    failure = OwnerFailure(owner.vm_id, outcome, str(error))
+                preflight_failures.append(failure)
+        return tuple(calls), tuple(preflight_failures)
 
     @staticmethod
     def _failure_status(collection) -> OperationStatus:

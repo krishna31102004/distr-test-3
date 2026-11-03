@@ -14,7 +14,8 @@ from mp3.coordinator import OperationStatus
 from mp3.eventual import EventualNoRRCoordinator
 from mp3.models import ConsistencyMode, Record, Version
 from mp3.node import NodeRuntime
-from mp3.rpc import RpcOperation, RpcOutcome, RpcOutcomeKind
+from mp3.rpc import (ReplicaResponse, RpcOperation, RpcOutcome, RpcOutcomeKind,
+                     RpcStatus)
 from mp3.tests.test_strong import _manifest
 from mp3.coordinator import Schema2Activation
 
@@ -77,9 +78,21 @@ class EventualIntegrationTests(unittest.TestCase):
                 pass
         self.temp.cleanup()
 
+    @staticmethod
+    def _read_response(target, request, expected_generation, *, status, version=None,
+                       value=b""):
+        response = ReplicaResponse(
+            request_id=request.request_id, manifest_id=request.manifest_id,
+            sender_id=target.vm_id, sender_generation=expected_generation,
+            target_id=request.sender_id, epoch=request.epoch, mode=request.mode,
+            op=request.op, phase=request.phase, status=status,
+            present=(status == RpcStatus.FOUND), version=version, value=value,
+            schema=2, operation_id=request.operation_id)
+        return RpcOutcome(RpcOutcomeKind.RESPONSE, response)
+
     def test_put_reserves_five_and_propagates_after_w_without_blocking_client(self):
         key = "eventual-background-fanout"
-        owners, owner_ids, coordinator = self.for_key(key)
+        _, owner_ids, coordinator = self.for_key(key)
         client = coordinator.rpc_client
         actual = client.call_replica
         release = threading.Event()
@@ -447,6 +460,152 @@ class EventualIntegrationTests(unittest.TestCase):
                     self.assertNotIn(failed_owner, result.qualifying_owners)
                 else:
                     self.assertEqual(result.qualifying_owners, ())
+
+    def test_get_dispatch_failure_still_allows_r2_and_selects_first_r_maximum(self):
+        key = "eventual-get-preflight-r2"
+        _, owner_ids, coordinator = self.for_key(key)
+        failed_owner = owner_ids[0]
+        slow_release = threading.Event()
+        attempted = []
+        operations = []
+        original_dispatch = coordinator.dispatch_owner
+        versions = {
+            owner_ids[1]: Version("eventual", 8, f"{owner_ids[1]}/1"),
+            owner_ids[2]: Version("eventual", 7, f"{owner_ids[2]}/1"),
+            owner_ids[3]: Version("eventual", 100, f"{owner_ids[3]}/1"),
+            owner_ids[4]: Version("eventual", 101, f"{owner_ids[4]}/1"),
+        }
+
+        def dispatch(target_id, *args, **kwargs):
+            attempted.append(target_id)
+            if target_id == failed_owner:
+                raise RuntimeError("injected synchronous dispatch failure")
+            return original_dispatch(target_id, *args, **kwargs)
+
+        def answer(target, request, **kwargs):
+            operations.append(request.op)
+            if target.vm_id in owner_ids[3:]:
+                slow_release.wait(3)
+            return self._read_response(
+                target, request, kwargs["expected_target_generation"],
+                status=RpcStatus.FOUND, version=versions[target.vm_id],
+                value=target.vm_id.encode())
+
+        try:
+            with mock.patch.object(coordinator, "dispatch_owner", side_effect=dispatch), \
+                    mock.patch.object(coordinator.rpc_client, "call_replica", side_effect=answer):
+                result = EventualNoRRCoordinator(
+                    coordinator, read_quorum=2).eventual_get(
+                        key, deadline=time.monotonic() + 5)
+            self.assertEqual(result.status, OperationStatus.OK, result)
+            self.assertEqual(result.version, versions[owner_ids[1]])
+            self.assertEqual(result.value, owner_ids[1].encode())
+            self.assertEqual(set(attempted), set(owner_ids))
+            self.assertEqual(len(attempted), 5)
+            self.assertEqual(operations, [RpcOperation.READ_LOCAL] * len(operations))
+            self.assertNotIn(RpcOperation.INSTALL_IF_NEWER, operations)
+        finally:
+            slow_release.set()
+
+    def test_get_dispatch_failure_makes_r5_impossible_without_waiting_for_deadline(self):
+        key = "eventual-get-preflight-r5"
+        _, owner_ids, coordinator = self.for_key(key)
+        failed_owner = owner_ids[0]
+        attempted = []
+        replied = set()
+        original_dispatch = coordinator.dispatch_owner
+        def dispatch(target_id, *args, **kwargs):
+            attempted.append(target_id)
+            if target_id == failed_owner:
+                raise RuntimeError("injected synchronous dispatch failure")
+            call = original_dispatch(target_id, *args, **kwargs)
+            completion = call.future.result(timeout=2)
+            self.assertEqual(completion.outcome.kind, RpcOutcomeKind.RESPONSE)
+            self.assertEqual(completion.outcome.response.status, RpcStatus.NOT_FOUND)
+            replied.add(target_id)
+            return call
+
+        def answer(target, request, **kwargs):
+            return self._read_response(
+                target, request, kwargs["expected_target_generation"],
+                status=RpcStatus.NOT_FOUND)
+
+        started = time.monotonic()
+        with mock.patch.object(coordinator, "dispatch_owner", side_effect=dispatch), \
+                mock.patch.object(coordinator.rpc_client, "call_replica", side_effect=answer):
+            result = EventualNoRRCoordinator(
+                coordinator, read_quorum=5).eventual_get(
+                    key, deadline=time.monotonic() + 10)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.status, OperationStatus.ERROR, result)
+        self.assertIsNone(result.value)
+        self.assertEqual(set(attempted), set(owner_ids))
+        self.assertEqual(len(attempted), 5)
+        self.assertEqual(replied, set(owner_ids[1:]))
+        self.assertLess(elapsed, 2.0, "impossible R=5 waited on the operation deadline")
+
+    def test_get_all_synchronous_dispatch_failures_are_explicit_and_release_resources(self):
+        key = "eventual-get-preflight-all"
+        _, owner_ids, coordinator = self.for_key(key)
+        attempted = []
+
+        def fail_all(target_id, *args, **kwargs):
+            attempted.append(target_id)
+            raise RuntimeError("injected local dispatch failure")
+
+        with mock.patch.object(coordinator, "dispatch_owner", side_effect=fail_all), \
+                mock.patch.object(coordinator.rpc_client, "call_replica") as rpc_call:
+            result = EventualNoRRCoordinator(
+                coordinator, read_quorum=2).eventual_get(
+                    key, deadline=time.monotonic() + 5)
+        self.assertEqual(result.status, OperationStatus.ERROR, result)
+        self.assertIsNone(result.value)
+        self.assertFalse(result.completion_unknown)
+        self.assertEqual(set(attempted), set(owner_ids))
+        self.assertEqual(len(attempted), 5)
+        rpc_call.assert_not_called()
+        report = coordinator.stop(timeout=5)
+        self.assertTrue(report.clean, report)
+
+    def test_get_dispatch_failure_distinguishes_empty_value_from_not_found(self):
+        key = "eventual-get-preflight-empty"
+        _, owner_ids, coordinator = self.for_key(key)
+        failed_owner = owner_ids[0]
+        release = threading.Event()
+        operations = []
+        original_dispatch = coordinator.dispatch_owner
+
+        def dispatch(target_id, *args, **kwargs):
+            if target_id == failed_owner:
+                raise RuntimeError("injected synchronous dispatch failure")
+            return original_dispatch(target_id, *args, **kwargs)
+
+        def answer(target, request, **kwargs):
+            operations.append(request.op)
+            if target.vm_id in owner_ids[3:]:
+                release.wait(3)
+            if target.vm_id == owner_ids[1]:
+                return self._read_response(
+                    target, request, kwargs["expected_target_generation"],
+                    status=RpcStatus.FOUND,
+                    version=Version("eventual", 9, f"{owner_ids[1]}/1"), value=b"")
+            return self._read_response(
+                target, request, kwargs["expected_target_generation"],
+                status=RpcStatus.NOT_FOUND)
+
+        try:
+            with mock.patch.object(coordinator, "dispatch_owner", side_effect=dispatch), \
+                    mock.patch.object(coordinator.rpc_client, "call_replica", side_effect=answer):
+                result = EventualNoRRCoordinator(
+                    coordinator, read_quorum=2).eventual_get(
+                        key, deadline=time.monotonic() + 5)
+            self.assertEqual(result.status, OperationStatus.OK, result)
+            self.assertEqual(result.value, b"")
+            self.assertEqual(result.version, Version("eventual", 9, f"{owner_ids[1]}/1"))
+            self.assertEqual(operations, [RpcOperation.READ_LOCAL] * len(operations))
+            self.assertNotIn(RpcOperation.INSTALL_IF_NEWER, operations)
+        finally:
+            release.set()
 
     def test_lost_ack_after_commit_is_uncertain_and_not_quorum_evidence(self):
         key = "eventual-lost-ack"

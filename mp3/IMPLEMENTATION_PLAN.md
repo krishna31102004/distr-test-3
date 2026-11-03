@@ -5,8 +5,9 @@ Prepared October 22, 2026; roadmap reconciled with the local October 21 specific
 reviewed. Step 3 design KD-11/KD-12 and scoped KD-08/10/14/15 refinements were
 approved October 31, 2026. Step 3 Batch 1 shared infrastructure and Batch 2 Strong
 ABD and Batch 3 Eventual-noRR passed independent local review. The final main and
-reviewer full suites each passed 198 tests. This is not ten-VM deployment
-verification.** Read AGENTS.md and
+reviewer full suites for the final Eventual GET correction each passed 202 tests
+(main: 118.088s; reviewer: 116.737s). The earlier Batch 3 baseline was 198 tests.
+This is not ten-VM deployment verification.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
 completed so far is local storage/versioning, fixed ring/membership/recovery,
@@ -1402,3 +1403,40 @@ subprocess tests. No university VM or ten-VM deployment was tested. E-01 is VERI
 for these local acceptance criteria. Batch 4 adversarial integration,
 Eventual-RR/read repair, mode switching, final commands, VM deployment, benchmarks,
 report and demo readiness remain future work.
+
+### Eventual GET dispatch-failure follow-up — November 2, 2026
+
+The final GET liveness correction records a synchronous dispatch failure against its
+prescribed owner and continues dispatching each remaining owner. The shared collector
+can now handle the all-five-preflight-failed case without inventing an RPC call: it
+requires the explicit key, validates that the supplied owners are exactly that key's
+five manifest owners, and requires one distinct terminal preflight failure for each.
+When some calls were submitted, the collector still requires a complete one-call-or-
+failure accounting for those same five identities. The first-R selection, deadline,
+fixed-owner set, response qualification and no-repair behavior are unchanged. Strong
+ABD dispatch logic was inspected and not modified.
+
+Regression tests cover R=2 success despite one failed dispatch, R=5 impossible quorum
+without waiting for a distant deadline, all-five synchronous failures with clean
+resource release, and an empty value paired with explicit NOT_FOUND. Exact focused,
+Strong, full-suite, smoke/help and compile results for this correction are recorded
+in the follow-up verification subsection below.
+
+### Final Eventual GET correction verification — November 2, 2026
+
+- Main, Python 3.12.4: `python3 -B -m unittest mp3.tests.test_eventual -v` —
+  **25 passed in 73.176s**; `python3 -B -m unittest mp3.tests.test_strong
+  mp3.tests.test_history_checker -v` — **14 passed in 28.738s**; full suite —
+  **202 passed in 118.088s**.
+- Main: `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` each exited 0. Smoke reports the expected `KV NOT_IMPLEMENTED`.
+- Independent GPT-6 Luna/high reviewer: focused Eventual suite — **25 passed in
+  68.561s**; full suite — **202 passed in 116.737s**. Review confirmed all five
+  prescribed dispatches are attempted, one-call-or-failure coverage is enforced, the
+  all-failed case does not synthesize responses, and first-R response validation is
+  preserved. The reviewer found no blocker; Strong dispatch is unchanged and its
+  quorum regression tests passed in the full suite.
+- The focused correction gate is VERIFIED locally, with no reviewer blocker.
+- The reviewed baseline was 198 tests; this correction adds four Eventual GET
+  regressions. These are local results only, not ten-VM evidence.
