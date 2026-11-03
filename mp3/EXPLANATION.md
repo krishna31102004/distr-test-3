@@ -911,3 +911,25 @@ tests cover queued-after-W starts, foreground queue/allocation expiry, overload,
 shutdown draining, lost acknowledgments, stale generation, no-read-repair, and
 concurrent coordinators. Final test evidence is recorded in `IMPLEMENTATION_PLAN.md`.
 These are local checks only; no university VM or ten-VM deployment was tested.
+
+## Step 3 Batch 4 — adversarial protocol integration tests
+
+`tests/test_protocol_adversarial.py` adds a cross-protocol harness built from fresh
+`NodeRuntime` instances, a validated ten-VM loopback manifest, schema-2 activation,
+temporary SQLite databases, and per-test cleanup. It does not change production
+behavior.
+
+| Test helper or test | Inputs / outputs and behavior | Callers and dependencies | Status |
+|---|---|---|---|
+| `ProtocolAdversarialTests.setUp() -> None` | Creates a temporary directory, free loopback manifest, schema-2 inventory, and mode-keyed node registry | `unittest`; `test_strong.py::_manifest`; `Schema2Activation` | IMPLEMENTED; local tests |
+| `_node(vm_id: str, mode: ConsistencyMode, **limits) -> NodeRuntime` | Creates an isolated node with separate database and bounded worker settings | `_start`; `NodeRuntime` | IMPLEMENTED; local tests |
+| `_start(vm_ids, mode, *, limits=None) -> None` | Starts selected logical VMs and waits with a bounded monotonic deadline for membership generations to converge | Both integration cases; membership and TCP services | IMPLEMENTED; local tests |
+| `_stop_nodes() -> None` | Stops every started runtime with bounded cleanup; registered as test cleanup | `unittest.addCleanup` | IMPLEMENTED; local tests |
+| `test_three_coordinator_strong_history_is_linearizable()` | Barrier-starts three Strong PUTs and three GETs from three coordinator identities, records `HistoryEntry` intervals and result evidence, then checks the actual history with the existing bounded checker | `NodeRuntime.strong_put/get`; `tests/history_checker.py`; KD-11 | IMPLEMENTED; local loopback; bounded-history evidence only |
+| `_assert_bounded_coordinator_capacity(mode: ConsistencyMode) -> None` | In a fresh mode-specific cluster, blocks one admitted operation, fills the single queue slot, confirms a third operation returns OVERLOADED, releases the gate, and checks both coordinator and outbound capacity drain | Strong/Eventual APIs; `CoordinatorResources`; KD-08/14/15 | IMPLEMENTED; local loopback |
+| `test_bounded_coordinator_admission_in_strong_cluster()` | Runs the bounded-admission scenario with an explicitly bootstrapped Strong cluster | `_assert_bounded_coordinator_capacity`; KD-11 | IMPLEMENTED; local loopback |
+| `test_bounded_coordinator_admission_in_eventual_cluster()` | Runs the same resource scenario in a separately bootstrapped Eventual-noRR cluster and checks all five fanout outcomes are durable | `_assert_bounded_coordinator_capacity`; KD-12 | IMPLEMENTED; local loopback |
+
+This batch adds no production functions and changes no consistency protocol. The full
+test commands, reviewer findings, and exact verification results are recorded in
+`IMPLEMENTATION_PLAN.md` and `BUILD_PROGRESS_EXPLAINED.md` after review.

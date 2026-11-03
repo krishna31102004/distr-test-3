@@ -4,10 +4,10 @@ Prepared October 22, 2026; roadmap reconciled with the local October 21 specific
 **Current gate: Step 2 Batches 1–4 local foundation is VERIFIED and independently
 reviewed. Step 3 design KD-11/KD-12 and scoped KD-08/10/14/15 refinements were
 approved October 31, 2026. Step 3 Batch 1 shared infrastructure and Batch 2 Strong
-ABD and Batch 3 Eventual-noRR passed independent local review. The final main and
-reviewer full suites for the final Eventual GET correction each passed 202 tests
-(main: 118.088s; reviewer: 116.737s). The earlier Batch 3 baseline was 198 tests.
-This is not ten-VM deployment verification.** Read AGENTS.md and
+ABD and Batch 3 Eventual-noRR passed independent local review. Step 3 Batch 4 adds
+adversarial integration coverage and is VERIFIED for the local gate: main passed
+205 tests in 125.887s and independent reviewer passed 205 in 125.888s. This remains
+local verification, not ten-VM deployment evidence.** Read AGENTS.md and
 KEY_DECISIONS.md before work. Krishna's
 C1–C6 contract approval and accepted KD directions are recorded there. The scope
 completed so far is local storage/versioning, fixed ring/membership/recovery,
@@ -100,8 +100,8 @@ are approved as C1/C2 contracts; their implementations remain future work.
 - **Work / owners:** Design approved October 31. Batch 1 implements common RPC,
   scheduler, collector, leases and durable Strong tag allocation. Krishna's Strong
   coordinator (A-01) and Juhi's Eventual-noRR coordinator (E-01) are implemented
-  and independently verified for local operation. Batch 4 still requires adversarial
-  integration before the local Step 3 gate; neither local result establishes ten-VM
+  and independently verified for local operation. Batch 4 adversarial integration
+  tests passed main and independent review locally; no result establishes ten-VM
   readiness.
 - **Approved before implementation:** KD-11/12 plus scoped KD-08/10/14/15 phase,
   allocation and contract refinements. KD-13/full KD-16 and final CLI/logging choices
@@ -162,7 +162,9 @@ are approved as C1/C2 contracts; their implementations remain future work.
 **Current task gate:** Batches 1–4 provide the locally reviewed storage/version,
 ring/membership, single-replica RPC, and integrated local node lifecycle foundations.
 Step 3 Batch 1 adds shared coordinator primitives; Batch 2 adds Strong ABD; Batch 3
-adds Eventual-noRR, now VERIFIED for local acceptance. Preserve approved KD-11
+adds Eventual-noRR, VERIFIED for local acceptance. Step 3 Batch 4 is VERIFIED for
+the local adversarial integration gate, with 205 passing main and reviewer tests.
+Preserve approved KD-11
 and KD-12 directions unless a concrete specification conflict or serious correctness
 issue appears. Eventual-RR/KD-13, full KD-16 and final KD-17 remain for Step 4; KD-18
 remains for Step 6.
@@ -1440,3 +1442,51 @@ in the follow-up verification subsection below.
 - The focused correction gate is VERIFIED locally, with no reviewer blocker.
 - The reviewed baseline was 198 tests; this correction adds four Eventual GET
   regressions. These are local results only, not ten-VM evidence.
+
+## Step 3 Batch 4 — adversarial protocol integration (verified locally, Nov 2, 2026)
+
+The accepted starting point is Batch 3 commit `fc5ca3d99ff06bce2deca4a0f82f8a58f2e2093e`.
+This batch adds `tests/test_protocol_adversarial.py`; no production code, MP1/MP2
+source, or `SPEC.md` changed. The test helper creates fresh schema-2 loopback nodes
+with temporary SQLite databases and waits for membership generation convergence.
+
+The new tests add (1) a seeded, barrier-started history containing three Strong PUTs
+and three GETs from three coordinator identities on the same key, checked by the
+existing bounded register-history checker; and (2) bounded coordinator admission
+tests in separately bootstrapped Strong and Eventual-noRR clusters. Each capacity
+test holds an accepted operation at an event-controlled gate, fills the one-entry
+queue, checks that a third short-deadline operation returns OVERLOADED, releases the
+gate, and checks the accepted operations and their resource accounting. Eventual
+reports must show five durable per-owner acknowledgments. Strong outbound cleanup is
+waited for with a bounded deadline because the protocol can return after Q=3 while
+minority calls complete.
+
+The existing `test_strong.py`, `test_eventual.py`, `test_node_runtime.py`, and
+`test_coordinator.py` suites remain part of the adversarial evidence: they cover
+real loopback RPC/SQLite, independent SIGKILL/restart processes, partial/lost writes,
+generation fencing, concurrent histories, R/W configurations, dispatch failures,
+leases, no-repair reads, overload, and shutdown. Those earlier tests were not
+rewritten by this batch.
+
+Main verification on Python 3.12.4:
+
+- `python3 -B -m unittest discover -s mp3/tests -v` — **205 passed in 125.887s**.
+- `python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v`
+  — **14 passed in 30.047s**.
+- `python3 -B -m unittest mp3.tests.test_eventual -v` — **25 passed in 72.193s**.
+- `python3 -B -m unittest mp3.tests.test_protocol_adversarial -v` — **3 passed in
+  8.276s**.
+- `python3 -B -m mp3 --smoke` — exit 0; reports `KV NOT_IMPLEMENTED` as intended.
+- `python3 -B -m mp3 --help`, `python3 -B -m mp3.node --help`,
+  `python3 -B -m compileall -q mp3`, and `git diff --check` — each exited 0.
+- Independent review: focused suite passed **3/3 in 8.252s**; full suite passed
+  **205 in 125.888s**. The reviewer requested
+  stricter assertions that Strong PUTs cannot be treated as failed no-ops and that
+  successful Eventual propagation has five `DURABLE_ACK` outcomes. A bounded wait
+  was added for Strong's post-quorum minority RPC cleanup. Full independent review
+  found no remaining correctness or scope blocker. These regression-quality fixes
+  changed tests only; no production defect was demonstrated.
+
+All these checks are local. Ten-VM deployment, university-VM fault schedules, and
+the broader F-01 remote acceptance gate remain unverified. No production defect has
+been demonstrated in this batch.

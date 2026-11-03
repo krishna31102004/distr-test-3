@@ -58,16 +58,20 @@ the repository root:
 python3 -B -m unittest discover -s mp3/tests -v
 python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v
 python3 -B -m unittest mp3.tests.test_eventual -v
+python3 -B -m unittest mp3.tests.test_protocol_adversarial -v
 python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
+python3 -B -m mp3.node --help
+python3 -B -m compileall -q mp3
+git diff --check
 ```
 
 The original Batch 3 acceptance baseline on November 2 passed **198 tests** (main:
 99.114s; independent reviewer: 107.886s). The final Eventual GET dispatch correction
-adds four regressions. Current correction verification on Python 3.12.4 passed
-**202 tests in 118.088s** (main), including **25 Eventual tests in 73.176s** and
-**14 Strong/history tests in 28.738s**. The independent reviewer also passed **202
-tests in 116.737s**, including **25 Eventual tests in 68.561s**, and found no blocker.
+raised that to **202 tests**. Current Step 3 Batch 4 verification on Python 3.12.4
+passed **205 tests in 125.887s** (main) and **205 in 125.888s** (independent reviewer).
+Focused runs passed: **14 Strong/history tests in 30.047s**, **25 Eventual tests in
+72.193s**, and **3 adversarial integration tests in 8.276s** (reviewer: 3 in 8.252s).
 The suite uses temporary
 SQLite directories, fake clocks, subprocesses killed with SIGKILL, and temporary
 loopback membership and KV listeners. `tests/test_node_runtime.py` starts three
@@ -81,6 +85,13 @@ replicas, prompt impossible-threshold handling, and explicit durable-ack trackin
 It contacts no university VM. The verified results and limits are recorded in the
 implementation plan. Do not run `mp1/test/test_suite.py`; its fixtures SSH to
 real VMs and replace logs. The MP2 README mentions a `selftest.py` absent from this copy.
+
+Step 3 Batch 4 is verified for local adversarial integration and adds three tests: a seeded, barrier-started Strong
+history from three coordinator identities, and bounded coordinator admission checks
+in separate fresh Strong and Eventual-noRR clusters. These supplement the detailed
+protocol and crash/recovery tests in `test_strong.py` and `test_eventual.py`. Final
+Batch 4 counts and review status are recorded in the plan. No university VM or
+ten-VM validation was performed.
 
 For an explicit schema-2 local test, `mp3.node` accepts `--schema2-inventory PATH`.
 The JSON inventory must name all ten manifest identities and give each the same

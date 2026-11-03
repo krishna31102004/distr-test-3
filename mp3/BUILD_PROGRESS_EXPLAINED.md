@@ -866,3 +866,79 @@ Step 3 Batch 4 is joint adversarial integration across the completed Strong and
 Eventual-noRR protocols. Later work still includes Eventual-RR/read repair, complete
 mode switching, the required file-based demo commands, full MP1 log querying, ten-VM
 deployment and fault testing, benchmark experiments, the report, and the demo.
+
+## Step 3 — Batch 4: Adversarial Testing of Strong and Eventual
+
+**Status: VERIFIED for the local adversarial integration gate after independent
+review. This is not ten-VM verification.**
+
+Passing a PUT test and a GET test one at a time is not enough. Several computers can
+send operations at nearly the same moment, and responses can arrive in a different
+order from requests. A history records each operation's coordinator, key, operation,
+input, start time, response time and result. The existing history checker asks
+whether there is a legal one-at-a-time ordering that respects those times and gives
+each GET a value written earlier in that ordering. It checks the recorded bounded
+examples; it is not a proof of every possible network execution.
+
+### A three-writer Strong example
+
+Three coordinators can ask to write `A`, `B` and `C` while three GETs are also
+running. Each Strong operation queries the same five prescribed owners, needs three
+valid replies, and (for writes) completes its install phase. The test starts all six
+calls behind a barrier, records their real intervals, and checks that history. A
+finished Strong PUT must have its required quorum; a failed or uncertain write is
+not treated as a confirmed no-op if it may have committed.
+
+```text
+Coordinator 1: PUT A  ---- query/install ---- response
+Coordinator 2: PUT B    ---- query/install ---- response
+Coordinator 3: GET       ---- query/readback ---- response
+                 \        shared five owners       /
+```
+
+### Eventual and resource pressure
+
+Eventual reads may return an older value if that value is the newest among the first
+R valid replies. A later, slower owner does not change a response already returned;
+Eventual-noRR does not repair copies during a read. With a partition, Strong may stop
+when it cannot obtain its three-of-five protocol quorums. Eventual may continue when
+the selected R and W values can still be satisfied. Neither mode replaces a failed
+owner with a sixth machine.
+
+The new capacity test blocks an admitted operation at a test-controlled event, fills
+one worker and one queue position, and submits another operation with a short
+deadline. The third call reports OVERLOADED; after the gate opens, accepted work
+finishes, Eventual's five per-owner reports show durable completion, and coordinator
+and outbound reservations drain. Strong may return at its quorum while minority
+replica calls finish, so the test waits within a bounded interval before checking
+outbound cleanup.
+
+### What this batch changed
+
+`mp3/tests/test_protocol_adversarial.py` adds a fresh loopback/SQLite harness for
+each consistency mode, a seeded six-operation history across three Strong
+coordinator identities, and bounded-admission stress in separate Strong and
+Eventual-noRR clusters. Earlier Strong/Eventual tests already exercise local
+subprocess SIGKILL/restart, partial commits, stale generations, delays, owner
+failures, post-ack propagation and read-no-repair behavior. This batch found no
+demonstrated production defect; the reviewer tightened assertions so a failed PUT
+cannot pass the history test as a no-op and successful Eventual propagation must
+show five `DURABLE_ACK` outcomes. A bounded wait accounts for Strong minority RPCs
+that can remain in flight after quorum completion.
+
+Verification on Python 3.12.4:
+
+- Main `python3 -B -m unittest discover -s mp3/tests -v`: **205 passed in 125.887s**.
+- Independent reviewer ran the same full suite: **205 passed in 125.888s**.
+- Focused Strong/history: **14 passed in 30.047s**; focused Eventual: **25 passed
+  in 72.193s**; this batch's adversarial file: **3 passed in 8.276s**. The reviewer
+  independently ran the new adversarial file: **3 passed in 8.252s**.
+- Smoke, both help commands, compileall, and `git diff --check` exited successfully.
+  Smoke still prints `KV NOT_IMPLEMENTED`; the final demo CLI is not implemented.
+
+The reviewer found no remaining blocker. Review improved the tests by requiring
+successful status for every completed Strong PUT, checking all five Eventual writes
+are recorded as `DURABLE_ACK`, and allowing minority Strong RPCs a bounded interval
+to finish after quorum response. No production bug was demonstrated and no production
+code was changed. All evidence is local loopback, temporary SQLite, and local
+subprocess testing. Ten-VM behavior and university VM fault tests remain unverified.
