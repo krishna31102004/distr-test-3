@@ -987,6 +987,14 @@ replica has a newer version, the coordinator can repair missing or older copies.
 This happens in bounded background work so a slow replica does not hold the user
 response open. A conditional install protects a concurrent newer write.
 
+There is an important case: if the first R replies all say NOT_FOUND, the client can
+receive NOT_FOUND, but Eventual-RR's background comparison still continues. If a
+later valid owner reply contains a record, the background work can use it to repair
+reachable missing or older copies. The client's earlier NOT_FOUND is not changed.
+Only if the full bounded comparison finds no record is there nothing to repair. A
+deterministic acceptance test must hold the later FOUND reply until after the client
+has returned NOT_FOUND, then verify both the repair and the unchanged client result.
+
 Changing modes is harder than changing one setting. Ten databases must agree on
 the new mode and epoch. Strong-to-Eventual and Eventual-to-Strong must clear values
 and version metadata everywhere, while membership and ring positions stay. Old
@@ -994,6 +1002,29 @@ messages and repairs must be fenced so they cannot put cleared data back. The
 proposal requires all ten nodes to prepare and record the same durable transition;
 an incomplete or partitioned switch stays visibly pending/fenced instead of claiming
 success.
+
+The proposed new `control` endpoint is part of the canonical manifest, so adding it
+creates a new manifest fingerprint. The VM labels and ring IDs still come from the
+same stable identities; their five-owner lists must remain identical. The design
+therefore calls for a paused, all-ten configuration cutover: validate the expanded
+manifest, stop operations, point all ten nodes at the same new manifest, and reopen
+only after fingerprint agreement. Each node keeps its existing SQLite path and
+records. Schema-2 request fields and algorithms stay the same, and their regression
+tests must pass with all nodes using the new fingerprint. During a mixed-config
+cutover, mismatched nodes are unavailable; the system must not accept both
+fingerprints as aliases.
+
+Mode activation also has a local safety rule. After a node PREPAREs, it stays fenced
+until it learns and records the durable transition decision. The coordinator records
+GLOBAL_ACTIVE only after all ten nodes committed the same new epoch and data action.
+If an ACTIVATE message is lost or the coordinator crashes, nodes that recorded
+ACTIVE may serve the target mode; the others stay unavailable until the same
+transition is replayed and reconciled. Operations count replies only from ACTIVE
+owners on that target epoch. They can succeed if their normal quorum is met, or
+return an explicit error if not; they never mix old and new modes or treat a fenced
+owner as NOT_FOUND. The command remains pending until all ten confirm activation.
+Acceptance cases cover lost ACTIVATE, coordinator restart, and requests during this
+partial state. These rules are still proposed, not implemented or approved.
 
 The CLI needs to send commands to a node process that is already running, and that
 process already owns its SQLite database. The design proposes a small bounded

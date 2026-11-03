@@ -686,9 +686,15 @@ means a concurrent newer record won and ends that target without retries. Equal-
 conflicting bytes fail closed and produce no ambiguous repair. This is easier to audit
 than incremental repairs, at the cost of delayed repair start. Modules: `eventual.py`,
 `attempts.py`, `coordinator.py`, `rpc.py`, `replica.py`, `storage.py`, `eventlog.py`.
-Tests: late maximum, first-R response frozen, stale/missing repair, racing higher PUT,
-unreachable owners, queue exhaustion, cancellation and logs. Continuation duration
-is a proposed KD-13 choice, not an approved KD-08 change.
+If the first R are explicit NOT_FOUND, return that client result immediately but keep
+the remaining accepted reads under the same comparison lease. A later valid FOUND
+may supply the background maximum and trigger repair of reachable missing/lower
+replicas; the client result is never revised. Only when the complete bounded
+comparison has no valid record is there nothing to install. Tests: first-R absent
+followed by a later FOUND and repair, all-five absent/no repair, late maximum,
+first-R response frozen, stale/missing repair, racing higher PUT, unreachable owners,
+queue exhaustion, cancellation and logs. Continuation duration is a proposed KD-13
+choice, not an approved KD-08 change.
 
 ### KD-16 — Cluster transition authority and durable state
 
@@ -704,8 +710,12 @@ adding consensus code for a rare admin operation but makes vm01 availability a
 control-plane dependency. Proposed 30-second overall monotonic deadline requires
 approval. Modules: `node.py`, `storage.py`, `rpc.py`, `replica.py`, membership
 readiness and a new transition/control module. Tests: ten-node loopback, every crash
-boundary, lost ACK, partition, concurrent requests, delayed old writes/repairs and
-ring/membership preservation.
+boundary, lost ACK/ACTIVATE, controller crash after GLOBAL_ACTIVE, partition,
+operations with committed but fenced owners, concurrent requests, delayed old
+writes/repairs and ring/membership preservation. The recommendation permits only
+durably ACTIVE nodes on the common target epoch to serve during partial ACTIVATE;
+fenced prescribed owners are unavailable/nonqualifying, with no old-mode fallback,
+and ordinary quorum thresholds still apply. Command success waits for all ten ACTIVE.
 
 ### KD-16 — Data clear/retention matrix
 
@@ -766,6 +776,12 @@ coordinator. This provides per-VM operations without a second Store opener; the 
 are an additional manifest endpoint and service. Modules: `ring.py`, `cli.py`,
 `node.py`, new control service/client, `storage.py` bounded `liststore` API. Tests:
 concurrent loopback clients, file failures/bytes, partial ARM/GO and bounded shutdown.
+Because the canonical manifest fingerprint includes service endpoints, adding the
+control endpoint changes the fingerprint even though VM identities, ring IDs and
+owner sets must remain unchanged. The proposal is a quiesced all-ten config cutover
+to one new fingerprint, reusing existing database paths/data and preserving schema-2
+RPC behavior; do not dual-accept old/new fingerprints in one live cluster. This
+migration detail remains part of the pending control/manifest contract.
 
 ### KD-06/KD-15 — RR wire rollout; KD-08 — bounded background continuation
 

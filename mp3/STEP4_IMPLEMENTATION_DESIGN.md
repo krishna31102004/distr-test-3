@@ -141,6 +141,12 @@ Execution:
    NOT_FOUND responses. Among only those R, choose the greatest version and its
    exact bytes. R explicit absences yield NOT_FOUND; any missing/failed response is
    not an absence. Equal-version/different-bytes among the first R fails closed.
+   This client result is frozen independently from the background comparison. In
+   particular, returning NOT_FOUND after R valid NOT_FOUND replies does not end the
+   RR work: the remaining accepted reads continue under the read lease below. A
+   later valid FOUND reply can reveal a record, become the background maximum, and
+   cause repair of reachable replicas that returned NOT_FOUND or an older version.
+   That discovery does not revise the already returned client NOT_FOUND.
    If R becomes mathematically impossible, cancel queued and in-flight unused read
    attempts and close running sockets through the lease-aware cancellation path.
    Queued calls become terminal without send; active slots remain owned until their
@@ -169,10 +175,14 @@ Execution:
    “Reachable” for this operation means a prescribed owner that returned a fully
    validated response under the attempt lease. Record other prescribed owners as
    timeout, unreachable, invalid, canceled, or incomplete; do not call them absent.
-8. Find the maximum record among all valid FOUND responses in the bounded set. An
-   all-NOT_FOUND or no-valid-record set has no value to install. If two responses
-   contain equal versions with different bytes, mark a conflict, log it, and perform
-   no repairs because the value for that tag is ambiguous.
+8. Find the maximum record among all valid FOUND responses in the complete bounded
+   background comparison set, not just the first R client replies. The first-R
+   client result remains unchanged. If every valid response in the complete set is
+   NOT_FOUND (or there is no valid FOUND record), there is no value to install. If
+   the first R were NOT_FOUND but a later valid response is FOUND, use that record
+   for the background maximum and repair reachable missing/lower copies. If two
+   responses contain equal versions with different bytes, mark a conflict, log it,
+   and perform no repairs because the value for that tag is ambiguous.
 9. For each reachable owner whose response was NOT_FOUND or whose version is lower
    than the maximum, dispatch exactly one `INSTALL_IF_NEWER`, phase
    `eventual_rr_repair`, for the maximum version and bytes. Do not install on an
@@ -244,6 +254,8 @@ Each test asserts client result separately from background report:
 | Scenario | Required result |
 |---|---|
 | First R are v2; later owner has v7 | Client returns v2 if those were first R; background discovers v7 and conditionally repairs reachable lower/missing copies |
+| First R are NOT_FOUND; a later owner returns v7 | Deterministically hold a third owner's valid FOUND(v7) until the first R absences have returned and the client result is observed as NOT_FOUND; release it before the read cutoff, then assert one conditional repair for each reachable absent/lower owner and that the client result remains NOT_FOUND |
+| All five valid read responses are NOT_FOUND | Client returns NOT_FOUND when its first R are absent; complete comparison finds no record and sends no repair INSTALL |
 | Client response before background window closes | Client call returns while handle is nonterminal; bounded wait later obtains terminal per-owner report |
 | Missing reachable owner | One repair INSTALL is sent to that same owner; durable exact result recorded |
 | Stale reachable owner | Conditional install reaches max; stored tag never decreases |
@@ -286,6 +298,22 @@ point. A participant serves the new mode only after learning and durably recordi
 GLOBAL_ACTIVE. The command reports success only after all ten acknowledge ACTIVE.
 The state may be unavailable during recovery, but it must not accept an operation
 from a mismatched mode/epoch.
+
+**Partial-activation safety invariant (part of the recommendation, not a new
+approval):** after a participant durably records PREPARED, it serves neither old nor
+target-context KV operations until it has durably resolved the matching transition.
+No participant serves the target context before vm01 has durably recorded
+GLOBAL_ACTIVE, which is possible only after all ten participants durably committed
+the same target mode/epoch and clear-or-retain action. After that point, only a node
+that receives and durably records that exact GLOBAL_ACTIVE decision may reopen
+admission, and it serves only that target mode/epoch. A node that misses ACTIVATE or
+cannot reconcile the transition stays fenced: it is an unavailable/nonqualifying
+prescribed owner, never an old-mode fallback, NOT_FOUND, or replacement candidate.
+An operation during partial activation may complete only if its ordinary protocol
+obtains the required evidence from activated prescribed owners in the common target
+context (for Strong, three of the five owners); otherwise it returns the ordinary
+explicit timeout/error. No quorum combines old-context and target-context evidence.
+The control command remains PENDING until all ten ACTIVE acknowledgments arrive.
 
 ### 3.2 Persistent records and local gate
 
@@ -421,6 +449,9 @@ transition ID is rejected.
 | Participant crashes after local clear/COMMITTED | SQLite atomicity preserves new context and clear; it remains closed until ACTIVE decision is verified |
 | Participant unavailable after COMMIT | Cannot roll back; return PENDING/INCOMPLETE. Nodes that verified GLOBAL_ACTIVE and persisted ACTIVE may serve the committed target context; nodes not yet activated remain fenced. The unavailable node reconciles before serving after restart. |
 | Control response lost | Query transition by ID/status; repeat idempotent control phase only; never allocate a second epoch for same request |
+| ACTIVATE is lost after GLOBAL_ACTIVE | Nodes that durably recorded GLOBAL_ACTIVE may serve the target context; nodes that missed it remain fenced and nonqualifying. Replay ACTIVATE/status with the same transition ID; never roll back or admit the old context |
+| vm01 crashes after GLOBAL_ACTIVE but before sending all ACTIVATE messages/ACKs | The committed decision is irrevocable. On recovery vm01 replays ACTIVATE/status to the same ten identities; already ACTIVE nodes continue the target context, while unreconciled nodes stay fenced |
+| Operations arrive while some committed participants remain fenced | Active nodes may serve only the target context; fenced prescribed owners contribute no response/quorum evidence. Complete only if that protocol's threshold is met by active prescribed owners; otherwise return TIMEOUT/ERROR, never NOT_FOUND from silence or a mixed-mode result |
 | Partition or vm01 unavailable | No alternate leader is elected. A locally ACTIVE participant with a valid committed context may continue that epoch; PREPARED or COMMITTED-not-ACTIVE participants stay fenced. vm01 unavailability blocks new transition/recovery decisions. No node infers GLOBAL_ACTIVE from silence; delayed controls are checked against durable transition ID/phase. |
 | Competing requests | vm01 serializes; exact duplicate joins, different active target returns BUSY with transition ID |
 | Same-mode command | No epoch increment or clear; return NO_CHANGE only after ten identities report matching ACTIVE mode/epoch |
@@ -475,6 +506,17 @@ No university VM test is included here.
   commit replay is determined by the persistent journal, never guesswork.
 - SIGKILL a participant during PREPARE, after COMMIT decision, during local clear,
   and before ACTIVATE; restart and reconcile.
+- After GLOBAL_ACTIVE, drop ACTIVATE to one or more participants. Verify durably
+  ACTIVE participants serve only the target epoch, missed-activation participants
+  reject/withhold KV service until reconciliation, and replaying the same transition
+  ID activates them without rollback.
+- Crash vm01 after GLOBAL_ACTIVE but before sending all ACTIVATE messages and after
+  sending them but before collecting all ACKs. Restart it and verify the durable
+  decision is replayed, never aborted or replaced by a new epoch.
+- During partial activation, issue Strong and Eventual operations whose prescribed
+  owners include both ACTIVE and fenced nodes. Assert only valid target-context
+  responses count; operation succeeds only if its normal threshold is met, otherwise
+  TIMEOUT/ERROR. Fenced owners never yield NOT_FOUND or old-context evidence.
 - Restart an offline node after a successful epoch change; it must reconcile before
   KV readiness and reject old context.
 - Delay old Strong INSTALL, Eventual PUT, and RR repair beyond clear; assert STALE_EPOCH
@@ -621,6 +663,35 @@ selection remain unchanged. The command client connects only to the configured
 selected VM control endpoint; multiput/mode control can contact remote control
 endpoints. Do not add UDS plus a second remote protocol.
 
+**Manifest fingerprint and safe configuration migration (proposal; no compatibility
+code is implemented):** `Manifest.fingerprint` hashes the canonical serialized node
+entries, including service endpoints. Adding `control` therefore intentionally
+produces a new fingerprint even when every VM identity and ring ID is unchanged.
+The ring ID is derived from the stable VM identity, not the manifest endpoint list,
+so adding this endpoint must leave all ten ring IDs and every `owners(key)` result
+unchanged. Do not accept both fingerprints as aliases in one live runtime: schema-2
+and schema-3 RPCs bind to one exact `manifest_id`, and mixed fingerprints must fail
+closed.
+
+The recommended migration is a quiesced, all-ten configuration cutover. Keep the
+current manifest as a versioned old configuration; generate the expanded manifest
+separately with a unique control endpoint for each of the same ten VM identities.
+Before rollout, validate the complete endpoint set and compare the two manifests:
+VM IDs, ring IDs, KV/membership/log-query endpoints, and configured database paths
+must match; only the added control endpoint and resulting fingerprint may differ.
+Pause KV operations, then configure/restart all ten nodes against the same expanded
+manifest. Reuse each existing database path unchanged; do not bootstrap, clear,
+rewrite, or migrate its records or version metadata. Each node must validate the
+same new fingerprint and preserved identity before listeners/admission reopen. Enable
+the separate schema-3 capability only after the complete RR-capable release inventory
+is validated. Schema-2 code paths and wire fields remain unchanged. Resume them only
+when all participants in the running cluster use the same new manifest fingerprint;
+run the existing Step 2/3 schema-2 regression suites against this homogeneous
+expanded-manifest fixture as well as the retained legacy fixtures. A mismatch during
+cutover remains unavailable/error evidence, never a reason to weaken fingerprint
+validation or substitute owners. This has a bounded maintenance window but avoids
+dual-fingerprint acceptance and preserves ring placement and durable local state.
+
 Proposed signatures (not implemented):
 
 ```python
@@ -742,6 +813,12 @@ completion line; replica service prints its own required receive/respond lines.
 - All eight help/parser commands; no command returns a false success.
 - Mode command waits for actual transition result; any partial transition reports ID
   and incomplete status.
+- Build old and expanded manifests; assert the new control endpoint changes the
+  fingerprint while each stable VM identity, ring ID, key-owner tuple, KV/membership/
+  log-query endpoint and SQLite path is preserved. After a quiesced all-ten cutover
+  fixture, run Step 2/3 schema-2 regression tests with one homogeneous expanded
+  fingerprint; assert mixed fingerprints fail closed and existing database records
+  survive restart. No live rollout is part of this design review.
 
 ## 6. Explicit decision and approval matrix
 

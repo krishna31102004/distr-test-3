@@ -46,6 +46,23 @@ source/documentation review and reported the design ready for Krishna's approval
 no remaining substantive blocker. The reviewer did not run application tests; the
 primary agent's 205-test run is baseline-only evidence.
 
+**Focused Step 4 clarification review:** The follow-up documentation pass starts
+from published design commit `264241b2894025798d5ccfc8ddbe2a4e5a3eeeac` on the same
+branch. It clarifies that an RR client NOT_FOUND after first-R explicit absences is
+frozen while later valid background reads can still discover a record and repair;
+that adding the control endpoint changes the canonical manifest fingerprint and
+requires a quiesced homogeneous all-ten cutover without touching databases or ring
+IDs; and that partial activation serves only durably ACTIVE target-context nodes,
+with fenced owners nonqualifying. Acceptance tests now cover late RR discovery,
+lost ACTIVATE, controller crash after GLOBAL_ACTIVE, and operations with some owners
+still fenced. These are design proposals and tests-to-run, not implementation or
+approval. The 12 decision rows remain PENDING. This focused documentation review
+does not alter the post-Step-4 cleanup checkpoint or the future Krishna/Juhi handoff
+plan below. The independent reviewer compared the final clarification diff with
+`SPEC.md`, `ring.py`, and the Step 2/3 RPC contracts and found no substantive gap or
+contradiction. Only Markdown files changed; application tests are not evidence for
+these proposed behaviors and were not run for this documentation-only correction.
+
 ## Objective, authority, and boundaries
 
 Build this assignment's fixed-ten-node replicated key-value store with N=5,
