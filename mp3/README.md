@@ -23,6 +23,11 @@ implemented and independently reviewed for local operation. Eventual-noRR Batch 
 is also independently reviewed for local loopback/subprocess operation; it is not
 ten-VM deployment evidence.
 
+The Step 4 proposal is documented in
+[STEP4_IMPLEMENTATION_DESIGN.md](STEP4_IMPLEMENTATION_DESIGN.md). It is design-only
+and awaits Krishna's approval. Eventual-RR/read repair, cluster-wide mode switching,
+operational CLI commands, and MP1 log querying remain unimplemented.
+
 ## Layout
 
 ```text
@@ -305,3 +310,14 @@ No deployment/reset script exists. VM inventory, interpreter versions and port
 availability are unverified. Obtain explicit authorization before VM access,
 deployment or remote fault tests. The private review-repository workflow is documented
 in `AGENTS.md`; the professor's course repository remains separate.
+
+## Future final handoff (planned, not available yet)
+
+After implementation, independent review, authorized ten-VM verification, real
+benchmark measurements and report preparation, the team plans to publish a concise
+handoff with the authoritative branch/full SHA and reproducible checkout; actual
+implemented-versus-pending feature matrix; Python/dependency and VM setup/restart
+instructions; tested commands and diagnostics; data/log paths and MP1 query usage;
+real test/failure/benchmark evidence and its seeds/scripts; remaining course
+submission and demo checklist; and explicit next actions for Juhi. This handoff is
+not complete, and missing evidence will be labeled pending rather than inferred.

@@ -19,6 +19,33 @@ MP1/MP2 remain read-only references. No university VM was contacted and no depen
 was installed. This roadmap records the current gates; it does not authorize future
 protocol batches or VM operations on its own.
 
+**Step 4 design gate:** `STEP4_IMPLEMENTATION_DESIGN.md` is prepared on branch
+`feature/step4-design-gate` from accepted Step 3 Batch 4 commit
+`85d97f10544efa1a2d685a654149eea53d51d81a`. It is a proposal only; KD-13, full
+KD-16, KD-17, and new KD-06/08/14/15 refinements remain PENDING human approval.
+No Step 4 production work has started.
+
+The independent design review identified interface/lifecycle clarifications now
+reflected in the proposal: schema-3 needs its own dispatch, lease, activation and
+replica owner-validation paths; direct `getfromreplica` uses schema-1 local READ; RR
+cancels and releases outstanding reads when R becomes impossible; mode-control and
+multiput pass remaining-duration budgets across hosts rather than comparing
+monotonic clock values; MP1 adapter errors must not use a success-shaped FILENAME
+response; partial GO is reported per node; and mode activation behavior is explicit.
+The reviewed Step 3 baseline test command was run during this design task: 205 tests
+passed in 129.651 seconds under Python 3.12.4. This is baseline regression evidence,
+not verification of any proposed Step 4 behavior. Final review also separated the
+RR read-collection and repair leases (10s continuation capped at admission+15s; then
+a 5s repair lease capped at admission+20s), distinguished COMMIT_DECIDED
+irrevocability from GLOBAL_ACTIVE linearization, and made multiput lost-response
+status PENDING/UNKNOWN with durable GO/operation-ID deduplication, per-origin sequence
+high-water and crash/replay tests. The cross-host budget language
+now explicitly says receiver leases begin at receipt; transit cannot be exactly
+subtracted without a clock assumption. The independent reviewer completed a final
+source/documentation review and reported the design ready for Krishna's approval with
+no remaining substantive blocker. The reviewer did not run application tests; the
+primary agent's 205-test run is baseline-only evidence.
+
 ## Objective, authority, and boundaries
 
 Build this assignment's fixed-ten-node replicated key-value store with N=5,
@@ -115,21 +142,43 @@ are approved as C1/C2 contracts; their implementations remain future work.
 
 ### Step 4 — Integrate repair, switching, commands and MP1 logs
 
-- **Work / owners:** Juhi builds RR after noRR (E-02); Krishna integrates ring/
-  membership diagnostics and MP1 log-query reuse. Jointly finish all eight commands,
-  actual file IO, simultaneous multiput, required logs/completion output and mode
-  switching (C-01/C-02/L-01). RR and CLI/log work can run **in parallel after shared
-  mode/log contracts**; final switch tests require all three integrated modes.
-- **Approve first:** KD-13, remaining KD-16, KD-17 and remaining KD-14 CLI details;
-  obtain Krishna approval of any required KD-06/08/15 interface extensions before using them.
-- **Can wait:** KD-18 until Step 6; optional monitoring and connection optimizations.
-- **Exit evidence:** All command/output assertions and MP1 queries pass locally;
-  RR returns after R then repairs to the reachable maximum without overwriting newer
-  writes; direct replica GET never repairs. Switch tests prove mandated clearing,
-  approved Eventual-to-Eventual behavior, unchanged IDs and stale-message fencing.
+- **Status:** DESIGN PROPOSED / NOT IMPLEMENTED; existing `E-02`, `C-02`, `C-01`,
+  and `L-01` statuses remain BLOCKED_BY_DECISION.
+- **Batch 1, shared contracts (Joint):** Krishna approves KD-13, full KD-16, KD-17,
+  KD-14 command/file semantics and proposed KD-06/08/15 extensions. Freeze RR
+  phases, control message/endpoint, durable transition records, event fields and
+  deadlines before implementation.
+- **Batch 2, parallel after Batch 1:** Juhi owns Eventual-RR (`E-02`). Krishna owns
+  the bounded MP1-compatible log-query adapter and structured logging plumbing
+  (`L-01`), using the jointly approved event contract. No MP1 source changes.
+- **Batch 3, mode switching (Joint):** Krishna owns transition control transport,
+  vm01 serialization and membership/RPC fencing; Juhi owns durable journal,
+  atomic clear/retain and storage gate. Both jointly test ten-node crash/replay.
+- **Batch 4, commands (Joint):** Krishna owns CLI client/control routing, `ls`, and
+  membership diagnostics; Juhi owns bounded `liststore` and storage/result boundary;
+  both integrate all eight commands, file behavior, output, and actual per-VM
+  multiput (`C-01`).
+- **Batch 5, local acceptance (Joint):** ten logical loopback nodes, real sockets and
+  separate databases; full transition/RR/crash matrix, all command outputs and
+  unchanged MP1 client querying MP3 logs. This is not ten-VM evidence.
+- **Approve first:** Explicit Krishna approval of every pending row in
+  `STEP4_IMPLEMENTATION_DESIGN.md`; recommendations alone do not unblock tasks.
+- **Exit evidence:** All eight SPEC command contracts, RR return/repair/log behavior,
+  all-ten mode transitions and crash recovery pass local adversarial tests; full
+  suite and independent review pass. Ring IDs and membership survive transitions.
+
+**Post-Step 4 cleanup gate (before Step 5):** Separate branch/commit, minimal and
+behavior-preserving only. Remove clearly stale comments/imports/dead code; preserve
+short correctness explanations for ABD, versions/fanout, durability, epochs,
+restart fencing, deadlines/leases, resource ownership and shutdown. No broad refactor,
+algorithm/API/schema/persistence/logging change. Require inspectable diff, focused
+protocol plus full regression tests, independent review, and verified private-remote
+push. Defer risky cosmetic changes and record the reason.
 
 ### Step 5 — Deploy on ten VMs and pass integrated correctness tests
 
+- **Entry dependency:** Step 4 batches and its cleanup gate pass locally. VM access,
+  deployment and remote fault testing still require separate explicit authorization.
 - **Work / owners:** With explicit remote authorization, Krishna validates membership/
   ring/RPC/Strong; Juhi validates disk/versions/Eventual/RR. Jointly build persistence-
   safe deployment/restart scripts and run full commands, long histories, kill -9,
@@ -158,6 +207,16 @@ are approved as C1/C2 contracts; their implementations remain future work.
   required plots/averages/standard deviations and reproducible raw trials; <3-page
   12-point report, submission receipts and full demo rehearsal are complete by the
   required dates. No results are inferred from unit tests or invented.
+- **Report evidence / teammate handoff (future, after actual ten-VM verification and
+  measurements):** record authoritative branch/full SHA and checkout instructions;
+  implemented/pending modes and commands; Python/dependency/inventory/bootstrap and
+  restart instructions; exact tests/results/known failure reproduction; ring,
+  membership, SQLite and log/MP1 query operations; real VM failure evidence, raw
+  workload results/seeds/scripts/plots/report source when available; and distinct
+  course submission, Gradescope tagging, code form and demo obligations. Preserve
+  Krishna/Juhi ownership and a concrete next-action list for Juhi. This handoff is
+  not complete now and never substitutes for implementation, deployment, experiments,
+  or report deliverables.
 
 **Current task gate:** Batches 1–4 provide the locally reviewed storage/version,
 ring/membership, single-replica RPC, and integrated local node lifecycle foundations.

@@ -667,3 +667,147 @@ Healthy cluster, sequential per-client operations, both >=180s durations, all-re
 **Planned tests / acceptance:** Workload mix/seed determinism, preload/readback, timestamp math,
   raw aggregation and missing-trial checks. See master plan for matrix and time budget.
 
+## Step 4 design proposals — all listed refinements remain PENDING
+
+The proposals below are documented for Krishna's review. They do not change the
+existing PENDING status of KD-13, full KD-16, or KD-17, and do not approve new
+KD-06/08/14/15 interface refinements. Specification requirements remain mandatory;
+the choices below describe recommended implementations only.
+
+### KD-13 — Eventual-RR scheduling and repair
+
+**Status: PENDING. Recommended, not approved.** Reserve five read attempts before
+dispatch; return max from the first R distinct valid replies, then continue the
+remaining one-shot reads under a separate bounded lease ending at
+`min(first-R response + 10s, admission + 15s)`. After collection closes, perform one
+conditional repair pass on reachable missing/stale owners. Exact durable
+INSTALLED/UNCHANGED reports repair to selected version; higher durable SUPERSEDED
+means a concurrent newer record won and ends that target without retries. Equal-tag
+conflicting bytes fail closed and produce no ambiguous repair. This is easier to audit
+than incremental repairs, at the cost of delayed repair start. Modules: `eventual.py`,
+`attempts.py`, `coordinator.py`, `rpc.py`, `replica.py`, `storage.py`, `eventlog.py`.
+Tests: late maximum, first-R response frozen, stale/missing repair, racing higher PUT,
+unreachable owners, queue exhaustion, cancellation and logs. Continuation duration
+is a proposed KD-13 choice, not an approved KD-08 change.
+
+### KD-16 — Cluster transition authority and durable state
+
+**Status: PENDING. Recommended, not approved; existing durable epoch-fencing
+direction remains approved.** Use stable `vm01` as serialized transition authority.
+Require durable PREPARED from all ten before vm01 persists irrevocable COMMIT; apply
+the participant clear/retain plus new context/epoch in one SQLite transaction; keep
+each participant closed until the committed global activation decision. Do not
+report success until all ten acknowledge activation. Abort only before durable
+COMMIT; after COMMIT, replay idempotently and never roll back. A missing node blocks
+the transition, and prepared nodes fail closed until authority recovery. This avoids
+adding consensus code for a rare admin operation but makes vm01 availability a
+control-plane dependency. Proposed 30-second overall monotonic deadline requires
+approval. Modules: `node.py`, `storage.py`, `rpc.py`, `replica.py`, membership
+readiness and a new transition/control module. Tests: ten-node loopback, every crash
+boundary, lost ACK, partition, concurrent requests, delayed old writes/repairs and
+ring/membership preservation.
+
+### KD-16 — Data clear/retention matrix
+
+**Status: PENDING for the permitted Eventual-to-Eventual policy.** Strong↔Eventual
+clear is mandated: delete values and both mode-specific version high-water metadata
+atomically with target context/epoch on every node. Membership, node identity and
+ring IDs survive. Recommendation for the spec-permitted Eventual-noRR↔Eventual-RR
+case is retain records and Eventual timestamp high-water while incrementing epoch
+and fencing old operations. Retention avoids needless data loss; stale Eventual data
+remains subject to RR's next GET. Alternative: clear on this transition too. Modules:
+`storage.py`, `node.py`, mode coordinator. Tests: all six directed transitions,
+version metadata, values, delayed requests and preserved ring/member identities.
+
+### KD-17 — Structured logs and MP1 query adapter
+
+**Status: PENDING. Recommended, not approved.** Preserve exact local terminal receipt
+and response lines; append JSONL to `machine.<number>.log` with local/UTC time, event,
+VM/ring/key IDs, operation/request IDs, mode/epoch, phase, sender/target generations,
+version/status/durability, repair evidence and completion uncertainty. Never log
+value bytes. Serialize complete appends with one logger lock and flush per record;
+do not fsync every record under the specified process-kill failure model. Propose
+64 MiB log segments with four retained and query across retained segments. Add an
+import-safe bounded adapter at `log_query` speaking MP1's existing 4-byte frame and
+valid `FILENAME:` response format; run the unchanged MP1 client against local adapter
+fixtures. For invalid/unsupported/timed-out/failed-grep/oversized queries, close
+without a `FILENAME:` frame: the unchanged client treats any such header as success
+and could count an error body as a match. A valid no-match remains `FILENAME:` with
+an empty body. Do not import `mp1/server.py` because it starts a listener at import,
+assumes CWD log paths, and creates unbounded handler threads. Alternative: launch
+the original MP1 server subprocess, which retains those assumptions. Modules:
+`eventlog.py`, replica/coordinators, query adapter. Tests: append/restart, escaping,
+concurrent writes, rotation, repair evidence, MP1-client interoperability and
+transport-visible adapter errors.
+
+### KD-14 with KD-06/07/15 — command service and file contract
+
+**Status: PENDING for command transport and semantics; previously approved bounded
+worker/no-global-lock principles remain unchanged.** Keep one long-lived NodeRuntime
+per node and make `python -m mp3` a short-lived client. Recommend a separate
+manifest-configured `control` endpoint with a strict versioned envelope and bounded
+pool, not command multiplexing on KV. PUT reads local binary bytes (0..1 MiB);
+successful GET writes via same-directory temporary file and atomic replace, while
+failures leave any existing destination unchanged. Multiput sends ARM/READY concurrently; if any node fails to become ready, send
+bounded ABORT to armed nodes and start no PUT. After all READY, send GO concurrently;
+partial delivery may start only a subset, so report each node and never claim atomic
+simultaneous start. Before dispatch, persist GO_ACCEPTED, a stable operation ID and
+command ID in a small SQLite ledger; duplicate GO/STATUS returns the existing state
+and never dispatches a second PUT. After crash with accepted GO but no durable result,
+return UNKNOWN rather than replay. Use durable per-origin command sequence high-water
+plus bounded result retention so result eviction cannot re-enable an old GO. Keep
+only up to ten high-water rows and preserve them across mode data clears; old evicted
+commands return UNKNOWN and are never re-executed. Missing
+response means PENDING/UNKNOWN, not NOT_STARTED. Carry
+remaining-duration budgets across VM hops and derive receipt-local deadlines at
+receivers. Transit time is not exactly subtracted without a clock assumption; the
+origin bounds its wait while receiver leases bound remote work. Each node uses its own configured random file and
+coordinator. This provides per-VM operations without a second Store opener; the costs
+are an additional manifest endpoint and service. Modules: `ring.py`, `cli.py`,
+`node.py`, new control service/client, `storage.py` bounded `liststore` API. Tests:
+concurrent loopback clients, file failures/bytes, partial ARM/GO and bounded shutdown.
+
+### KD-06/KD-15 — RR wire rollout; KD-08 — bounded background continuation
+
+**Status: PENDING interface refinement.** Preserve schema 2 and all C5 framing and
+Strong/noRR behavior. Recommend schema 3 for the new `eventual_rr_read` and
+`eventual_rr_repair` phases and for the existing `eventual_put` phase when mode is
+Eventual-RR; Eventual-RR changes GET semantics, not the approved KD-12 PUT behavior.
+Also use a separate control envelope on the new control endpoint. Activate new
+capability from a one-time same-release inventory for all ten identities; the local
+runtime and replica service each require an explicit schema-3 activation gate, strict
+phase/mode validation and the same fixed-owner check as schema 2. Extend dispatch and
+the client lease path only for those Eventual-RR schema-3 phases. Never downgrade or
+repeat an all-ten health check per operation. An
+incompatible/unreachable owner remains nonqualifying among the prescribed five.
+RR reads propose atomic reservation of five reads, up to five repairs and one
+bounded completion task before any send; if R becomes impossible or foreground expires first, request cancellation, close
+running sockets, and schedule no repair. Queued slots release immediately; active
+slots remain reserved until their workers report terminal, then release exactly once. The read collector ends when all five reads are
+terminal or at `min(first-R completion + 10s, admission + 15s)`. Repairs then use a
+distinct five-second lease capped at admission+20s; do not reuse the expired read
+lease. This proposed total RR lifetime and repair phase budget require approval. A bounded 16/64 background executor is a proposed
+small `CoordinatorResources` extension because the current implementation has only
+coordinator and attempt executors. RR's one-shot reads use a proposed ten-second
+continuation, capped at 15 seconds from admission. Recommend schema-3 dispatch and a
+separate receiver activation gate, retaining fixed-owner validation; the client lease
+path must permit only the exact schema-3 Eventual-RR phases: `eventual_put`,
+`eventual_rr_read`, and `eventual_rr_repair`. Direct `getfromreplica`
+uses schema-1 `phase=local` for one selected node and does not weaken schema-2/3
+owner checks. Control transitions use a proposed configurable 30-second controller-local budget;
+pass remaining duration between VMs and derive receipt-local deadlines. Network
+transit cannot be exactly measured without a clock assumption, so do not claim a
+strict cross-host wall-time deadline. Modules: `rpc.py`, `replica.py`, `ring.py`,
+control service, `attempts.py`. Tests: strict schema/mixed-release behavior, exact
+correlation, capacity, impossible R, owner rejection, delayed-hop budget and late
+response handling. Existing approved schema-2 and KD-12 write continuation are not changed.
+
+### KD-01 — VM runtime compatibility
+
+**Status: PENDING.** Keep the approved Python/minimal-dependency direction. Recommend
+selecting the final Python minor only after all-ten VM interpreter/SQLite inventory,
+then run imports, compile, smoke and full tests on that common version. Alternative:
+mandate laptop Python 3.12 without evidence the VMs support it. No VM inventory or
+access is part of this design gate. Affects all modules and deployment instructions;
+acceptance is actual authorized VM version/test evidence.
+

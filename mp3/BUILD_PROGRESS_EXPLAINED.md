@@ -931,8 +931,10 @@ above. Earlier Strong/Eventual tests already exercise local
 subprocess SIGKILL/restart, partial commits, stale generations, delays, owner
 failures, post-ack propagation and read-no-repair behavior. This batch found no
 demonstrated production defect; the reviewer tightened assertions so a failed PUT
-cannot pass the history test as a no-op and successful Eventual propagation must
-show five `DURABLE_ACK` outcomes. A bounded wait accounts for Strong minority RPCs
+cannot pass the history test as a no-op. The initial capacity assertion also
+required five `DURABLE_ACK` outcomes for each successful Eventual PUT; the focused
+follow-up below corrects that because an older overlapping PUT may validly receive
+`SUPERSEDED` from pending owners. A bounded wait accounts for Strong minority RPCs
 that can remain in flight after quorum completion.
 
 Verification on Python 3.12.4:
@@ -946,11 +948,12 @@ Verification on Python 3.12.4:
   Smoke still prints `KV NOT_IMPLEMENTED`; the final demo CLI is not implemented.
 
 The reviewer found no remaining blocker. Review improved the tests by requiring
-successful status for every completed Strong PUT, checking all five Eventual writes
-are recorded as `DURABLE_ACK`, and allowing minority Strong RPCs a bounded interval
-to finish after quorum response. No production bug was demonstrated and no production
-code was changed. All evidence is local loopback, temporary SQLite, and local
-subprocess testing. Ten-VM behavior and university VM fault tests remain unverified.
+successful status for every completed Strong PUT, checking each Eventual client has
+its exact W evidence and every owner attempt reaches a valid terminal result, and
+allowing minority Strong RPCs a bounded interval to finish after quorum response.
+No production bug was demonstrated and no production code was changed. All evidence
+is local loopback, temporary SQLite, and local subprocess testing. Ten-VM behavior
+and university VM fault tests remain unverified.
 
 ### Final KD-12 overlap correction
 
@@ -971,3 +974,80 @@ suite (**14 in 30.619s**), Eventual suite (**25 in 70.704s**), and full suite
 (**205 in 124.085s**). Smoke, both help commands, compileall and `git diff --check`
 also exited successfully. This correction changed tests and documentation only; no
 production defect was found.
+
+## Step 4 Design Gate: What We Are Planning
+
+**Planning only — no Step 4 production feature has been implemented.** The detailed
+proposal is in `STEP4_IMPLEMENTATION_DESIGN.md`; KD-13, full KD-16, KD-17 and the
+new interface refinements are still waiting for Krishna's approval.
+
+Eventual-RR adds one thing to Eventual-noRR: after a GET replies using its first R
+replicas, the node continues checking the other prescribed owners. If a later
+replica has a newer version, the coordinator can repair missing or older copies.
+This happens in bounded background work so a slow replica does not hold the user
+response open. A conditional install protects a concurrent newer write.
+
+Changing modes is harder than changing one setting. Ten databases must agree on
+the new mode and epoch. Strong-to-Eventual and Eventual-to-Strong must clear values
+and version metadata everywhere, while membership and ring positions stay. Old
+messages and repairs must be fenced so they cannot put cleared data back. The
+proposal requires all ten nodes to prepare and record the same durable transition;
+an incomplete or partitioned switch stays visibly pending/fenced instead of claiming
+success.
+
+The CLI needs to send commands to a node process that is already running, and that
+process already owns its SQLite database. The design proposes a small bounded
+control service so the command client does not open a second copy of the database.
+MP1's server is unsafe to import because it starts listening at import time and
+assumes logs live in its current directory. The proposal keeps MP1 code unchanged
+and adds an adapter that speaks its existing query framing and response format.
+
+The next implementation batch, after approval, will settle shared RPC/control,
+logging and lifecycle interfaces. Then Juhi can build Eventual-RR while Krishna
+works on the separate MP1 query/log plumbing. Mode switching, all eight commands,
+and full local integration follow in dependency order.
+
+After Step 4 functionality, a separate small code-readability pass is planned. It
+will remove only clearly stale comments/imports/dead code, preserve correctness
+explanations, keep algorithms and interfaces unchanged, and require review plus full
+tests. After authorized real VM checks, measurements and report preparation, the
+team will prepare a reproducible handoff: verified branch/SHA, setup and restart
+steps, implemented/pending features, exact test and failure evidence, logs/query
+instructions, raw benchmark data and scripts when available, submission/demo
+obligations, and concrete next actions for Juhi. Neither cleanup nor that handoff is
+complete now; missing evidence must remain marked pending.
+
+
+### Step 4 design review clarifications
+
+The design review found that RR must reserve repair capacity before the first read,
+and cancel/release outstanding reads without scheduling repairs if R becomes
+impossible. Running slots remain reserved until their socket workers actually exit. The read-comparison window and repair RPCs need separate deadlines: the
+proposal now gives the reads up to 10 seconds after the first-R response (capped at
+15 seconds from admission), then gives repairs a separate five-second lease capped
+at 20 seconds total from admission. The existing coordinator resource class has no
+separate background executor, so the proposal calls for a bounded 16-active/64-queued
+pool rather than implying that such a pool already exists. The proposed schema-3
+path also needs its own activation and lease validation while retaining fixed-owner
+checks; direct
+`getfromreplica` can use the existing schema-1 local-read path for one nonowner.
+
+A monotonic clock is local to one computer. The mode-control and multiput proposal
+therefore sends remaining time budgets between VMs, and each receiver starts its own
+monotonic deadline from the remaining budget. Network transit is not subtracted
+exactly because monotonic clocks are not shared; the originating process bounds its
+own wait, while each receiver has a bounded local lease. Multiput sends GO concurrently after
+all nodes are READY; partial GO delivery is reported per node, without claiming an
+atomic simultaneous start. Duplicate GO is keyed by command ID; a missing response
+is PENDING/UNKNOWN rather than a claim that the node never started. The design now
+persists a command and operation ID before dispatching each node's PUT; after a crash,
+an accepted-but-unreported operation is UNKNOWN and is never replayed, avoiding a
+second write. COMMIT_DECIDED means the transition cannot be aborted; GLOBAL_ACTIVE after all ten
+nodes commit is the proposed mode linearization point. A node may serve only after it
+receives GLOBAL_ACTIVE, while another node may remain fenced during message delivery.
+The command still reports success only after all ten activation acknowledgments.
+
+The MP1 client treats any `FILENAME:` response as success, so the proposed adapter
+will close without that response on query errors; valid no-match remains an empty
+`FILENAME:` body. These are design clarifications only. No Step 4 behavior has been
+implemented or tested.
