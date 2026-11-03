@@ -926,10 +926,19 @@ behavior.
 | `_start(vm_ids, mode, *, limits=None) -> None` | Starts selected logical VMs and waits with a bounded monotonic deadline for membership generations to converge | Both integration cases; membership and TCP services | IMPLEMENTED; local tests |
 | `_stop_nodes() -> None` | Stops every started runtime with bounded cleanup; registered as test cleanup | `unittest.addCleanup` | IMPLEMENTED; local tests |
 | `test_three_coordinator_strong_history_is_linearizable()` | Barrier-starts three Strong PUTs and three GETs from three coordinator identities, records `HistoryEntry` intervals and result evidence, then checks the actual history with the existing bounded checker | `NodeRuntime.strong_put/get`; `tests/history_checker.py`; KD-11 | IMPLEMENTED; local loopback; bounded-history evidence only |
-| `_assert_bounded_coordinator_capacity(mode: ConsistencyMode) -> None` | In a fresh mode-specific cluster, blocks one admitted operation, fills the single queue slot, confirms a third operation returns OVERLOADED, releases the gate, and checks both coordinator and outbound capacity drain | Strong/Eventual APIs; `CoordinatorResources`; KD-08/14/15 | IMPLEMENTED; local loopback |
+| `_assert_bounded_coordinator_capacity(mode: ConsistencyMode) -> None` | In a fresh mode-specific cluster, blocks one admitted operation, fills the single queue slot, confirms a third operation returns OVERLOADED, releases the gate, and checks coordinator/outbound capacity drains. For Eventual-noRR it also holds the older PUT's three remaining sends until a newer PUT has durable exact-version acknowledgments from all five owners, then verifies the older sends receive `SUPERSEDED` and every replica retains the newer record | Strong/Eventual APIs; `CoordinatorResources`; KD-08/14/15 and KD-12 | IMPLEMENTED; local loopback |
 | `test_bounded_coordinator_admission_in_strong_cluster()` | Runs the bounded-admission scenario with an explicitly bootstrapped Strong cluster | `_assert_bounded_coordinator_capacity`; KD-11 | IMPLEMENTED; local loopback |
-| `test_bounded_coordinator_admission_in_eventual_cluster()` | Runs the same resource scenario in a separately bootstrapped Eventual-noRR cluster and checks all five fanout outcomes are durable | `_assert_bounded_coordinator_capacity`; KD-12 | IMPLEMENTED; local loopback |
+| `test_bounded_coordinator_admission_in_eventual_cluster()` | Runs the resource scenario in a separately bootstrapped Eventual-noRR cluster. Both successful operations require two distinct exact-version durable W acknowledgments; the older write reaches terminal reports with two `DURABLE_ACK` plus three valid higher-version `SUPERSEDED` outcomes, while all five replicas retain the newer value/version | `_assert_bounded_coordinator_capacity`; KD-12 | IMPLEMENTED; local loopback |
 
 This batch adds no production functions and changes no consistency protocol. The full
 test commands, reviewer findings, and exact verification results are recorded in
 `IMPLEMENTATION_PLAN.md` and `BUILD_PROGRESS_EXPLAINED.md` after review.
+
+The Eventual capacity scenario deliberately overlaps two PUTs on one key. The older
+successful PUT is required to show W=2 distinct durable replies for its exact version;
+that does not require the other three owners to keep that older version. The test
+holds those remaining sends, commits the newer version at all five owners, then
+releases the older sends and requires valid durable `SUPERSEDED` replies. It verifies
+each successful PUT's qualifying owner IDs against captured exact-version response
+evidence, all five older attempts become terminal, and all five local stores retain
+the newer version/value. This is KD-12 behavior, not a change to the protocol.

@@ -907,18 +907,27 @@ owner with a sixth machine.
 
 The new capacity test blocks an admitted operation at a test-controlled event, fills
 one worker and one queue position, and submits another operation with a short
-deadline. The third call reports OVERLOADED; after the gate opens, accepted work
-finishes, Eventual's five per-owner reports show durable completion, and coordinator
-and outbound reservations drain. Strong may return at its quorum while minority
-replica calls finish, so the test waits within a bounded interval before checking
-outbound cleanup.
+deadline. The third call reports OVERLOADED. Strong may return at its quorum while
+minority replica calls finish, so the test waits within a bounded interval before
+checking outbound cleanup.
+
+The Eventual half also shows why W=2 is not a promise that all five replicas hold
+each particular write. PUT 1 gets its two required exact-version durable replies,
+while three other accepted sends are held. PUT 2 then durably installs its higher
+version at all five owners. When the old sends are released, the remaining three
+report `SUPERSEDED`: each owner already stores the higher version. The test checks
+that both clients got two distinct exact-version durable W acknowledgments, every
+owner attempt reaches a terminal report, and every SQLite replica still contains
+PUT 2's version and bytes. KD-12 intentionally excludes these SUPERSEDED replies
+from PUT 1's W count because they do not prove PUT 1's bytes were stored.
 
 ### What this batch changed
 
 `mp3/tests/test_protocol_adversarial.py` adds a fresh loopback/SQLite harness for
 each consistency mode, a seeded six-operation history across three Strong
 coordinator identities, and bounded-admission stress in separate Strong and
-Eventual-noRR clusters. Earlier Strong/Eventual tests already exercise local
+Eventual-noRR clusters, including the event-controlled overlapping-write schedule
+above. Earlier Strong/Eventual tests already exercise local
 subprocess SIGKILL/restart, partial commits, stale generations, delays, owner
 failures, post-ack propagation and read-no-repair behavior. This batch found no
 demonstrated production defect; the reviewer tightened assertions so a failed PUT
@@ -942,3 +951,23 @@ are recorded as `DURABLE_ACK`, and allowing minority Strong RPCs a bounded inter
 to finish after quorum response. No production bug was demonstrated and no production
 code was changed. All evidence is local loopback, temporary SQLite, and local
 subprocess testing. Ten-VM behavior and university VM fault tests remain unverified.
+
+### Final KD-12 overlap correction
+
+The Eventual capacity test now deliberately overlaps two writes to the same key.
+The older PUT gets its W=2 durable exact-version acknowledgments while three of its
+five accepted sends are held. The newer PUT then reaches all five owners. When the
+older sends continue, those three owners reply `SUPERSEDED` because they already
+have the newer tag. This is valid: W=2 means the older client proved two durable
+copies of its own version, not that all five owners stored that version. The test
+checks the two exact durable acknowledgments for each successful PUT, all five
+terminal outcomes, and every replica's final record to confirm the older bytes did
+not overwrite the newer version.
+
+The independent reviewer inspected the Eventual coordinator, shared collector and
+KD-12 rule, then passed the focused adversarial suite (**3 tests in 8.718s**). Main
+verification passed the focused adversarial suite (**3 in 7.656s**), Strong/history
+suite (**14 in 30.619s**), Eventual suite (**25 in 70.704s**), and full suite
+(**205 in 124.085s**). Smoke, both help commands, compileall and `git diff --check`
+also exited successfully. This correction changed tests and documentation only; no
+production defect was found.

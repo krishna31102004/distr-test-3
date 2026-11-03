@@ -1456,10 +1456,12 @@ existing bounded register-history checker; and (2) bounded coordinator admission
 tests in separately bootstrapped Strong and Eventual-noRR clusters. Each capacity
 test holds an accepted operation at an event-controlled gate, fills the one-entry
 queue, checks that a third short-deadline operation returns OVERLOADED, releases the
-gate, and checks the accepted operations and their resource accounting. Eventual
-reports must show five durable per-owner acknowledgments. Strong outbound cleanup is
-waited for with a bounded deadline because the protocol can return after Q=3 while
-minority calls complete.
+gate, and checks the accepted operations and their resource accounting. In the
+controlled Eventual overlap, the newer PUT is driven to five durable per-owner
+acknowledgments before the older PUT's remaining sends are released; the older PUT
+can then report durable `SUPERSEDED` outcomes for those owners while still meeting
+its own W=2. Strong outbound cleanup is waited for with a bounded deadline because
+the protocol can return after Q=3 while minority calls complete.
 
 The existing `test_strong.py`, `test_eventual.py`, `test_node_runtime.py`, and
 `test_coordinator.py` suites remain part of the adversarial evidence: they cover
@@ -1490,3 +1492,40 @@ Main verification on Python 3.12.4:
 All these checks are local. Ten-VM deployment, university-VM fault schedules, and
 the broader F-01 remote acceptance gate remain unverified. No production defect has
 been demonstrated in this batch.
+
+### Batch 4 Eventual overlapping-write test correction
+
+The earlier capacity test incorrectly required all five replicas to report
+`DURABLE_ACK` for both overlapping Eventual writes. KD-12 requires W=2 exact-version
+durable acknowledgments for client success and permits a pending older attempt to
+arrive after a newer version, producing a valid `SUPERSEDED` result. The test now
+uses events to hold the older PUT's three remaining owner attempts after its two
+qualifying acknowledgments, runs the newer PUT to durable propagation on all five
+owners, and then releases the older attempts. It checks both successful results have
+two distinct prescribed-owner W acknowledgments, verifies their recorded responses
+are durable and exact-version, requires all five older per-owner attempts to become
+terminal with two `DURABLE_ACK` and three `SUPERSEDED`, and reads every owner store
+to confirm the newer version/value was not overwritten. It also checks the
+SUPERSEDED evidence is durable and reports the actual newer stored version.
+
+This is a test-only correction; the approved KD-12 protocol and production
+implementation are unchanged. Verification of the correction is recorded below
+after the focused suites and full run.
+
+Correction verification on Python 3.12.4:
+
+- `python3 -B -m unittest mp3.tests.test_protocol_adversarial -v` — **3 passed in
+  7.656s**; the independent reviewer ran the same focused suite — **3 passed in
+  8.718s**.
+- `python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v`
+  — **14 passed in 30.619s**.
+- `python3 -B -m unittest mp3.tests.test_eventual -v` — **25 passed in 70.704s**.
+- `python3 -B -m unittest discover -s mp3/tests -v` — **205 passed in 124.085s**.
+- `python3 -B -m mp3 --smoke`, `python3 -B -m mp3 --help`,
+  `python3 -B -m mp3.node --help`, `python3 -B -m compileall -q mp3`, and
+  `git diff --check` — all exited 0. Smoke reports the expected `KV NOT_IMPLEMENTED`.
+
+The independent reviewer checked the actual Eventual response qualification and
+KD-12 contract, found no blocker, and confirmed the Strong capacity assertions were
+not weakened. These are local tests only; no production code, MP1/MP2, `SPEC.md`, or
+university VM was changed.
