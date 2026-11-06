@@ -4,12 +4,18 @@
 . "$(dirname "$0")/lib.sh"
 parse_vms "${@:-all}"
 one() {
-    local n="$1" pid
+    local n="$1" pid query_pid port
     pid=$(vm_pid "$n")
+    query_pid=$(log_query_pid "$n")
+    port=$(vm_log_query_port "$n" 2>/dev/null)
     if [ -n "$pid" ]; then
-        printf 'VM %-2s UP   pid %-6s %s\n' "$n" "$pid" "$(vm_sh "$n" 'grep "^READY" "$MP3_RUN/node.out" | tail -1 | cut -d" " -f1-4')"
+        printf 'VM %-2s node=UP(pid=%s) log_query=%s(pid=%s,port=%s) %s\n' "$n" "$pid" \
+            "$([ -n "$query_pid" ] && echo UP || echo DOWN)" "${query_pid:- -}" "${port:-unknown}" \
+            "$(vm_sh "$n" 'grep "^READY" "$MP3_RUN/node.out" | tail -1 | cut -d" " -f1-4')"
     else
-        printf 'VM %-2s DOWN %s\n' "$n" "$(vm_sh "$n" '[ -e "$MP3_RUN/$VMID.db" ] && echo "(database present)" || echo "(no database)"' 2>/dev/null)"
+        printf 'VM %-2s node=DOWN log_query=%s(pid=%s,port=%s) %s\n' "$n" \
+            "$([ -n "$query_pid" ] && echo UP || echo DOWN)" "${query_pid:- -}" "${port:-unknown}" \
+            "$(vm_sh "$n" '[ -e "$MP3_RUN/$VMID.db" ] && echo "(database present)" || echo "(no database)"' 2>/dev/null)"
     fi
 }
 for n in "${VMS[@]}"; do one "$n" & done | sort -k2 -n; wait

@@ -673,8 +673,9 @@ membership class, socketpair framing, pathlib, importlib and mock.patch clocks.
 Local storage, fixed hashing/membership and single-replica KV RPC exist as described
 above. Shared distinct-response collection and bounded dispatch are implemented, and the
 coordinators, read repair, mode manager and all eight commands now exist (see the Step 3 and
-Step 4 sections). Benchmarks, plotting and deployment scripts do not exist yet. Later
-responsibilities and decision gates are in the plan and KD-01..18. No fabricated
+Step 4 sections). Step 5 deployment/lifecycle scripts and a local rehearsal now exist, but
+university-VM compatibility is unverified. Benchmarks, plotting and the report remain future
+work. Later responsibilities and decision gates are in the plan and KD-01..18. No fabricated
 benchmark/report content exists.
 
 Final Batch 1 refinements: timeout rejects booleans; decimal encoding/decoding
@@ -1241,3 +1242,47 @@ random bytes, initiator among the VMs, abort when a VM is down with nothing writ
 selections, ARM lease expiry, duplicate GO, GO after abort, bounded memory, fenced node), scripted
 coordinator cases (lost GO reply, lost ARM, UNKNOWN, resend while armed), request-time clamping,
 bounded replica reads, and an end-to-end pass of all eight commands in each of the three modes.
+
+
+## Step 5 local deployment and MP1 query integration
+
+`deploy/lib.sh` adds `vm_log_query_port(vm)`, which reads the per-VM MP1 port from the
+selected manifest; `log_query_pid(vm)`, which matches the Python server process argv;
+`start_log_query(vm)`, which starts the original MP1 server in the node's run directory;
+and `stop_log_query(vm)`, which terminates it with a bounded wait. `run_mp` starts MP1
+before the MP3 node and rolls the newly started MP1 process back if node startup fails.
+`stop_mp` and `status_mp` manage/report both services. `deploy_mp` copies the original
+`mp1/server.py` and `mp1/protocol.py` unchanged. The server's working directory contains
+`machine.<N>.log`, and its listen port comes from manifest `log_query` configuration.
+
+`check_prep` checks Python 3.10+, SQLite/WAL availability, files and local data, the
+manifest endpoint, both running services, an empty store, and membership convergence to
+ten entries. `reset_mp` refuses to remove data while either service runs.
+`deploy/local_release_rehearsal.sh` requires `MP3_TARGET=local`, creates a unique temporary
+tree, exercises the local ten-process deployment lifecycle, and removes only its own tree
+after confirming the services stopped. If shutdown is incomplete, it retains that tree for
+inspection.
+
+`tests/test_mp1_ten_process_deployment.py` starts ten independent copies of the unchanged
+MP1 server on manifest ports, creates one `machine.N.log` per process, and runs the unchanged
+MP1 client for match, count and no-match. Each query receives ten responses; aggregate match
+counts are 10, 20 and 0. The test also compares copied MP1 source bytes with their originals.
+The local release rehearsal additionally runs all eight MP3 commands and all three modes,
+then crashes/restarts a node and queries MP3 logs with MP1.
+
+`test_a_node_that_missed_activate_stays_fenced_until_it_is_told` now pauses background
+recovery at the fenced-state assertion, then resumes recovery and confirms activation. This is
+a test scheduling control; production transition behavior is unchanged.
+
+Verification (November 6, 2026): latest independent Python 3.12.4 suite: 360 tests passed
+in 511.917 seconds. The independent ten-server MP1 test passed in 0.683 seconds and the
+primary focused run passed in 0.307 seconds. The transition regression passed five
+consecutive times in each run. The primary local ten-process rehearsal passed. Smoke, both
+help commands, compilation, shell syntax and `git diff --check` passed. This is loopback
+evidence only; no university VM or SSH endpoint was accessed.
+
+Unverified before real deployment: instructor-confirmed hostnames/IPs and demo procedure,
+DNS, SSH credentials and host-key rules, firewall and port availability, remote Python and
+SQLite versions, process/resource limits, and actual ten-VM crash/recovery behavior. The
+current remote host/user/port values are repository-derived assumptions, not verified course
+instructions.

@@ -8,7 +8,9 @@ ensure_generated
 
 deploy_one() {
     local n="$1"
-    if [ -n "$(vm_pid "$n")" ]; then echo "VM $n: node is running; kill_mp $n first"; return 1; fi
+    if [ -n "$(vm_pid "$n")" ] || [ -n "$(log_query_pid "$n")" ]; then
+        echo "VM $n: node or MP1 log server is running; stop_mp $n first"; return 1
+    fi
     echo "VM $n: copying files"
     # Code: the mp3 package without tests, docs, deploy tooling or caches.
     (cd "$REPO_ROOT" && COPYFILE_DISABLE=1 tar -czf - --exclude='mp3/tests' --exclude='mp3/deploy' \
@@ -16,6 +18,8 @@ deploy_one() {
         vm_pipe "$n" 'mkdir -p "$MP3_RUN" "$MP3_RUN/out" && rm -rf "$MP3_ROOT/mp3" && tar -xzf - -C "$MP3_ROOT"' || return 1
     (cd "$DEPLOY_DIR/remote" && cat start_node.sh) | vm_pipe "$n" 'cat > "$MP3_RUN/start_node.sh"' || return 1
     (cd "$DEPLOY_DIR/remote" && cat mp3) | vm_pipe "$n" 'cat > "$MP3_RUN/mp3"' || return 1
+    (cd "$REPO_ROOT/mp1" && cat server.py) | vm_pipe "$n" 'cat > "$MP3_RUN/server.py"' || return 1
+    (cd "$REPO_ROOT/mp1" && cat protocol.py) | vm_pipe "$n" 'cat > "$MP3_RUN/protocol.py"' || return 1
     cat "$GEN_DIR/manifest.json" | vm_pipe "$n" 'cat > "$MP3_RUN/manifest.json"' || return 1
     cat "$GEN_DIR/inventory.json" | vm_pipe "$n" 'cat > "$MP3_RUN/inventory.json"' || return 1
     vm_sh "$n" 'echo "$VMID" > "$MP3_RUN/vm_id"; chmod +x "$MP3_RUN/start_node.sh" "$MP3_RUN/mp3"; mkdir -p "$MP3_DATA"' || return 1

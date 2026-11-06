@@ -8,9 +8,11 @@
 parse_vms "$@" || die "usage: ./run_mp <vm...|all>"
 
 start_one() {
-    local n="$1"
-    if [ -n "$(vm_pid "$n")" ]; then echo "VM $n: already running (pid $(vm_pid "$n"))"; return 0; fi
+    local n="$1" log_query_started
     vm_sh "$n" '[ -x "$MP3_RUN/start_node.sh" ]' || { echo "VM $n: not deployed; run ./deploy_mp $n"; return 1; }
+    start_log_query "$n" || return 1
+    log_query_started="$LOG_QUERY_STARTED"
+    if [ -n "$(vm_pid "$n")" ]; then echo "VM $n: node already running (pid $(vm_pid "$n"))"; return 0; fi
     local life=bootstrap
     vm_sh "$n" '[ -e "$MP3_RUN/$VMID.db" ]' && life=recover
     vm_sh "$n" "cd \"\$MP3_RUN\" && export MODE=$MP3_MODE R=$MP3_R W=$MP3_W MP3_DATA && {
@@ -26,7 +28,11 @@ start_one() {
         else
             nohup bash start_node.sh >> node.out 2>&1 &
         fi
-    }" || { echo "VM $n: launch failed"; return 1; }
+    }" || {
+        echo "VM $n: launch failed"
+        [ "$log_query_started" = 1 ] && stop_log_query "$n" >/dev/null 2>&1
+        return 1
+    }
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
@@ -36,6 +42,7 @@ start_one() {
         [ -n "$(vm_pid "$n")" ] || break
     done
     echo "VM $n: FAILED to become ready. node.out:"; vm_sh "$n" 'tail -n 15 "$MP3_RUN/node.out"'
+    [ "$log_query_started" = 1 ] && stop_log_query "$n" >/dev/null 2>&1
     return 1
 }
 

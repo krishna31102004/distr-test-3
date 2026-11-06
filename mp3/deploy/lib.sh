@@ -40,6 +40,17 @@ vm_host() { if [ "$MP3_TARGET" = local ]; then echo 127.0.0.1; else printf 'fa26
 vm_root() { if [ "$MP3_TARGET" = local ]; then echo "$MP3_LOCAL_ROOT/$(vm_id "$1")"; else echo "$MP3_REMOTE_ROOT"; fi; }
 vm_data() { if [ -n "${MP3_DATA_DIR:-}" ]; then echo "$MP3_DATA_DIR"; else echo "$(vm_root "$1")/data"; fi; }
 
+# Resolve the log-query listener from the same manifest that the MP3 node uses.
+vm_log_query_port() {
+    local n="$1"
+    vm_sh "$n" 'python3 - "$MP3_RUN/manifest.json" "$VMID" <<'"'"'PY'"'"'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+node = next(item for item in manifest["nodes"] if item["vm_id"] == sys.argv[2])
+print(node["log_query"]["port"])
+PY' 2>/dev/null
+}
+
 # parse_vms ARGS...  ->  global array VMS of VM numbers ("all" means 1..10)
 parse_vms() {
     VMS=()
@@ -79,6 +90,74 @@ vm_pipe() {
 # [m] keeps this very command line (which contains the pattern text) from matching itself.
 NODE_PATTERN='-m [m]p3\.node --vm-id $VMID( |\$)'
 vm_pid() { vm_sh "$1" "pgrep -f -- \"$NODE_PATTERN\" | head -1" 2>/dev/null; }
+
+log_query_pid() {
+    local n="$1" port
+    port=$(vm_log_query_port "$n") || return 1
+    [ -n "$port" ] || return 1
+    # Match the Python process argv rather than the shell command that launched it.
+    vm_sh "$n" "python3 - $n $port <<'PY'
+import os, shlex, subprocess, sys
+number, port = sys.argv[1:]
+listing = subprocess.run(['ps', '-Ao', 'pid=,args='], capture_output=True, text=True, check=True)
+for line in listing.stdout.splitlines():
+    try:
+        pid, command = line.strip().split(None, 1)
+        argv = shlex.split(command)
+    except (ValueError, OSError):
+        continue
+    if (len(argv) >= 5 and os.path.basename(argv[0]).lower().startswith('python')
+            and argv[-3:] == ['server.py', number, port]):
+        print(pid)
+        break
+PY" 2>/dev/null
+}
+
+start_log_query() {
+    local n="$1" port pid
+    LOG_QUERY_STARTED=0
+    port=$(vm_log_query_port "$n") || { echo "VM $n: cannot read log_query port from manifest" >&2; return 1; }
+    [ -n "$port" ] || { echo "VM $n: manifest has no log_query port" >&2; return 1; }
+    pid=$(log_query_pid "$n")
+    if [ -n "$pid" ]; then echo "VM $n: MP1 log server already running (pid $pid)"; return 0; fi
+    LOG_QUERY_STARTED=1
+    vm_sh "$n" "[ -f \"\$MP3_RUN/server.py\" ] && [ -f \"\$MP3_RUN/protocol.py\" ] && cd \"\$MP3_RUN\" && nohup python3 -B server.py $n $port >> log_query.out 2>&1 </dev/null &"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if vm_sh "$n" "python3 - $port <<'PY'
+import socket, sys
+with socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=0.3): pass
+PY" >/dev/null 2>&1; then
+            pid=$(log_query_pid "$n")
+            if [ -n "$pid" ]; then
+                echo "VM $n: MP1 log server ready on manifest port $port (pid $pid)"
+                return 0
+            fi
+            echo "VM $n: manifest log_query port $port is occupied by an untracked process" >&2
+            LOG_QUERY_STARTED=0
+            return 1
+        fi
+        sleep 0.2
+    done
+    echo "VM $n: MP1 log server failed to listen on $port" >&2
+    vm_sh "$n" 'tail -n 20 "$MP3_RUN/log_query.out"' >&2
+    pid=$(log_query_pid "$n")
+    [ -z "$pid" ] || stop_log_query "$n" >/dev/null 2>&1
+    return 1
+}
+
+stop_log_query() {
+    local n="$1" pid i
+    pid=$(log_query_pid "$n")
+    [ -n "$pid" ] || { echo "VM $n: MP1 log server is not running"; return 0; }
+    vm_sh "$n" "kill -TERM $pid"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.2
+        [ -z "$(log_query_pid "$n")" ] && { echo "VM $n: MP1 log server stopped"; return 0; }
+    done
+    echo "VM $n: MP1 log server did not stop within 2 seconds" >&2
+    return 1
+}
 
 # for_each_vm FUNCTION VM...  -- run FUNCTION VM in parallel; returns nonzero if any failed.
 for_each_vm() {

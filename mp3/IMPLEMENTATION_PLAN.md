@@ -1820,3 +1820,39 @@ processes; kill -9 and recover; multiput; read repair; five replicas identical).
 run on the university VMs (no authorization yet); tmux and python version on the VMs are unchecked.
 Observed: under concurrent Eventual puts, a put overtaken by a newer version reports an error
 (the Step 3 design: superseded replies are not acknowledgements); the winner still converges everywhere.
+
+
+### Final local release-readiness check — November 6, 2026
+
+This check finished MP1 deployment integration and exercised deployment lifecycle only
+with `MP3_TARGET=local`; no UIUC machine was contacted.
+
+- `deploy_mp` copies the original `mp1/server.py` and `mp1/protocol.py` byte-for-byte.
+  `run_mp`, `stop_mp` and `status_mp` start, stop and report the MP1 log-query server using
+  each manifest `log_query.port`, with the node run directory as working directory so the
+  server reads that node's `machine.<N>.log`. If node startup fails, a newly started MP1
+  server is stopped as rollback.
+- `check_prep` checks Python 3.10+ and SQLite/WAL capability, required files/data, manifest
+  endpoint reachability, both services, an empty local store and ten-member convergence.
+  `reset_mp` refuses to remove data if either service is running.
+- `tests/test_mp1_ten_process_deployment.py` started ten separate local MP1 processes and
+  used the unchanged MP1 client for match/count/no-match: ten responses each and aggregate
+  match counts 10, 20 and 0. It asserts copied server/protocol bytes equal the originals.
+- The missed-ACTIVATE transition test pauses background recovery for its fenced-state
+  assertion, then resumes and verifies activation. It passed five consecutive primary runs
+  and five independent reviewer runs.
+- `MP3_TARGET=local ./mp3/deploy/local_release_rehearsal.sh` passed with ten local nodes,
+  all eight commands, Strong/Eventual-noRR/Eventual-RR, node crash/recovery and MP1 log
+  query. It uses its own temporary tree and removes it only after both services stop.
+- Latest independent full-suite result under Python 3.12.4: **360 tests passed in
+  511.917 s**. The MP1 ten-process test passed independently in 0.683 s and in the primary
+  focused run in 0.307 s. Smoke, CLI and node help, `compileall`, `bash -n` on deployment
+  scripts, and `git diff --check` all exited successfully. The reviewer independently ran
+  the full suite, focused MP1 test, smoke/help, compilation and shell syntax checks; only the
+  primary agent ran the complete local lifecycle rehearsal.
+
+**Release boundary:** these results establish local script and loopback behavior only.
+Current professor deployment/demo instructions, UIUC DNS, SSH/account and host-key policy,
+firewall/port availability, remote Python/SQLite versions, VM resource limits and real
+ten-VM correctness are unverified. Hostnames, default user and remote ports derive from
+repository precedents and require instructor confirmation. No benchmark was started.

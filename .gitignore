@@ -33,6 +33,7 @@ logs/
 runtime/
 data/
 results/
+mp3/deploy/.generated/
 
 # Local environment and credentials
 .env

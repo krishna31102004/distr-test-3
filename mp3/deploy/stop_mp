@@ -4,15 +4,21 @@
 parse_vms "$@" || die "usage: ./stop_mp <vm...|all>"
 
 stop_one() {
-    local n="$1" pid i
+    local n="$1" pid i failed=0
     pid=$(vm_pid "$n")
-    if [ -z "$pid" ]; then echo "VM $n: node is not running"; return 0; fi
-    vm_sh "$n" "kill -TERM $pid"
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 1
-        [ -z "$(vm_pid "$n")" ] && { echo "VM $n: stopped ($(vm_sh "$n" 'grep "^STOPPED" "$MP3_RUN/node.out" | tail -1'))"; return 0; }
-    done
-    echo "VM $n: did not stop within 10 s (use kill_mp)"; return 1
+    if [ -z "$pid" ]; then echo "VM $n: node is not running"; else
+        vm_sh "$n" "kill -TERM $pid" || failed=1
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            if [ -z "$(vm_pid "$n")" ]; then
+                echo "VM $n: node stopped ($(vm_sh "$n" 'grep "^STOPPED" "$MP3_RUN/node.out" | tail -1'))"
+                break
+            fi
+        done
+        [ -z "$(vm_pid "$n")" ] || { echo "VM $n: node did not stop within 10 s (use kill_mp)"; failed=1; }
+    fi
+    stop_log_query "$n" || failed=1
+    return "$failed"
 }
 
 for_each_vm stop_one "${VMS[@]}"

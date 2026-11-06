@@ -1,7 +1,8 @@
 #!/bin/bash
 # Pre-demo check: run before walking into the room. Verifies on all ten VMs that
 #  - python3 is new enough, the code is deployed, the dataset files business_1..20 exist,
-#  - the node is running, no keys are stored yet (liststore empty), and membership lists 10.
+#  - the node and original MP1 log-query server are running, no keys are stored yet,
+#    and membership lists 10.
 # Usage: ./check_prep        (exit 0 only if everything is ready)
 . "$(dirname "$0")/lib.sh"
 fail=0
@@ -10,18 +11,43 @@ check_one() {
     out=$(vm_sh "$n" '
         ok=1; msg=""
         python3 -c "import sys; sys.exit(sys.version_info < (3, 10))" || { ok=0; msg="$msg python<3.10($(python3 -V 2>&1));"; }
-        [ -f "$MP3_RUN/manifest.json" ] && [ -d "$MP3_ROOT/mp3" ] || { ok=0; msg="$msg not-deployed;"; }
+        sqlite_ok=$(python3 -c "import sqlite3; print(int(sqlite3.sqlite_version_info >= (3, 7, 0)))" 2>/dev/null) || sqlite_ok=0
+        sqlite_version=$(python3 -c "import sqlite3; print(sqlite3.sqlite_version)" 2>/dev/null) || sqlite_version=unknown
+        [ "$sqlite_ok" = 1 ] || { ok=0; msg="$msg sqlite-without-WAL;"; }
+        [ -f "$MP3_RUN/manifest.json" ] && [ -d "$MP3_ROOT/mp3" ] && \
+            [ -f "$MP3_RUN/server.py" ] && [ -f "$MP3_RUN/protocol.py" ] || { ok=0; msg="$msg not-deployed;"; }
         missing=0; for i in $(seq 1 20); do
             [ -f "$MP3_DATA/business_$i" ] || ls "$MP3_DATA"/business_$i.* >/dev/null 2>&1 || missing=$((missing+1)); done
         [ $missing -eq 0 ] || { ok=0; msg="$msg dataset-missing:$missing-of-20;"; }
         cd "$MP3_RUN" 2>/dev/null || exit 1
         if [ -z "$(pgrep -f -- "-m [m]p3\.node --vm-id $VMID( |\$)" | head -1)" ]; then ok=0; msg="$msg node-down;"
         else
-            members=$(./mp3 list_mem_ids 2>&1 | grep -o "\"vm\": \"vm" | wc -l | tr -d " ")
+            members=0
+            for attempt in $(seq 1 15); do
+                members_json=$(./mp3 list_mem_ids 2>&1)
+                members=$(printf "%s" "$members_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get(\"members\", [])))" 2>/dev/null) || members=0
+                [ "$members" -ge 10 ] && break
+                sleep 0.2
+            done
             [ "$members" -ge 10 ] || { ok=0; msg="$msg membership=$members/10;"; }
             ./mp3 liststore 2>&1 | grep -q "\"keys\": 0" || { ok=0; msg="$msg has-keys-or-error;"; }
         fi
-        [ $ok = 1 ] && echo "OK $(python3 -V 2>&1)" || echo "PROBLEM $msg"' 2>&1)
+        log_port=$(python3 - "$MP3_RUN/manifest.json" "$VMID" <<"PY"
+import json, sys
+nodes = json.load(open(sys.argv[1], encoding="utf-8"))["nodes"]
+node = next(item for item in nodes if item["vm_id"] == sys.argv[2])
+print(node["log_query"]["port"])
+PY
+        ) || { ok=0; msg="$msg log-manifest-invalid;"; log_port=""; }
+        if [ -n "$log_port" ]; then
+            python3 - "$N" "$log_port" <<"PY" || { ok=0; msg="$msg log-query-down;"; }
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1): pass
+PY
+        fi
+        [ $ok = 1 ] && echo "OK $(python3 -V 2>&1) SQLite $sqlite_version" || echo "PROBLEM $msg"' 2>&1)
+    query_pid=$(log_query_pid "$n" 2>/dev/null)
+    [ -n "$query_pid" ] || out="$out MP1-server-process-missing"
     printf 'VM %-2s %s\n' "$n" "$out"
     case "$out" in OK*) ;; *) return 1;; esac
 }

@@ -1210,3 +1210,34 @@ rule belongs to the team and needs the owners' approval to change.
 
 Checks: all 359 tests pass, ten real node processes still run all the commands, and a second AI
 reviewer confirmed nothing the code does has changed.
+
+
+## Step 5 — Final local release-readiness check (November 6, 2026)
+
+The deployment scripts also need to start the old MP1 log-search server so the unchanged
+MP1 client can search each node's MP3 log. We left MP1's source untouched and copy its
+`server.py` and `protocol.py` into each node's run folder. Each server reads that node's
+`machine.N.log` and listens on the `log_query` port in the MP3 manifest.
+
+We checked the client against ten separate local MP1 server processes. A match query, a
+count query, and a no-match query each received ten responses. Their total match counts were
+10, 20, and 0. A separate local rehearsal started ten MP3 nodes and ten MP1 servers, ran all
+eight MP3 commands and all three consistency modes, killed and recovered a node, searched
+logs using MP1, then stopped the services.
+
+The missed-ACTIVATE test had a scheduling race: background recovery could activate the
+node before the test checked that the node was still fenced. The test now pauses recovery,
+checks the fenced state, then resumes recovery and checks activation. It passed five times
+in the primary run and five times in independent review; production behavior was not
+weakened.
+
+The latest independent Python 3.12.4 test run passed **360 tests in 511.917 seconds**.
+The separate ten-server MP1 test passed in primary and reviewer runs. Smoke, CLI help,
+node help, Python compilation, shell syntax checks and whitespace checks also passed. These
+are local results; we did not connect to any UIUC computer.
+
+We still need the professor's current host/IP list and demo directions, confirmation of
+SSH and host-key rules, firewall/port policy, and the university VM's Python and SQLite
+versions. The hostnames, username and ports in our scripts come from older repository
+files, so they are assumptions to verify rather than proof the course machines are ready.
+Real ten-VM deployment and failure testing remain for the next authorized task.

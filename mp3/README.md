@@ -69,6 +69,7 @@ python3 -B -m unittest discover -s mp3/tests -v
 python3 -B -m unittest mp3.tests.test_strong mp3.tests.test_history_checker -v
 python3 -B -m unittest mp3.tests.test_eventual -v
 python3 -B -m unittest mp3.tests.test_protocol_adversarial -v
+MP3_TARGET=local python3 -B -m unittest mp3.tests.test_mp1_ten_process_deployment -v
 python3 -B -m mp3 --smoke
 python3 -B -m mp3 --help
 python3 -B -m mp3.node --help
@@ -302,8 +303,11 @@ structured records when a logger is configured; see "Logs and MP1" below.
 No KV service starts at CLI import/startup. A node started with `--log machine.<N>.log` appends
 one JSON line per replica receipt and response and one `read_repair` line per Eventual-RR GET.
 The unchanged MP1 server (`python3 server.py <N> [port]`, run in the log directory) and the
-unchanged MP1 client find those lines; `tests/test_mp1_logs.py` and a ten-process run verify this
-locally. MP1 and MP2 source remain unchanged.
+unchanged MP1 client find those lines. `tests/test_mp1_logs.py` checks MP3 log content, while
+`tests/test_mp1_ten_process_deployment.py` starts ten copies of the original server at manifest
+`log_query` ports and checks match, count, and no-match queries using the original client.
+`deploy/local_release_rehearsal.sh` also verifies the deploy/start/stop/status lifecycle locally.
+MP1 and MP2 source remain unchanged.
 
 ## Programmatic Eventual-noRR API
 
@@ -340,15 +344,31 @@ Run the focused local Eventual-noRR suite with:
 python3 -B -m unittest mp3.tests.test_eventual -v
 ```
 
+## Local deployment rehearsal
+
+`deploy/` contains MP3 deployment, service lifecycle, status, readiness and demo scripts. Every
+deployment rehearsal in this workspace must explicitly select the local target. To run the
+isolated ten-process gate, execute:
+
+```bash
+MP3_TARGET=local ./mp3/deploy/local_release_rehearsal.sh
+```
+
+This script creates its own temporary tree, deploys ten loopback identities, starts MP3 plus the
+original MP1 log server for each identity, waits for readiness, exercises all eight commands and
+the Strong, Eventual-noRR and Eventual-RR modes, kills and recovers a node, queries logs through
+the original MP1 client, then stops services and removes only its own temporary tree. It refuses
+to run unless `MP3_TARGET=local` is explicitly set. Exact results are recorded in
+`deploy/README.md` and `IMPLEMENTATION_PLAN.md` after each verified release check.
+
 ## What remains
 
-Later work is ten-VM correctness testing, deployment and restart scripts, the benchmarks, the
-report and demo readiness. Everything currently has only local loopback/subprocess
-verification.
-No deployment/reset script and no benchmark harness exist yet. VM inventory, interpreter versions and port
-availability are unverified. Obtain explicit authorization before VM access,
-deployment or remote fault tests. The private review-repository workflow is documented
-in `AGENTS.md`; the professor's course repository remains separate.
+The deployment scripts and local ten-process rehearsal exist; actual UIUC VM host access,
+interpreter/SQLite compatibility, SSH, firewall and instructor demo instructions remain
+unverified. Ten-VM correctness testing, benchmarks, the report and demo readiness are still ahead.
+Obtain and compare current instructor VM/demo instructions before remote use. The private
+review-repository workflow is documented in `AGENTS.md`; the professor's course repository
+remains separate.
 
 ## Future final handoff (planned, not available yet)
 
@@ -364,3 +384,11 @@ not complete, and missing evidence will be labeled pending rather than inferred.
 ## Deployment and demo scripts
 
 See `deploy/README.md`: start/kill/restart scripts for the ten VMs, a local practice mode, and one script per demo test.
+
+
+Latest local release check (November 6, 2026): the independent Python 3.12.4 full suite
+passed 360 tests in 511.917 seconds. The focused ten-process unchanged-MP1-client test
+passed match, count and no-match against all ten local servers. The guarded local rehearsal
+passed all eight commands, three consistency modes, crash/recovery and MP1 log querying.
+These are loopback results, not university-VM readiness evidence. See
+[`deploy/README.md`](deploy/README.md) for verified scope and outstanding remote checks.

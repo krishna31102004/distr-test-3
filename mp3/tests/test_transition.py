@@ -353,6 +353,7 @@ class CrashRecoveryTests(ModeTestCase):
         gate = threading.Event()
         victim = cluster.nodes["vm06"].transition
         original = victim.participant_message
+        victim.pause_recovery()  # freeze the fenced state until the assertion below
 
         def refuse_activate(command, transition_id, payload):
             if command == "tx_activate" and not gate.is_set():
@@ -368,7 +369,8 @@ class CrashRecoveryTests(ModeTestCase):
         # Active nodes serve the target mode; the fenced node returns an explicit refusal.
         self.assertEqual(cluster.nodes["vm06"].store.read_local(
             "k", context=Context(2, NORR)).status, LocalStatus.TRANSITIONING)
-        gate.set()  # vm01's recovery loop replays ACTIVATE with the same transition id
+        gate.set()
+        victim.resume_recovery()  # participant now reconciles vm01's durable decision
         wait_for(lambda: cluster.settled(NORR, 2), 30, "late activation")
 
 
