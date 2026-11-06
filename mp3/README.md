@@ -1,14 +1,15 @@
 # CS 425 MP3: distributed key-value store
 
-**Step 2 and Step 3 Batches 1–3 are implemented and locally tested.** Programmatic
-Strong ABD and Eventual-noRR PUT/GET work through the integrated local runtime;
-file-oriented CLI operations and Eventual-RR remain unfinished. The foundation includes local SQLite WAL/FULL
-storage, fixed SHA-256 ring ownership, restart-aware membership, a bounded
-single-replica KV TCP request/response service, and an integrated node runtime.
-Step 3 Batch 1 adds shared schema-2 coordinator infrastructure; Batch 2 adds Strong
-ABD; Batch 3 adds Eventual-noRR without read repair. Eventual-RR, read repair, command
-integration and mode changes remain future work. The October 21 specification in
-[SPEC.md](SPEC.md) is authoritative.
+**Steps 2, 3 and 4 are implemented and locally tested; nothing has been run on the university
+VMs yet.** The system is a ten-node key-value store with fixed SHA-256 ring ownership (five owners
+per key), restart-aware membership, durable local SQLite storage, a bounded replica TCP service,
+and three consistency modes: Strong (two-phase ABD), Eventual-noRR and Eventual-RR (read repair).
+Each node also runs a control endpoint, and all eight required commands (`put`, `get`, `ls`,
+`liststore`, `getfromreplica`, `list_mem_ids`, `multiput`, `consistency_mode`) run from the command
+line against a node. A cluster-wide mode change (coordinated by vm01) clears or keeps data as the
+assignment requires, and per-node `machine.<N>.log` logs can be searched with the unchanged MP1
+server and client. Ten-VM deployment, benchmarks, the report and the demo are still ahead. The
+October 21 specification in [SPEC.md](SPEC.md) is authoritative.
 
 Start with [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md),
 [KEY_DECISIONS.md](KEY_DECISIONS.md), [AGENTS.md](AGENTS.md), and
@@ -23,10 +24,11 @@ implemented and independently reviewed for local operation. Eventual-noRR Batch 
 is also independently reviewed for local loopback/subprocess operation; it is not
 ten-VM deployment evidence.
 
-The Step 4 proposal is documented in
-[STEP4_IMPLEMENTATION_DESIGN.md](STEP4_IMPLEMENTATION_DESIGN.md). It is design-only
-and awaits Krishna's approval. Eventual-RR/read repair, cluster-wide mode switching,
-operational CLI commands, and MP1 log querying remain unimplemented.
+The Step 4 design is in [STEP4_IMPLEMENTATION_DESIGN.md](STEP4_IMPLEMENTATION_DESIGN.md); the
+approved choices and the two deviations from it are recorded in
+[KEY_DECISIONS.md](KEY_DECISIONS.md) ("Step 4 approval record"). Batches A to D and their
+evidence are in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md); all of it is local
+loopback/subprocess evidence, not ten-VM evidence.
 
 ## Layout
 
@@ -47,8 +49,11 @@ mp3/
   ring.py                      ten-node manifest, SHA-256 IDs and five owners
   membership.py                retained suspicion, TCP gossip and restart recovery
   node.py                      one-node lifecycle and diagnostic launcher
+  control.py                   bounded control service and client for put/get/status
+  commands.py                  CLI put/get file handling (1 MiB cap, atomic get output)
   legacy_membership.py         byte-identical MP2 reference; not the MP3 service
-  cli.py, pending.py            parsing and NOT_IMPLEMENTED command boundary
+  multiput.py                  simultaneous puts from several VMs (ARM, READY, GO)
+  cli.py                       command parsing and routing for all eight commands
   tests/                        standard-library local tests
   *.md                          shared plans, explanation, journal and decisions
 ```
@@ -75,6 +80,13 @@ The original Batch 3 acceptance baseline on November 2 passed **198 tests** (mai
 99.114s; independent reviewer: 107.886s). The final Eventual GET dispatch correction
 raised that to **202 tests**. Current Step 3 Batch 4 verification on Python 3.12.4
 passed **205 tests in 125.887s** (main) and **205 in 125.888s** (independent reviewer).
+Step 4 Batch A (control endpoint, schema-3 groundwork, `put`/`get` CLI) raised the suite to
+259 tests, and Batch B (Eventual-RR, structured logs, MP1 query) to
+284 tests, Batch C (cluster-wide mode switching) to 329 tests, and Batch D (the last five
+commands and `multiput`) to 361 tests. After the behavior-preserving cleanup pass the suite is
+**359 tests, all passing in 499 s** on Python 3.11.9 (main agent, November 5, 2026; the two removed
+tests exercised only the deleted stub-era result types). Haiku read-only review rounds are recorded
+in `IMPLEMENTATION_PLAN.md`.
 Focused runs passed: **14 Strong/history tests in 30.047s**, **25 Eventual tests in
 72.193s**, and **3 adversarial integration tests in 8.276s** (reviewer: 3 in 8.252s).
 The suite uses temporary
@@ -107,22 +119,52 @@ only one replica RPC and do not run Strong/Eventual coordination.
 
 ## Commands currently working
 
-Help, local smoke, parsing and explicit rejection of unfinished operations work:
+`put` and `get` work through the control endpoint of a running node. Start a node
+(`python3 -B -m mp3.node --vm-id vm01 --manifest manifest.json --db vm01.sqlite
+--bootstrap --schema2-inventory inventory.json`; the manifest needs a `control`
+endpoint for every node), then run the command from the same VM:
 
 ```bash
-python3 -B -m mp3 put key localfilename
-python3 -B -m mp3 get key localfilename
-python3 -B -m mp3 ls key
-python3 -B -m mp3 liststore
-python3 -B -m mp3 getfromreplica VMaddress key localfilename
-python3 -B -m mp3 list_mem_ids
-python3 -B -m mp3 'multiput(key, VM1, VM10)'
-python3 -B -m mp3 consistency_mode eventual-RR
+python3 -B -m mp3 --manifest manifest.json --vm-id vm01 put key localfilename
+python3 -B -m mp3 --manifest manifest.json --vm-id vm01 get key localfilename
+# or: export MP3_MANIFEST=manifest.json MP3_VM_ID=vm01
 ```
 
-All eight distributed commands still return `NOT_IMPLEMENTED` and exit 3. Invalid
-syntax exits 2. No command changes a value file, connects to a server, completes a
-PUT/GET, or switches consistency modes.
+Each prints one JSON line with the status, the key's ring ID, the mode and epoch, the
+version, and the acknowledging nodes. Exit codes: 0 OK, 1 the operation failed
+(including NOT_FOUND, TIMEOUT or an unreachable node), 2 usage or configuration error.
+Files are capped at 1 MiB; a `get` replaces its output file
+atomically and only on success. These commands work in Strong and Eventual-noRR;
+in Eventual-RR they use read repair (`--read-quorum`/`--write-quorum` set R and W, default 2 and 2).
+
+`consistency_mode {strong,eventual-noRR,eventual-RR}` switches every node (any VM can run it; vm01
+coordinates). Strong <-> Eventual clears all values and version metadata on all ten nodes; the two
+Eventual modes keep them. It succeeds only after all ten nodes confirm (`OK`), reports `NO_CHANGE`
+if the cluster already runs that mode, `BUSY` if another change is running, and `TIMEOUT` before
+anything changes if a node is unreachable. A change that is decided but not yet confirmed on every
+node reports `PENDING` and vm01 keeps finishing it. While a node is switching it answers `put` and
+`get` with a `TRANSITIONING` error.
+
+The other commands (all print one JSON line; `ls` needs only `--manifest`):
+
+```bash
+python3 -B -m mp3 --manifest manifest.json ls key
+python3 -B -m mp3 --manifest manifest.json --vm-id vm03 liststore
+python3 -B -m mp3 --manifest manifest.json --vm-id vm03 getfromreplica vm05 key localfilename
+python3 -B -m mp3 --manifest manifest.json --vm-id vm03 list_mem_ids
+python3 -B -m mp3 --manifest manifest.json --vm-id vm03 'multiput(key, VM3, VM5, VM8)'
+```
+
+`ls` prints the key's ring ID and its five owners (ring ID and address) from the manifest alone.
+`liststore` prints each key stored on that VM with its key ID, then the VM's ring ID and a count.
+`getfromreplica` reads exactly one replica's own copy (a VM name, `host:port`, or a unique host) with
+no quorum and no repair, and writes the file only if that copy exists. `list_mem_ids` prints every
+member with its ring ID, sorted by ring ID, including suspected ones. `multiput` makes each named
+VM put its own value (`--multiput-file` on the node, else 1 KiB of random bytes) to the same key at
+the same moment (ARM, READY, then GO), and reports one row per VM: its state, put status, version,
+acknowledging nodes, size and a SHA-256 prefix, and its own timings. If any VM is not ready, none of
+the aborted VMs start a put. Exit codes: 0 success, 1 the operation failed, 2 usage or
+configuration error.
 
 ## Local foundation APIs
 
@@ -233,11 +275,9 @@ valid. Failure results distinguish timeout/error and may report
 adversarial examples are in `tests/test_strong.py`; the bounded history checker is
 `tests/history_checker.py`.
 
-These are programmatic coordinator APIs, not completed `python3 -m mp3 put/get`
-commands. The user-facing file commands remain `NOT_IMPLEMENTED`; Eventual
-coordinators, all-owner Eventual propagation, read repair and consistency-mode
-switching remain future work. Local loopback success does not establish deployment
-readiness across the ten university VMs.
+The same operations are reachable from the command line (`put` and `get` choose the
+coordinator from the node's current mode). Local loopback success does not establish
+deployment readiness across the ten university VMs.
 
 ## Single-replica RPC foundation
 
@@ -251,24 +291,24 @@ initialized; each call tries up to eight numeric addresses under its remaining
 absolute deadline. `mp3.replica.ReplicaService` serves these operations using a
 bounded worker pool and queue, then reads or durably installs against that VM's local
 SQLite database. These are local replica primitives: they do not compute quorum
-results, replicate to other owners, or make CLI PUT/GET operational.
+results or replicate to other owners; the Strong and Eventual coordinators do that
+on top of them.
 
 Receipt and response events print the required local timestamp line and can append
-structured records when a logger is configured. Full MP1 distributed log-query
-integration remains future work.
+structured records when a logger is configured; see "Logs and MP1" below.
 
 ## Logs and MP1
 
-No KV service starts at CLI import/startup. `ReplicaService` prints/logs receipt and
-response events when explicitly started by a caller. MP1
-uses `machine.<vm>.log` and port 65432; framing interoperability tests do not prove
-end-to-end MP1 queries against MP3 logs. MP1 and MP2 source remain unchanged.
+No KV service starts at CLI import/startup. A node started with `--log machine.<N>.log` appends
+one JSON line per replica receipt and response and one `read_repair` line per Eventual-RR GET.
+The unchanged MP1 server (`python3 server.py <N> [port]`, run in the log directory) and the
+unchanged MP1 client find those lines; `tests/test_mp1_logs.py` and a ten-process run verify this
+locally. MP1 and MP2 source remain unchanged.
 
 ## Programmatic Eventual-noRR API
 
 The programmatic API works only when the node is ready, schema-2 activation is
-configured, and its persisted context is Eventual-noRR. It does not make the CLI
-commands operational.
+configured, and its persisted context is Eventual-noRR. The CLI uses the same calls.
 
 ```python
 import time
@@ -302,11 +342,10 @@ python3 -B -m unittest mp3.tests.test_eventual -v
 
 ## What remains
 
-Later work implements Eventual-RR/read repair, mode switching, all command
-integration, ten-VM correctness, benchmarks, report, deployment and demo readiness.
-Strong ABD and Eventual-noRR currently have only local loopback/subprocess
+Later work is ten-VM correctness testing, deployment and restart scripts, the benchmarks, the
+report and demo readiness. Everything currently has only local loopback/subprocess
 verification.
-No deployment/reset script exists. VM inventory, interpreter versions and port
+No deployment/reset script and no benchmark harness exist yet. VM inventory, interpreter versions and port
 availability are unverified. Obtain explicit authorization before VM access,
 deployment or remote fault tests. The private review-repository workflow is documented
 in `AGENTS.md`; the professor's course repository remains separate.
@@ -321,3 +360,7 @@ instructions; tested commands and diagnostics; data/log paths and MP1 query usag
 real test/failure/benchmark evidence and its seeds/scripts; remaining course
 submission and demo checklist; and explicit next actions for Juhi. This handoff is
 not complete, and missing evidence will be labeled pending rather than inferred.
+
+## Deployment and demo scripts
+
+See `deploy/README.md`: start/kill/restart scripts for the ten VMs, a local practice mode, and one script per demo test.

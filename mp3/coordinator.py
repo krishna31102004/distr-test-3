@@ -1,7 +1,8 @@
 """Shared coordinator evidence, bounded dispatch and schema-2 activation (KD-08/11/12/14/15).
 
-This module deliberately contains no Strong ABD or Eventual coordinator. It provides
-the bounded, version-aware primitives those future algorithms will use.
+This module contains no coordinator protocol itself (see strong.py and eventual.py). It
+provides the bounded, version-aware primitives they share: the bounded executors, one-shot
+owner dispatch, distinct-owner quorum collection and the schema activation gates.
 """
 
 from __future__ import annotations
@@ -19,11 +20,11 @@ from typing import Callable, Iterable, Mapping
 import uuid
 
 from .attempts import AttemptLease
-from .models import ConsistencyMode, Context, Version
+from .models import Context, Version
 from .ring import Manifest, Node
 from .rpc import (
-    PROTOCOL_SCHEMA_VERSION, ReplicaRequest, ReplicaResponse, RpcOutcome,
-    RpcOutcomeKind, RpcOperation, RpcProtocolError, RpcStatus,
+    PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION, ReplicaRequest, ReplicaResponse, RpcOutcome,
+    RpcOutcomeKind, RpcProtocolError, RpcStatus,
 )
 
 
@@ -31,6 +32,8 @@ DEFAULT_COORDINATOR_WORKERS = 16
 DEFAULT_COORDINATOR_QUEUE = 32
 DEFAULT_ATTEMPT_WORKERS = 16
 DEFAULT_ATTEMPT_QUEUE = 64
+DEFAULT_BACKGROUND_WORKERS = 8
+DEFAULT_BACKGROUND_QUEUE = 32
 DEFAULT_ADMISSION_WAIT_SECONDS = 5.0
 
 
@@ -251,8 +254,9 @@ class Schema2Activation:
         return cls(manifest.fingerprint, next(iter(release_ids)),
                    tuple(node.vm_id for node in manifest.nodes))
 
-    @classmethod
-    def from_file(cls, manifest: Manifest, path: str | Path) -> "Schema2Activation":
+    @staticmethod
+    def load_inventory(manifest: Manifest, path: str | Path) -> Mapping[str, Mapping[str, object]]:
+        """Read and shape-check an inventory file; return its per-node release records."""
         def unique_object(pairs):
             result = {}
             for key, value in pairs:
@@ -270,12 +274,50 @@ class Schema2Activation:
                 or data["manifest_id"] != manifest.fingerprint
                 or not isinstance(data["nodes"], dict)):
             raise ValueError("inventory has wrong shape or manifest fingerprint")
-        return cls.from_inventory(manifest, data["nodes"])
+        return data["nodes"]
+
+    @classmethod
+    def from_file(cls, manifest: Manifest, path: str | Path) -> "Schema2Activation":
+        return cls.from_inventory(manifest, cls.load_inventory(manifest, path))
 
     def enabled_for(self, manifest: Manifest) -> bool:
         return (isinstance(manifest, Manifest)
                 and manifest.fingerprint == self.manifest_id
                 and self.schema_version == PROTOCOL_SCHEMA_VERSION
+                and set(self.compatible_nodes) == {node.vm_id for node in manifest.nodes})
+
+
+@dataclass(frozen=True)
+class Schema3Activation:
+    """Operator activation of the Eventual-RR schema (KD-13/KD-15).
+
+    The same release inventory file used for schema 2 activates schema 3 only when
+    every node advertises `schema_version >= 3`; it is an assertion from deployment
+    tooling, not a live health check.
+    """
+
+    manifest_id: str
+    release_id: str
+    compatible_nodes: tuple[str, ...]
+    schema_version: int = RR_SCHEMA_VERSION
+
+    @classmethod
+    def from_inventory(cls, manifest: Manifest,
+                       inventory: Mapping[str, Mapping[str, object]]) -> "Schema3Activation":
+        base = Schema2Activation.from_inventory(manifest, inventory)
+        for vm_id, record in inventory.items():
+            if record["schema_version"] < RR_SCHEMA_VERSION:
+                raise ValueError(f"{vm_id} does not advertise schema 3")
+        return cls(base.manifest_id, base.release_id, base.compatible_nodes)
+
+    @classmethod
+    def from_file(cls, manifest: Manifest, path: str | Path) -> "Schema3Activation":
+        return cls.from_inventory(manifest, Schema2Activation.load_inventory(manifest, path))
+
+    def enabled_for(self, manifest: Manifest) -> bool:
+        return (isinstance(manifest, Manifest)
+                and manifest.fingerprint == self.manifest_id
+                and self.schema_version == RR_SCHEMA_VERSION
                 and set(self.compatible_nodes) == {node.vm_id for node in manifest.nodes})
 
 
@@ -526,10 +568,12 @@ class BoundedExecutor:
 class CoordinatorShutdownReport:
     coordinators: WorkerShutdownReport
     attempts: WorkerShutdownReport
+    background: WorkerShutdownReport | None = None
 
     @property
     def clean(self) -> bool:
-        return self.coordinators.clean and self.attempts.clean
+        return (self.coordinators.clean and self.attempts.clean
+                and (self.background is None or self.background.clean))
 
 
 class CoordinatorResources:
@@ -538,12 +582,22 @@ class CoordinatorResources:
     def __init__(self, *, coordinator_workers: int = DEFAULT_COORDINATOR_WORKERS,
                  coordinator_queue: int = DEFAULT_COORDINATOR_QUEUE,
                  attempt_workers: int = DEFAULT_ATTEMPT_WORKERS,
-                 attempt_queue: int = DEFAULT_ATTEMPT_QUEUE):
+                 attempt_queue: int = DEFAULT_ATTEMPT_QUEUE,
+                 background_workers: int = DEFAULT_BACKGROUND_WORKERS,
+                 background_queue: int = DEFAULT_BACKGROUND_QUEUE):
         self.coordinators = BoundedExecutor(
             workers=coordinator_workers, max_pending=coordinator_queue, name="mp3-coordinator")
         try:
             self.attempts = BoundedExecutor(
                 workers=attempt_workers, max_pending=attempt_queue, name="mp3-attempt")
+            try:
+                # Eventual-RR comparison and repair run here, apart from foreground work.
+                self.background = BoundedExecutor(
+                    workers=background_workers, max_pending=background_queue,
+                    name="mp3-background")
+            except BaseException:
+                self.attempts.shutdown(timeout=1.0, force=True)
+                raise
         except BaseException:
             self.coordinators.shutdown(timeout=1.0, force=True)
             raise
@@ -559,10 +613,13 @@ class CoordinatorResources:
         deadline = time.monotonic() + timeout
         coordinator_report = self.coordinators.shutdown(
             timeout=max(0.0, deadline - time.monotonic()), force=force)
-        attempt_report = self.attempts.shutdown(
+        background_report = self.background.shutdown(
             timeout=max(0.0, deadline - time.monotonic()),
             force=force or not coordinator_report.clean)
-        return CoordinatorShutdownReport(coordinator_report, attempt_report)
+        attempt_report = self.attempts.shutdown(
+            timeout=max(0.0, deadline - time.monotonic()),
+            force=force or not coordinator_report.clean or not background_report.clean)
+        return CoordinatorShutdownReport(coordinator_report, attempt_report, background_report)
 
 
 def dispatch_owner(client, node: Node, request: ReplicaRequest, *, manifest: Manifest,
@@ -576,7 +633,7 @@ def dispatch_owner(client, node: Node, request: ReplicaRequest, *, manifest: Man
     if (not isinstance(node, Node) or request.target_id != node.vm_id
             or type(expected_generation) is not int or expected_generation <= 0):
         raise ValueError("owner call target and expected generation are invalid")
-    if request.schema == PROTOCOL_SCHEMA_VERSION:
+    if request.schema in (PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION):
         prescribed_ids = {owner.vm_id for owner in manifest.owners(request.key)}
         if node.vm_id not in prescribed_ids:
             raise OwnerDispatchError(OwnerFailure(
@@ -622,9 +679,19 @@ def _failure_from_outcome(owner_id: str, outcome: RpcOutcome) -> OwnerFailure:
                         outcome.error, outcome.completion_unknown)
 
 
+# Phases whose owner sends must all run to completion: the Eventual PUT fanout.
+# Reaching the threshold never cancels the remaining sends. (Repair results are
+# classified by the RR coordinator itself, not by collect_distinct.)
+CONTINUING_PHASES = frozenset({"eventual_put"})
+READ_PHASES = frozenset({"strong_query", "eventual_read", "eventual_rr_read"})
+# Phases whose remaining attempts survive reaching the threshold. An Eventual-RR read
+# keeps every accepted read so the later comparison can see all five replicas.
+KEEP_AFTER_THRESHOLD = CONTINUING_PHASES | {"eventual_rr_read"}
+
+
 def _qualifies(phase: str, request: ReplicaRequest,
                response: ReplicaResponse) -> bool:
-    if phase in ("strong_query", "eventual_read"):
+    if phase in READ_PHASES:
         return response.status in (RpcStatus.FOUND, RpcStatus.NOT_FOUND)
     if phase in ("strong_write", "strong_readback"):
         if response.status in (RpcStatus.INSTALLED, RpcStatus.UNCHANGED):
@@ -633,7 +700,7 @@ def _qualifies(phase: str, request: ReplicaRequest,
                 and response.stored_version is not None
                 and request.version is not None
                 and response.stored_version.compare(request.version) > 0)
-    if phase == "eventual_put":
+    if phase in CONTINUING_PHASES:
         return (response.status in (RpcStatus.INSTALLED, RpcStatus.UNCHANGED)
                 and response.durable and response.stored_version == request.version)
     return False
@@ -654,8 +721,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         raise ValueError("collector requires five distinct nodes from the manifest")
     if type(required) is not int or not 1 <= required <= 5:
         raise ValueError("required threshold must be in 1..5")
-    if phase not in {"strong_query", "strong_write", "strong_readback",
-                     "eventual_read", "eventual_put"}:
+    if phase not in {"strong_write", "strong_readback"} | READ_PHASES | CONTINUING_PHASES:
         raise ValueError("unsupported protocol phase")
     if type(deadline) not in (int, float) or not math.isfinite(deadline):
         raise ValueError("deadline must be a finite monotonic timestamp")
@@ -698,7 +764,8 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         primary[owner_id] = call
         request = call.request
         if (request.target_id != owner_id or request.operation_id != operation_id
-                or request.phase != phase or request.schema != PROTOCOL_SCHEMA_VERSION
+                or request.phase != phase
+                or request.schema not in (PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION)
                 or request.manifest_id != manifest.fingerprint
                 or request.key != first_key
                 or (request.epoch, request.mode) != (context.epoch, context.mode)
@@ -745,7 +812,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         # wait(FIRST_COMPLETED) may return several futures at once. Process them
         # in completion order and stop exactly at the threshold. Leave remaining
         # futures pending so Eventual PUT's reserved fanout is never discarded.
-        for index, future in enumerate(completed_ordered):
+        for future in completed_ordered:
             call = pending.pop(future)
             owner_id = call.node.vm_id
             try:
@@ -803,7 +870,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                 if threshold_impossible:
                     break
                 continue
-            if response.status == RpcStatus.SUPERSEDED and phase == "eventual_put":
+            if response.status == RpcStatus.SUPERSEDED and phase in CONTINUING_PHASES:
                 failures.append(OwnerFailure(owner_id, OwnerOutcome.SUPERSEDED,
                                              "higher version does not acknowledge this Eventual PUT"))
                 threshold_impossible = impossible_with_remaining()
@@ -847,7 +914,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         if threshold_impossible:
             break
 
-    if threshold_impossible and phase != "eventual_put":
+    if threshold_impossible and phase not in CONTINUING_PHASES:
         # A bounded phase may stop as soon as terminal outcomes prove the
         # threshold impossible; no replacement owner is submitted.
         for future, call in tuple(pending.items()):
@@ -863,7 +930,7 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         # attempt through its lease/shutdown boundary. For read/Strong phases,
         # cancel work that has not started; an in-flight RPC cannot be forcefully
         # canceled by Future.cancel(), so expose it to the caller as continuing.
-        if phase != "eventual_put" and future.cancel():
+        if phase not in KEEP_AFTER_THRESHOLD and future.cancel():
             failures.append(OwnerFailure(call.node.vm_id, OwnerOutcome.CANCELLED,
                                          "collection completed before this attempt started"))
         else:

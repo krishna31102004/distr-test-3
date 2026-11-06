@@ -1,1 +1,1 @@
-"""CS 425 MP3 Phase 0 foundations; distributed KV operations are pending."""
+"""CS 425 MP3: a distributed key-value store (Strong, Eventual-noRR and Eventual-RR)."""

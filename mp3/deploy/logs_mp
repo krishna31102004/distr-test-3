@@ -1,0 +1,10 @@
+#!/bin/bash
+# Show a node's event log (machine.<vm>.log, one JSON event per line, no value bytes).
+# Usage: ./logs_mp <vm> [grep-pattern] [lines]    e.g. ./logs_mp 3 mykey   |  ./logs_mp 2 read_repair
+. "$(dirname "$0")/lib.sh"
+[ $# -ge 1 ] || die "usage: ./logs_mp <vm> [pattern] [lines]"
+n=$(vm_num "$1") || die "invalid VM '$1'"
+pat="${2:-.}"; lines="${3:-20}"
+echo "== VM $n machine.$n.log (pattern: $pat)"
+vm_sh "$n" "grep -E -- '$pat' \"\$MP3_RUN/machine.\$N.log\" 2>/dev/null | tail -n $lines"
+true

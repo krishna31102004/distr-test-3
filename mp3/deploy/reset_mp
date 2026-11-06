@@ -1,0 +1,13 @@
+#!/bin/bash
+# Fresh start: delete databases, logs, outputs and console files on the VMs.
+# Only when every selected node is stopped. Usage: ./reset_mp all   |  ./reset_mp 3 4
+# Reset all ten together: a mixed cluster (some fresh, some old) is not a valid state.
+. "$(dirname "$0")/lib.sh"
+parse_vms "$@" || die "usage: ./reset_mp <vm...|all>"
+for n in "${VMS[@]}"; do
+    [ -z "$(vm_pid "$n")" ] || die "VM $n is running; stop it first (stop_mp / kill_mp)"
+done
+reset_one() {
+    vm_sh "$1" 'rm -f "$MP3_RUN/$VMID.db" "$MP3_RUN/$VMID.db-wal" "$MP3_RUN/$VMID.db-shm" "$MP3_RUN/machine.$N.log" "$MP3_RUN/node.out"; rm -rf "$MP3_RUN/out"; mkdir -p "$MP3_RUN/out"' && echo "VM $1: reset"
+}
+for_each_vm reset_one "${VMS[@]}"

@@ -1,4 +1,4 @@
-"""Local command/result types; these are not a network schema (KD-06/10)."""
+"""Shared domain types: modes, versions, records, contexts and storage results (KD-06/10)."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -10,40 +10,10 @@ class ConsistencyMode(str, Enum):
     EVENTUAL_RR = "eventual-RR"
 
 
-class Status(str, Enum):
-    OK = "OK"
-    NOT_FOUND = "NOT_FOUND"
-    TIMEOUT = "TIMEOUT"
-    ERROR = "ERROR"
-    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
-
-
 @dataclass(frozen=True)
 class Command:
     name: str
     args: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class OperationResult:
-    """Empty bytes are a successful value, never a missing-value sentinel.
-
-    Final RPC responses will also require request/replica/version/epoch metadata;
-    this deliberately small local result does not define their encoding.
-    """
-
-    status: Status
-    message: str = ""
-    value: bytes | None = None
-
-    def __post_init__(self) -> None:
-        """Reject ambiguous values on failures and nonbinary successful values."""
-        if not isinstance(self.status, Status):
-            raise ValueError("status must be a Status")
-        if self.value is not None and not isinstance(self.value, bytes):
-            raise TypeError("value must be bytes or None")
-        if self.status != Status.OK and self.value is not None:
-            raise ValueError("only OK results may carry a value")
 
 
 @dataclass(frozen=True)
@@ -103,7 +73,43 @@ class LocalStatus(str, Enum):
     SUPERSEDED = "SUPERSEDED"
     VERSION_CONFLICT = "VERSION_CONFLICT"
     STALE_EPOCH = "STALE_EPOCH"
+    TRANSITIONING = "TRANSITIONING"
     ERROR = "ERROR"
+
+
+def mode_change_clears_data(source: "ConsistencyMode", target: "ConsistencyMode") -> bool:
+    """Strong <-> Eventual clears all values and version metadata (SPEC); the two
+    Eventual modes keep them (the approved KD-16 choice)."""
+    return (source == ConsistencyMode.STRONG) != (target == ConsistencyMode.STRONG)
+
+
+@dataclass(frozen=True)
+class TransitionInfo:
+    """One node's record of a cluster-wide mode change (KD-16)."""
+
+    transition_id: str
+    coordinator: str
+    from_context: "Context"
+    target_context: "Context"
+    phase: str = "PREPARED"
+
+    def __post_init__(self) -> None:
+        import re
+        if not isinstance(self.transition_id, str) or not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                self.transition_id):
+            raise ValueError("transition_id must be a canonical lowercase UUID4")
+        if self.coordinator != "vm01":
+            raise ValueError("vm01 is the only transition coordinator")
+        if not isinstance(self.from_context, Context) or not isinstance(
+                self.target_context, Context):
+            raise ValueError("transition contexts must be Context values")
+        if self.target_context.epoch <= self.from_context.epoch:
+            raise ValueError("the target epoch must be above the current epoch")
+        if self.target_context.mode == self.from_context.mode:
+            raise ValueError("a transition must change the mode")
+        if self.phase not in ("PREPARED", "COMMITTED", "ACTIVE", "ABORTED"):
+            raise ValueError("invalid transition phase")
 
 
 @dataclass(frozen=True)

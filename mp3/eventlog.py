@@ -1,8 +1,9 @@
 """Opt-in JSON-lines logging and local replica events (KD-17).
 
 No handlers are installed at import time. This is not a durability mechanism.
-Do not log value bytes. Batch 3 replica handlers emit local GET/PUT receipt and
-response events; full distributed operation and MP1 query integration remain pending.
+Do not log value bytes. Replicas emit one receipt and one response event for every GET and
+PUT, and an Eventual-RR GET adds one structured read_repair event. Written to a file named
+machine.<N>.log, these lines can be searched with the unchanged MP1 server and client.
 """
 
 import json
@@ -19,13 +20,19 @@ _REPLICA_EVENT_LOCK = threading.Lock()
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Encode one event as one JSON line, escaping embedded newlines."""
-        return json.dumps({
+        event = {
             "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
             "level": record.levelname,
             "event": record.getMessage(),
             "node_id": getattr(record, "node_id", None),
             "request_id": getattr(record, "request_id", None),
-        }, ensure_ascii=True, sort_keys=True)
+        }
+        # Structured events (read repair) add flat fields; they may not replace base keys.
+        for name, value in (getattr(record, "fields", None) or {}).items():
+            if name in event:
+                raise ValueError(f"log field {name!r} clashes with a base field")
+            event[name] = value
+        return json.dumps(event, ensure_ascii=True, sort_keys=True)
 
 
 def configure_logging(logger: logging.Logger, path: str | Path, *, stream) -> None:
@@ -69,3 +76,15 @@ def log_replica_event(logger: logging.Logger | None, phase: str, operation: str,
                         extra={"node_id": node_id, "request_id": request_id})
         print(line, file=stream if stream is not None else sys.stdout, flush=True)
     return line
+
+
+def log_read_repair(logger: logging.Logger | None, *, node_id: str, operation_id: str,
+                    fields: dict) -> None:
+    """Append one structured Eventual-RR event: returned version, reachable replicas,
+    each owner's response and every repair (KD-13/KD-17). `fields` must hold only
+    JSON-ready text, numbers, lists and dicts; value bytes are never logged. A missing
+    logger is not an error: the node simply runs without a machine log."""
+    if logger is None:
+        return
+    logger.info("read_repair", extra={"node_id": node_id, "request_id": operation_id,
+                                      "fields": fields})

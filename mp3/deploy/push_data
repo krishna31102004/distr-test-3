@@ -1,0 +1,10 @@
+#!/bin/bash
+# Copy the course dataset (files business_1 .. business_20) to every VM.
+# Usage: ./push_data /path/to/local/dataset_dir [vm...|all]
+. "$(dirname "$0")/lib.sh"
+src="${1:-}"; [ -d "$src" ] || die "usage: ./push_data <local dataset dir> [vm...|all]"; shift
+parse_vms "${@:-all}"
+push_one() {
+    (cd "$src" && COPYFILE_DISABLE=1 tar -czf - .) | vm_pipe "$1" 'mkdir -p "$MP3_DATA" && tar -xzf - -C "$MP3_DATA"' && echo "VM $1: dataset copied"
+}
+for_each_vm push_one "${VMS[@]}"

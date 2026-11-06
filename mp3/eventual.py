@@ -1,9 +1,11 @@
-"""Eventual-noRR client coordination on the shared bounded MP3 runtime (KD-12)."""
+"""Eventual-noRR and Eventual-RR client coordination on the bounded MP3 runtime (KD-12/13)."""
 
 from __future__ import annotations
 
-from concurrent.futures import Future, wait, FIRST_COMPLETED
+from concurrent.futures import Future, InvalidStateError, wait
 from dataclasses import dataclass
+from enum import Enum
+import hashlib
 import math
 import threading
 import time
@@ -16,7 +18,8 @@ from .coordinator import (
     ProtocolResult, RpcCompletion,
     collect_distinct,
 )
-from .models import ConsistencyMode, Record
+from .eventlog import log_read_repair
+from .models import ConsistencyMode, Record, Version
 from .rpc import RpcOperation, RpcOutcomeKind, RpcStatus, new_operation_id
 
 if TYPE_CHECKING:
@@ -198,7 +201,18 @@ class PropagationHandle:
 
 
 class EventualNoRRCoordinator:
-    """Run first-R Eventual reads and bounded five-owner Eventual writes."""
+    """Run first-R Eventual reads and bounded five-owner Eventual writes.
+
+    `EventualRRCoordinator` subclasses this: PUT is identical, only the mode, the
+    schema activation it needs and the GET path differ.
+    """
+
+    MODE = ConsistencyMode.EVENTUAL_NO_RR
+    MODE_ERROR = "Eventual-noRR operation requires eventual-noRR mode"
+    GATE_ERROR = "SCHEMA2_DISABLED"
+
+    def _activation(self):
+        return self.runtime.protocol_activation
 
     def __init__(self, runtime: "NodeRuntime", *, read_quorum: int = 2,
                  write_quorum: int = 2, foreground_seconds: float = 5.0):
@@ -312,12 +326,11 @@ class EventualNoRRCoordinator:
     def _external_gate(self, operation_id: str) -> ProtocolResult | None:
         if not self.runtime.ready:
             return self._result(OperationStatus.ERROR, operation_id, error="node is not ready")
-        activation = self.runtime.protocol_activation
+        activation = self._activation()
         if activation is None or not activation.enabled_for(self.runtime.manifest):
-            return self._result(OperationStatus.ERROR, operation_id, error="SCHEMA2_DISABLED")
-        if self.runtime.context.mode != ConsistencyMode.EVENTUAL_NO_RR:
-            return self._result(OperationStatus.ERROR, operation_id,
-                                error="Eventual-noRR operation requires eventual-noRR mode")
+            return self._result(OperationStatus.ERROR, operation_id, error=self.GATE_ERROR)
+        if self.runtime.context.mode != self.MODE:
+            return self._result(OperationStatus.ERROR, operation_id, error=self.MODE_ERROR)
         return None
 
     def _run_put(self, admission: "CoordinatorAdmission", key: str,
@@ -327,10 +340,9 @@ class EventualNoRRCoordinator:
         operation_id = admission.operation_id
         deadline = admission.deadline
         context = admission.context
-        if context.mode != ConsistencyMode.EVENTUAL_NO_RR:
+        if context.mode != self.MODE:
             transition.finish(min(time.monotonic(), lease.foreground_deadline))
-            return self._result(OperationStatus.ERROR, operation_id,
-                                error="Eventual-noRR operation requires eventual-noRR mode")
+            return self._result(OperationStatus.ERROR, operation_id, error=self.MODE_ERROR)
         owners = self.runtime.manifest.owners(key)
         if time.monotonic() >= deadline:
             transition.finish(deadline)
@@ -429,9 +441,8 @@ class EventualNoRRCoordinator:
     def _run_get(self, admission: "CoordinatorAdmission", key: str,
                  deadline: float, required: int) -> ProtocolResult:
         operation_id, context = admission.operation_id, admission.context
-        if context.mode != ConsistencyMode.EVENTUAL_NO_RR:
-            return self._result(OperationStatus.ERROR, operation_id,
-                                error="Eventual-noRR operation requires eventual-noRR mode")
+        if context.mode != self.MODE:
+            return self._result(OperationStatus.ERROR, operation_id, error=self.MODE_ERROR)
         owners = self.runtime.manifest.owners(key)
         reservation = self.runtime.reserve_attempts(5, deadline=deadline,
                                                     admission=admission)
@@ -515,3 +526,571 @@ class EventualNoRRCoordinator:
         return ProtocolResult(status, value, version, operation_id,
                               tuple(dict.fromkeys(owners)), completion_unknown,
                               propagation, error)
+
+
+# ---------------------------------------------------------------------------
+# Eventual-RR (KD-13): first-R client reply, bounded comparison, one repair pass
+# ---------------------------------------------------------------------------
+
+RR_READ_PHASE = "eventual_rr_read"
+RR_REPAIR_PHASE = "eventual_rr_repair"
+RR_READ_LIFETIME_SECONDS = 15.0       # read lease hard cap from admission
+RR_READ_CONTINUATION_SECONDS = 10.0   # read window that follows the client reply
+RR_REPAIR_SECONDS = 5.0               # repair pass budget
+RR_TOTAL_LIFETIME_SECONDS = 20.0      # nothing runs past admission + 20 s
+RR_SETTLE_SECONDS = 1.0               # grace for lease-aware workers to exit
+
+
+@dataclass(frozen=True)
+class ReadEvidence:
+    """One owner's read: a valid reply (outcome None) or why none is usable."""
+
+    owner_id: str
+    generation: int | None
+    outcome: OwnerOutcome | None
+    status: RpcStatus | None = None
+    version: Version | None = None
+    value_digest: str | None = None
+    error: str | None = None
+
+    @property
+    def valid(self) -> bool:
+        return self.outcome is None
+
+
+class RepairStatus(str, Enum):
+    REPAIRED = "REPAIRED"
+    SUPERSEDED_NEWER = "SUPERSEDED_NEWER"
+    FAILED = "FAILED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    owner_id: str
+    status: RepairStatus
+    requested_version: Version | None
+    stored_version: Version | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ReadRepairReport:
+    """Final evidence for one Eventual-RR GET; carries digests, never value bytes."""
+
+    operation_id: str
+    returned_status: OperationStatus | None
+    returned_version: Version | None
+    replies: tuple[ReadEvidence, ...]
+    maximum_version: Version | None
+    repairs: tuple[RepairResult, ...]
+    conflict: bool = False
+    incomplete_reason: str | None = None
+
+    @property
+    def reachable(self) -> tuple[str, ...]:
+        return tuple(reply.owner_id for reply in self.replies if reply.valid)
+
+
+class ReadRepairHandle:
+    """Completion view of one RR GET's background comparison and repair."""
+
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        self._done = threading.Event()
+        self._lock = threading.Lock()
+        self._claimed = False
+        self._report: ReadRepairReport | None = None
+
+    def claim(self) -> bool:
+        """Take the single right to log and finish this operation's report."""
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
+
+    def finish(self, report: ReadRepairReport) -> None:
+        with self._lock:
+            self._report = report
+        self._done.set()
+
+    @property
+    def terminal(self) -> bool:
+        return self._done.is_set()
+
+    def wait(self, timeout: float | None = None) -> ReadRepairReport | None:
+        """Return the final report, or None if it is not ready within `timeout`."""
+        if timeout is not None and (type(timeout) not in (int, float)
+                                    or not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("timeout must be finite and nonnegative")
+        if not self._done.wait(timeout):
+            return None
+        return self._report
+
+
+def _version_text(version: Version | None) -> str | None:
+    return None if version is None else f"{version.kind}:{version.number}:{version.writer_id}"
+
+
+class EventualRRCoordinator(EventualNoRRCoordinator):
+    """Eventual-RR: PUT is the Eventual PUT; GET replies after R then repairs once."""
+
+    MODE = ConsistencyMode.EVENTUAL_RR
+    MODE_ERROR = "Eventual-RR operation requires eventual-RR mode"
+    GATE_ERROR = "SCHEMA3_DISABLED"
+
+    def _activation(self):
+        return self.runtime.rr_activation
+
+    def eventual_get(self, key: str, *, deadline: float) -> ProtocolResult:
+        """Return the newest of the first R replies; compare and repair in the background.
+
+        The result's `propagation` is a `ReadRepairHandle` whose `wait()` gives the
+        final report. The client result is frozen when R replies arrive.
+        """
+        operation_id = new_operation_id()
+        invalid = self._validate_key(key, operation_id)
+        if invalid:
+            return invalid
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            return self._result(OperationStatus.ERROR, operation_id,
+                                error="deadline must be a finite monotonic timestamp")
+        failure = self._external_gate(operation_id)
+        if failure:
+            return failure
+        handle = ReadRepairHandle(operation_id)
+        foreground: Future = Future()
+        admitted_at = time.monotonic()  # every RR time limit counts from admission
+        try:
+            future = self.runtime.submit_coordinator(
+                self._run_rr_get, key, deadline, self.read_quorum, foreground, handle,
+                admitted_at, deadline=deadline, operation_id=operation_id)
+        except (RuntimeError, ValueError) as error:
+            return self._result(OperationStatus.ERROR, operation_id, error=str(error))
+        if future is None:
+            return self._result(OperationStatus.OVERLOADED, operation_id,
+                                error="coordinator capacity unavailable")
+
+        def settle(done: Future) -> None:
+            # The task normally settles the client result itself; this covers a task
+            # that was cancelled or died before it could.
+            if foreground.done():
+                return
+            reason = "coordinator canceled" if done.cancelled() else (
+                f"coordinator failed: {type(done.exception()).__name__}")
+            try:
+                foreground.set_result(self._result(OperationStatus.ERROR, operation_id,
+                                                   error=reason))
+            except InvalidStateError:
+                pass
+            self._finish_report(handle, key, ReadRepairReport(
+                operation_id, OperationStatus.ERROR, None, (), None, (),
+                incomplete_reason=reason))
+
+        future.add_done_callback(settle)
+        try:
+            return foreground.result(timeout=max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            return self._result(OperationStatus.TIMEOUT, operation_id, propagation=handle,
+                                error="Eventual-RR GET deadline expired")
+
+    # -- coordinator task ---------------------------------------------------
+
+    def _run_rr_get(self, admission: "CoordinatorAdmission", key: str, deadline: float,
+                    required: int, foreground: Future, handle: ReadRepairHandle,
+                    admitted_at: float) -> None:
+        """Foreground half: five reads, reply after R. The rest runs on the background pool."""
+        operation_id, context = admission.operation_id, admission.context
+        started = time.monotonic()
+
+        def settle(result: ProtocolResult) -> None:
+            try:
+                foreground.set_result(result)
+            except InvalidStateError:
+                pass
+
+        def give_up(status: OperationStatus, reason: str, replies=(), *, error=None) -> None:
+            settle(self._result(status, operation_id, propagation=handle,
+                                error=error or reason))
+            self._finish_report(handle, key, ReadRepairReport(
+                operation_id, status, None, tuple(replies), None, (),
+                incomplete_reason=reason))
+
+        if context.mode != self.MODE:
+            give_up(OperationStatus.ERROR, self.MODE_ERROR)
+            return
+        if deadline - started <= 0:
+            give_up(OperationStatus.TIMEOUT, "deadline expired before dispatch")
+            return
+        owners = self.runtime.manifest.owners(key)
+        lease = AttemptLease(
+            admitted_at=admitted_at,
+            foreground_seconds=min(deadline - admitted_at, RR_READ_LIFETIME_SECONDS),
+            continuation_seconds=RR_READ_CONTINUATION_SECONDS,
+            max_lifetime=RR_READ_LIFETIME_SECONDS)
+        try:
+            reservation = self.runtime.reserve_attempts(
+                5, deadline=admission.deadline, queue_deadline=lease.hard_deadline,
+                admission=admission, attempt_lease=lease)
+        except (RuntimeError, ValueError) as error:
+            give_up(OperationStatus.ERROR, "cannot reserve read attempts",
+                    error=f"cannot reserve read attempts: {error}")
+            return
+        if reservation is None:
+            give_up(OperationStatus.OVERLOADED,
+                    "cannot reserve read attempts; no replica request was sent",
+                    error="cannot reserve read attempts")
+            return
+        calls: list[OwnerCall] = []
+        preflight: list[OwnerFailure] = []
+        client = None
+        try:
+            for owner in owners:
+                try:
+                    calls.append(self.runtime.dispatch_owner(
+                        owner.vm_id, RpcOperation.READ_LOCAL, key,
+                        deadline=lease.hard_deadline, reservation=reservation,
+                        phase=RR_READ_PHASE, operation_id=operation_id,
+                        attempt_lease=lease, admission=admission))
+                except Exception as error:
+                    failure = getattr(error, "failure", None)
+                    if not isinstance(failure, OwnerFailure):
+                        failure = OwnerFailure(owner.vm_id, OwnerOutcome.ERROR, str(error))
+                    preflight.append(failure)
+            if not calls:
+                give_up(OperationStatus.ERROR, "no prescribed owner read could be dispatched",
+                        [self._failed_read(f) for f in preflight])
+                return
+            collection = collect_distinct(
+                tuple(calls), owners=owners, manifest=self.runtime.manifest,
+                required=required, operation_id=operation_id, phase=RR_READ_PHASE,
+                context=context, deadline=min(deadline, lease.foreground_deadline),
+                preflight_failures=preflight, key=key)
+            if not collection.reached:
+                # R is out of reach: stop the unused reads and schedule no repair.
+                self._stop_reads(lease, calls)
+                give_up(self._failure_status(collection),
+                        "R replies were not reached; no repair scheduled",
+                        self._gather_reads(calls, preflight),
+                        error=self._failure_text(collection, RR_READ_PHASE))
+                return
+            returned = self._returned_record(collection)
+            if returned is False:
+                self._stop_reads(lease, calls)
+                give_up(OperationStatus.ERROR, "equal version with conflicting bytes",
+                        self._gather_reads(calls, preflight),
+                        error="equal Eventual version has conflicting bytes")
+                return
+            owner_ids = tuple(reply.owner_id for reply in collection.qualifying)
+            if returned is None:
+                outcome = self._result(OperationStatus.NOT_FOUND, operation_id,
+                                       owners=owner_ids, propagation=handle)
+            else:
+                outcome = self._result(OperationStatus.OK, operation_id,
+                                       value=returned.value, version=returned.version,
+                                       owners=owner_ids, propagation=handle)
+            lease.finish_foreground(min(time.monotonic(), lease.foreground_deadline))
+            settle(outcome)  # the client result is frozen from here on
+            client = outcome
+        except Exception as error:
+            give_up(OperationStatus.ERROR, f"internal error: {type(error).__name__}",
+                    error=f"Eventual-RR GET failed: {type(error).__name__}")
+        finally:
+            reservation.close()
+        if client is not None:
+            self._hand_off(context, key, owners, calls, preflight, lease, client, handle,
+                           admitted_at)
+
+    def _hand_off(self, context, key, owners, calls, preflight, lease, client, handle,
+                  admitted_at) -> None:
+        """Give the comparison and repair to the bounded background pool, not a worker."""
+        resources = self.runtime.coordinator_resources
+        future = None
+        try:
+            if resources is not None:
+                future = resources.background.submit(
+                    self._background, context, key, owners, calls, preflight, lease,
+                    client, handle, admitted_at, deadline=time.monotonic() + 1.0)
+        except (RuntimeError, ValueError):
+            future = None
+        if future is None:
+            self._stop_reads(lease, calls)
+            self._finish_report(handle, key, ReadRepairReport(
+                handle.operation_id, client.status, client.version,
+                tuple(self._gather_reads(calls, preflight)), None, (),
+                incomplete_reason="background capacity unavailable; no repair"))
+            return
+
+        def abandoned(done: Future) -> None:
+            # A queued comparison dropped at shutdown must still finish its report.
+            if done.cancelled():
+                self._stop_reads(lease, calls)
+                self._finish_report(handle, key, ReadRepairReport(
+                    handle.operation_id, client.status, client.version, (), None, (),
+                    incomplete_reason="shut down before the comparison started; no repair"))
+
+        future.add_done_callback(abandoned)
+
+    def _background(self, context, key, owners, calls, preflight, lease, client, handle,
+                    admitted_at) -> None:
+        try:
+            self._compare_and_repair(context, key, owners, calls, preflight, lease,
+                                     client, handle, admitted_at)
+        except Exception as error:
+            self._finish_report(handle, key, ReadRepairReport(
+                handle.operation_id, client.status, client.version, (), None, (),
+                incomplete_reason=f"internal error: {type(error).__name__}"))
+
+    def _stop_reads(self, lease: AttemptLease, calls) -> None:
+        lease.cancel()
+        for call in calls:
+            call.future.cancel()
+
+    @staticmethod
+    def _returned_record(collection):
+        """Maximum FOUND record among the first R replies; None if all absent; False on conflict."""
+        records = [Record(reply.response.version, reply.response.value)
+                   for reply in collection.qualifying
+                   if reply.response.status == RpcStatus.FOUND]
+        if not records:
+            return None
+        maximum = records[0]
+        for record in records[1:]:
+            order = record.version.compare(maximum.version)
+            if order == 0 and record.value != maximum.value:
+                return False
+            if order > 0:
+                maximum = record
+        return maximum
+
+    # -- evidence -----------------------------------------------------------
+
+    @staticmethod
+    def _failed_read(failure: OwnerFailure) -> ReadEvidence:
+        return ReadEvidence(failure.owner_id, None, failure.outcome, error=failure.error)
+
+    def _read_evidence(self, call: OwnerCall) -> tuple[ReadEvidence, bytes]:
+        owner_id, generation = call.node.vm_id, call.expected_generation
+
+        def failed(outcome, error=None):
+            return ReadEvidence(owner_id, generation, outcome, error=error), b""
+
+        future = call.future
+        if future.cancelled():
+            return failed(OwnerOutcome.CANCELLED, "read canceled before it started")
+        if not future.done():
+            return failed(OwnerOutcome.TIMEOUT, "read did not finish in the comparison window")
+        try:
+            completion = future.result()
+            if not isinstance(completion, RpcCompletion):
+                raise TypeError("invalid completion")
+        except BaseException as error:
+            return failed(OwnerOutcome.ERROR, type(error).__name__)
+        outcome = completion.outcome
+        if outcome.kind != RpcOutcomeKind.RESPONSE or outcome.response is None:
+            names = {RpcOutcomeKind.TIMEOUT: OwnerOutcome.TIMEOUT,
+                     RpcOutcomeKind.UNREACHABLE: OwnerOutcome.UNREACHABLE,
+                     RpcOutcomeKind.INVALID_RESPONSE: OwnerOutcome.INVALID_RESPONSE,
+                     RpcOutcomeKind.OVERLOADED: OwnerOutcome.OVERLOADED,
+                     RpcOutcomeKind.CANCELLED: OwnerOutcome.CANCELLED}
+            return failed(names.get(outcome.kind, OwnerOutcome.ERROR), outcome.error)
+        response = outcome.response
+        try:
+            response.validate_for(call.request, call.node, self.runtime.manifest, generation)
+        except (TypeError, ValueError) as error:
+            return failed(OwnerOutcome.INVALID_RESPONSE, str(error))
+        if (response.operation_id != call.request.operation_id
+                or response.phase != RR_READ_PHASE):
+            return failed(OwnerOutcome.INVALID_RESPONSE, "operation or phase did not match")
+        if response.status == RpcStatus.FOUND:
+            digest = hashlib.sha256(response.value).hexdigest()
+            return ReadEvidence(owner_id, generation, None, RpcStatus.FOUND,
+                                response.version, digest), response.value
+        if response.status == RpcStatus.NOT_FOUND:
+            return ReadEvidence(owner_id, generation, None, RpcStatus.NOT_FOUND), b""
+        if response.status == RpcStatus.STALE_EPOCH:
+            return failed(OwnerOutcome.STALE_EPOCH, response.error)
+        return failed(OwnerOutcome.ERROR, response.error or response.status.value)
+
+    def _gather_reads(self, calls, preflight) -> list[ReadEvidence]:
+        rows = [self._read_evidence(call)[0] for call in calls]
+        rows.extend(self._failed_read(failure) for failure in preflight)
+        return rows
+
+    # -- comparison and the single repair pass ------------------------------
+
+    def _compare_and_repair(self, context, key, owners, calls, preflight, lease, client,
+                            handle, admitted_at) -> None:
+        operation_id = handle.operation_id
+        futures = [call.future for call in calls]
+        # Window: until every read is terminal or the read cutoff (<= admission + 15 s).
+        wait(futures, timeout=max(0.0, lease.current_deadline() - time.monotonic()))
+        for future in futures:
+            future.cancel()  # a read still queued at the cutoff never starts
+        wait(futures, timeout=RR_SETTLE_SECONDS)
+        gathered = [self._read_evidence(call) for call in calls]
+        replies = [row for row, _value in gathered]
+        replies.extend(self._failed_read(failure) for failure in preflight)
+
+        found = [(row, value) for row, value in gathered
+                 if row.valid and row.status == RpcStatus.FOUND]
+        conflict = False
+        best_row = best_value = None
+        for row, value in found:
+            if best_row is None:
+                best_row, best_value = row, value
+                continue
+            order = row.version.compare(best_row.version)
+            if order == 0 and row.value_digest != best_row.value_digest:
+                conflict = True
+            elif order > 0:
+                best_row, best_value = row, value
+        maximum = None if best_row is None else best_row.version
+        if conflict:
+            # Two different values share one version: which is right is unknowable.
+            self._finish_report(handle, key, ReadRepairReport(
+                operation_id, client.status, client.version, tuple(replies), maximum, (),
+                conflict=True, incomplete_reason="conflicting bytes for one version; no repair"))
+            return
+        targets = []
+        if maximum is not None:
+            for row, _value in gathered:
+                if not row.valid:
+                    continue
+                if row.status == RpcStatus.NOT_FOUND or (
+                        row.status == RpcStatus.FOUND and row.version.compare(maximum) < 0):
+                    targets.append(row.owner_id)
+        repairs = self._repair(context, operation_id, key, targets, maximum, best_value,
+                               admitted_at)
+        self._finish_report(handle, key, ReadRepairReport(
+            operation_id, client.status, client.version, tuple(replies), maximum,
+            tuple(repairs)))
+
+    def _repair(self, context, operation_id, key, targets, version, value, admitted_at):
+        """Send one conditional install to each stale or missing reachable owner."""
+        if not targets:
+            return []
+
+        def skipped(reason):
+            return [RepairResult(owner, RepairStatus.NOT_ATTEMPTED, version, error=reason)
+                    for owner in targets]
+
+        try:
+            current = self.runtime.context
+        except RuntimeError:
+            return skipped("node is not accepting work")
+        if current != context:
+            return skipped("mode or epoch changed after the read")
+        # Everything, including the settle wait below, ends by admission + 20 s.
+        window = min(RR_REPAIR_SECONDS, admitted_at + RR_TOTAL_LIFETIME_SECONDS
+                     - time.monotonic() - RR_SETTLE_SECONDS)
+        if window <= 0.05:
+            return skipped("20-second repair limit reached")
+        lease = AttemptLease(admitted_at=time.monotonic(), foreground_seconds=window,
+                             continuation_seconds=window, max_lifetime=window)
+        reserve_deadline = time.monotonic() + 1.0
+        try:
+            reservation = self.runtime.reserve_attempts(
+                len(targets), deadline=reserve_deadline,
+                queue_deadline=max(lease.hard_deadline, reserve_deadline))
+        except (RuntimeError, ValueError) as error:
+            return skipped(f"cannot reserve repair attempts: {type(error).__name__}")
+        if reservation is None:
+            return skipped("repair capacity unavailable")
+        results: dict[str, RepairResult] = {}
+        calls: list[OwnerCall] = []
+        try:
+            for owner in targets:
+                try:
+                    # No coordinator admission is held here; the lease bounds the call.
+                    calls.append(self.runtime.dispatch_owner(
+                        owner, RpcOperation.INSTALL_IF_NEWER, key,
+                        deadline=lease.hard_deadline, reservation=reservation,
+                        phase=RR_REPAIR_PHASE, operation_id=operation_id,
+                        version=version, value=value, attempt_lease=lease))
+                except Exception as error:
+                    failure = getattr(error, "failure", None)
+                    results[owner] = RepairResult(
+                        owner, RepairStatus.NOT_ATTEMPTED, version,
+                        error=(failure.error if failure is not None else type(error).__name__))
+            futures = [call.future for call in calls]
+            wait(futures, timeout=max(0.0, lease.hard_deadline - time.monotonic()))
+            lease.cancel()
+            wait(futures, timeout=RR_SETTLE_SECONDS)
+            for call in calls:
+                results[call.node.vm_id] = self._repair_result(call, version)
+        finally:
+            reservation.close()
+        return [results[owner] for owner in targets]
+
+    def _repair_result(self, call: OwnerCall, version: Version) -> RepairResult:
+        owner = call.node.vm_id
+
+        def failed(text):
+            return RepairResult(owner, RepairStatus.FAILED, version, error=text)
+
+        future = call.future
+        if future.cancelled():
+            return failed("repair canceled before it started")
+        if not future.done():
+            return failed("repair did not finish in its window")
+        try:
+            outcome = future.result().outcome
+        except BaseException as error:
+            return failed(type(error).__name__)
+        if outcome.kind != RpcOutcomeKind.RESPONSE or outcome.response is None:
+            return failed(outcome.kind.value + (f": {outcome.error}" if outcome.error else ""))
+        response = outcome.response
+        try:
+            response.validate_for(call.request, call.node, self.runtime.manifest,
+                                  call.expected_generation)
+        except (TypeError, ValueError) as error:
+            return failed(f"invalid response: {error}")
+        if (response.operation_id != call.request.operation_id
+                or response.phase != RR_REPAIR_PHASE):
+            return failed("operation or phase did not match")
+        if (response.status in (RpcStatus.INSTALLED, RpcStatus.UNCHANGED)
+                and response.durable and response.stored_version == version):
+            return RepairResult(owner, RepairStatus.REPAIRED, version, response.stored_version)
+        if (response.status == RpcStatus.SUPERSEDED and response.durable
+                and response.stored_version is not None
+                and response.stored_version.compare(version) > 0):
+            # A newer write won. Its bytes are not in this reply, so nothing is propagated.
+            return RepairResult(owner, RepairStatus.SUPERSEDED_NEWER, version,
+                                response.stored_version)
+        return failed(response.error or response.status.value)
+
+    def _finish_report(self, handle: ReadRepairHandle, key: str,
+                       report: ReadRepairReport) -> None:
+        if not handle.claim():
+            return
+        try:
+            self._log_report(key, report)  # logged before waiters are released
+        finally:
+            handle.finish(report)
+
+    def _log_report(self, key: str, report: ReadRepairReport) -> None:
+        log_read_repair(getattr(self.runtime, "logger", None), node_id=self.runtime.vm_id,
+                        operation_id=report.operation_id, fields={
+                            "operation": "get", "mode": "eventual-RR", "key": key,
+                            "returned_status": (report.returned_status.value
+                                                if report.returned_status else None),
+                            "returned_version": _version_text(report.returned_version),
+                            "reachable": list(report.reachable),
+                            "responses": [{
+                                "owner": row.owner_id,
+                                "result": (row.status.value if row.valid
+                                           else row.outcome.value),
+                                "version": _version_text(row.version),
+                                "digest": row.value_digest, "error": row.error,
+                            } for row in report.replies],
+                            "maximum_version": _version_text(report.maximum_version),
+                            "repairs": [{
+                                "owner": repair.owner_id, "status": repair.status.value,
+                                "requested_version": _version_text(repair.requested_version),
+                                "stored_version": _version_text(repair.stored_version),
+                                "error": repair.error,
+                            } for repair in report.repairs],
+                            "conflict": report.conflict,
+                            "incomplete_reason": report.incomplete_reason})

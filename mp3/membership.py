@@ -16,7 +16,7 @@ import random
 import socket
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Callable
 
 from .framing import HEADER, send_frame
 from .ring import Manifest, Node, node_position

@@ -47,7 +47,7 @@ def make_manifest():
     used = set()
     for number in range(1, 11):
         ports = []
-        while len(ports) < 3:
+        while len(ports) < 4:
             port = unused_port()
             if port not in used:
                 used.add(port)
@@ -57,6 +57,7 @@ def make_manifest():
             "kv": Endpoint("127.0.0.1", ports[0]),
             "membership": Endpoint("127.0.0.1", ports[1]),
             "log_query": Endpoint("127.0.0.1", ports[2]),
+            "control": Endpoint("127.0.0.1", ports[3]),
         }
     return Manifest.from_endpoints(endpoints)
 

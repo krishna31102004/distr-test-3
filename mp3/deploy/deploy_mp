@@ -1,0 +1,26 @@
+#!/bin/bash
+# Copy the MP3 code, manifest, inventory and helper scripts to the VMs (nothing is started).
+# Usage: ./deploy_mp all | ./deploy_mp 1 2 3
+# Refuses to touch a VM whose node is running (kill it first), and never deletes a database.
+. "$(dirname "$0")/lib.sh"
+parse_vms "$@" || die "usage: ./deploy_mp <vm...|all>"
+ensure_generated
+
+deploy_one() {
+    local n="$1"
+    if [ -n "$(vm_pid "$n")" ]; then echo "VM $n: node is running; kill_mp $n first"; return 1; fi
+    echo "VM $n: copying files"
+    # Code: the mp3 package without tests, docs, deploy tooling or caches.
+    (cd "$REPO_ROOT" && COPYFILE_DISABLE=1 tar -czf - --exclude='mp3/tests' --exclude='mp3/deploy' \
+        --exclude='__pycache__' --exclude='*.md' mp3) |
+        vm_pipe "$n" 'mkdir -p "$MP3_RUN" "$MP3_RUN/out" && rm -rf "$MP3_ROOT/mp3" && tar -xzf - -C "$MP3_ROOT"' || return 1
+    (cd "$DEPLOY_DIR/remote" && cat start_node.sh) | vm_pipe "$n" 'cat > "$MP3_RUN/start_node.sh"' || return 1
+    (cd "$DEPLOY_DIR/remote" && cat mp3) | vm_pipe "$n" 'cat > "$MP3_RUN/mp3"' || return 1
+    cat "$GEN_DIR/manifest.json" | vm_pipe "$n" 'cat > "$MP3_RUN/manifest.json"' || return 1
+    cat "$GEN_DIR/inventory.json" | vm_pipe "$n" 'cat > "$MP3_RUN/inventory.json"' || return 1
+    vm_sh "$n" 'echo "$VMID" > "$MP3_RUN/vm_id"; chmod +x "$MP3_RUN/start_node.sh" "$MP3_RUN/mp3"; mkdir -p "$MP3_DATA"' || return 1
+    echo "VM $n: deployed"
+}
+
+for_each_vm deploy_one "${VMS[@]}" || die "deployment failed on at least one VM"
+echo "Deployed to VMs: ${VMS[*]}"

@@ -16,20 +16,25 @@ from typing import TextIO
 
 from .eventlog import configure_logging
 from .attempts import AttemptLease
+from .config import DEFAULT_R, DEFAULT_W, validate_quorums
+from .control import ControlService
 from .coordinator import (
     DEFAULT_ATTEMPT_QUEUE, DEFAULT_ATTEMPT_WORKERS,
+    DEFAULT_BACKGROUND_QUEUE, DEFAULT_BACKGROUND_WORKERS,
     DEFAULT_COORDINATOR_QUEUE, DEFAULT_COORDINATOR_WORKERS,
     CoordinatorResources, CoordinatorShutdownReport, OwnerCall, OwnerDispatchError,
-    OwnerFailure, OwnerOutcome, Schema2Activation,
+    OwnerFailure, OwnerOutcome, Schema2Activation, Schema3Activation,
     dispatch_owner as _dispatch_owner,
 )
 from .membership import Member, MembershipRuntime
 from .models import ConsistencyMode, Context, Version
 from .replica import DEFAULT_REPLICA_QUEUE, DEFAULT_REPLICA_WORKERS, ReplicaService, ShutdownReport
 from .ring import Manifest, Node, load_manifest
-from .rpc import (ReplicaClient, ReplicaRequest, RpcOperation, RpcOutcome,
-                  new_operation_id, new_request)
+from .rpc import (PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION, ReplicaClient,
+                  RpcOperation, RpcOutcome, new_operation_id, new_request)
 from .storage import Store, open_store
+from .multiput import MultiputManager
+from .transition import TransitionManager
 
 
 DEFAULT_NODE_SHUTDOWN_TIMEOUT = 12.0
@@ -44,6 +49,7 @@ class NodeShutdownReport:
     membership_stopped: bool
     store_closed: bool
     coordinator: CoordinatorShutdownReport | None = None
+    control: ShutdownReport | None = None
 
     @property
     def clean(self) -> bool:
@@ -54,6 +60,8 @@ class NodeShutdownReport:
             and self.incomplete_requests == 0
             and (self.replica is None or self.replica.workers_joined)
             and (self.coordinator is None or self.coordinator.clean)
+            and (self.control is None or (
+                self.control.workers_joined and self.control.incomplete_requests == 0))
         )
 
     @property
@@ -75,7 +83,8 @@ class NodeRuntime:
     """Own one VM's Store, membership/gossip, KV replica service, and RPC client.
 
     The runtime owns local services and exposes programmatic Strong ABD and
-    Eventual-noRR methods. Eventual-RR and command-line PUT/GET remain pending.
+    Eventual-noRR and Eventual-RR methods, plus the control endpoint, mode-transition
+    manager and multiput manager that the command line uses.
     """
 
     def __init__(self, *, manifest: Manifest, vm_id: str, database_path: str | Path,
@@ -88,7 +97,12 @@ class NodeRuntime:
                  coordinator_queue: int = DEFAULT_COORDINATOR_QUEUE,
                  attempt_workers: int = DEFAULT_ATTEMPT_WORKERS,
                  attempt_queue: int = DEFAULT_ATTEMPT_QUEUE,
+                 background_workers: int = DEFAULT_BACKGROUND_WORKERS,
+                 background_queue: int = DEFAULT_BACKGROUND_QUEUE,
+                 read_quorum: int = DEFAULT_R, write_quorum: int = DEFAULT_W,
+                 multiput_file: str | Path | None = None,
                  protocol_activation: Schema2Activation | None = None,
+                 rr_activation: Schema3Activation | None = None,
                  gossip_background: bool = True):
         if not isinstance(manifest, Manifest):
             raise TypeError("manifest must be a validated Manifest")
@@ -118,6 +132,16 @@ class NodeRuntime:
         if protocol_activation is not None and not protocol_activation.enabled_for(manifest):
             raise ValueError("schema-2 activation does not match this manifest")
         self.protocol_activation = protocol_activation
+        if rr_activation is not None and not rr_activation.enabled_for(manifest):
+            raise ValueError("schema-3 activation does not match this manifest")
+        self.rr_activation = rr_activation
+        self.background_workers = background_workers
+        self.background_queue = background_queue
+        validate_quorums(read_quorum, write_quorum)  # Eventual R and W for this node
+        self.read_quorum = read_quorum
+        self.write_quorum = write_quorum
+        # The value this VM puts in a multiput: this file, or random bytes if unset.
+        self.multiput_file = None if multiput_file is None else Path(multiput_file)
         self.gossip_background = gossip_background
 
         self.store: Store | None = None
@@ -125,6 +149,9 @@ class NodeRuntime:
         self.replica_service: ReplicaService | None = None
         self.rpc_client: ReplicaClient | None = None
         self.coordinator_resources: CoordinatorResources | None = None
+        self.control_service: ControlService | None = None
+        self.transition: TransitionManager | None = None
+        self.multiput: MultiputManager | None = None
         self.logger: logging.Logger | None = None
         self._ready = False
         self._stopping = False
@@ -145,9 +172,16 @@ class NodeRuntime:
         manifest = load_manifest(manifest_path)
         activation = (None if schema2_inventory_path is None else
                       Schema2Activation.from_file(manifest, schema2_inventory_path))
+        rr_activation = None
+        if schema2_inventory_path is not None:
+            # The same inventory enables schema 3 only if every node advertises it.
+            try:
+                rr_activation = Schema3Activation.from_file(manifest, schema2_inventory_path)
+            except ValueError:
+                rr_activation = None
         return cls(manifest=manifest, vm_id=vm_id, database_path=database_path,
                    bootstrap=bootstrap, bootstrap_mode=bootstrap_mode,
-                   protocol_activation=activation, **kwargs)
+                   protocol_activation=activation, rr_activation=rr_activation, **kwargs)
 
     @property
     def ready(self) -> bool:
@@ -171,6 +205,18 @@ class NodeRuntime:
             raise RuntimeError("node is not ready")
         return self.membership_runtime.table.snapshot()
 
+    def list_store(self, after: str | None = None):
+        """One bounded page of this node's stored keys: (keys, next cursor or None)."""
+        if not self._ready or self.store is None:
+            raise RuntimeError("node is not ready")
+        return self.store.list_keys(after=after)
+
+    def transition_phase(self) -> str:
+        """ACTIVE, or PREPARED/COMMITTED while a mode change fences this node."""
+        if not self._ready or self.store is None:
+            return "ACTIVE"
+        return self.store.local_phase()
+
     def owners(self, key: str) -> tuple[Node, ...]:
         """Return the fixed five prescribed owners, regardless of liveness."""
         return self.manifest.owners(key)
@@ -182,7 +228,7 @@ class NodeRuntime:
         return self.membership_runtime.table.list_mem_ids()
 
     def strong_put(self, key: str, value: bytes, *, deadline: float):
-        """Perform an admitted two-phase Strong ABD write; no CLI path calls this yet."""
+        """Perform an admitted two-phase Strong ABD write."""
         from .strong import StrongCoordinator
         return StrongCoordinator(self).strong_put(key, value, deadline=deadline)
 
@@ -191,20 +237,41 @@ class NodeRuntime:
         from .strong import StrongCoordinator
         return StrongCoordinator(self).strong_get(key, deadline=deadline)
 
-    def eventual_put(self, key: str, value: bytes, *, read_quorum: int = 2,
-                     write_quorum: int = 2):
+    def eventual_put(self, key: str, value: bytes, *, read_quorum: int | None = None,
+                     write_quorum: int | None = None):
         """Perform a bounded Eventual-noRR write; accepted fanout is inspectable."""
         from .eventual import EventualNoRRCoordinator
         return EventualNoRRCoordinator(
-            self, read_quorum=read_quorum, write_quorum=write_quorum).eventual_put(key, value)
+            self, read_quorum=self.read_quorum if read_quorum is None else read_quorum,
+            write_quorum=self.write_quorum if write_quorum is None else write_quorum,
+        ).eventual_put(key, value)
 
-    def eventual_get(self, key: str, *, deadline: float, read_quorum: int = 2,
-                     write_quorum: int = 2):
+    def eventual_get(self, key: str, *, deadline: float, read_quorum: int | None = None,
+                     write_quorum: int | None = None):
         """Return the maximum version among the first R replies, without repair."""
         from .eventual import EventualNoRRCoordinator
         return EventualNoRRCoordinator(
-            self, read_quorum=read_quorum, write_quorum=write_quorum).eventual_get(
-                key, deadline=deadline)
+            self, read_quorum=self.read_quorum if read_quorum is None else read_quorum,
+            write_quorum=self.write_quorum if write_quorum is None else write_quorum,
+        ).eventual_get(key, deadline=deadline)
+
+    def eventual_rr_put(self, key: str, value: bytes, *, read_quorum: int | None = None,
+                        write_quorum: int | None = None):
+        """Perform the Eventual PUT under Eventual-RR (schema 3, same W rule)."""
+        from .eventual import EventualRRCoordinator
+        return EventualRRCoordinator(
+            self, read_quorum=self.read_quorum if read_quorum is None else read_quorum,
+            write_quorum=self.write_quorum if write_quorum is None else write_quorum,
+        ).eventual_put(key, value)
+
+    def eventual_rr_get(self, key: str, *, deadline: float, read_quorum: int | None = None,
+                        write_quorum: int | None = None):
+        """Return after R replies, then compare all reachable replicas and repair once."""
+        from .eventual import EventualRRCoordinator
+        return EventualRRCoordinator(
+            self, read_quorum=self.read_quorum if read_quorum is None else read_quorum,
+            write_quorum=self.write_quorum if write_quorum is None else write_quorum,
+        ).eventual_get(key, deadline=deadline)
 
     def start(self) -> "NodeRuntime":
         """Open explicit bootstrap/recovery state, then start services in order."""
@@ -217,7 +284,7 @@ class NodeRuntime:
             self.store = open_store(
                 self.database_path, bootstrap=bootstrap_context, vm_id=self.vm_id,
                 timeout=self.store_timeout, capacity=self.store_capacity)
-            context = self.store.current_context()
+            self.store.current_context()  # validates the recovered context before serving
             if self.log_path is not None:
                 self.logger = logging.getLogger(f"mp3.node.{self.vm_id}.{id(self)}")
                 configure_logging(self.logger, self.log_path, stream=sys.stderr)
@@ -234,22 +301,34 @@ class NodeRuntime:
                 self.store, self.manifest, self.membership_runtime.table,
                 workers=self.replica_workers, max_pending=self.replica_queue,
                 logger=self.logger, event_stream=self.event_stream,
-                protocol_activation=self.protocol_activation)
+                protocol_activation=self.protocol_activation,
+                rr_activation=self.rr_activation)
             self.replica_service.start()
 
             # Endpoint resolution is part of constructing the existing single-call
             # client. Only after all local services exist do we report local readiness.
             self.rpc_client = ReplicaClient(self.manifest,
                                             self.membership_runtime.table,
-                                            protocol_activation=self.protocol_activation)
+                                            protocol_activation=self.protocol_activation,
+                                            rr_activation=self.rr_activation)
             self.coordinator_resources = CoordinatorResources(
                 coordinator_workers=self.coordinator_workers,
                 coordinator_queue=self.coordinator_queue,
                 attempt_workers=self.attempt_workers,
-                attempt_queue=self.attempt_queue)
+                attempt_queue=self.attempt_queue,
+                background_workers=self.background_workers,
+                background_queue=self.background_queue)
             with self._calls:
                 self._ready = True
                 self._accepting_calls = True
+            # Commands are admitted last, after every service they depend on is ready.
+            self.multiput = MultiputManager(self)
+            self.control_service = ControlService(self)
+            self.control_service.start()
+            # Mode transitions: the control path above carries their messages, and the
+            # recovery thread finishes any change this node was part of before a crash.
+            self.transition = TransitionManager(self)
+            self.transition.start_recovery()
             return self
         except BaseException:
             self._ready = False
@@ -259,6 +338,16 @@ class NodeRuntime:
 
     def _cleanup_failed_start(self) -> None:
         """Release initialized resources while preserving the original exception."""
+        control_report = None
+        if self.multiput is not None:
+            self.multiput.stop()
+        if self.transition is not None:
+            self.transition.stop(timeout=1.0)
+        if self.control_service is not None:
+            try:
+                control_report = self.control_service.stop(timeout=2.0)
+            except BaseException:
+                pass
         coordinator_report = None
         if self.coordinator_resources is not None:
             try:
@@ -280,6 +369,7 @@ class NodeRuntime:
                 membership_stopped = False
         safe_to_close_store = (
             (replica_report is None or replica_report.workers_joined)
+            and (control_report is None or control_report.workers_joined)
             and (coordinator_report is None or coordinator_report.clean))
         store_closed = False
         if self.store is not None and safe_to_close_store and membership_stopped:
@@ -290,7 +380,8 @@ class NodeRuntime:
                 pass
         self._close_logger()
         self._shutdown_report = NodeShutdownReport(
-            replica_report, 0, membership_stopped, store_closed, coordinator_report)
+            replica_report, 0, membership_stopped, store_closed, coordinator_report,
+            control_report)
 
     def call_replica(self, target_id: str, op: RpcOperation, key: str, *,
                      deadline: float, version: Version | None = None,
@@ -420,7 +511,7 @@ class NodeRuntime:
                        value: bytes = b"", attempt_lease: AttemptLease | None = None,
                        admission: CoordinatorAdmission | None = None,
                        ) -> OwnerCall:
-        """Create and dispatch one schema-2 RPC, without collecting a quorum."""
+        """Create and dispatch one schema-2 or schema-3 RPC, without collecting a quorum."""
         with self._calls:
             external = self._ready and self._accepting_calls
             authorization_deadline = deadline
@@ -437,7 +528,7 @@ class NodeRuntime:
                 raise RuntimeError("node is not accepting RPC calls")
             if admission is not None and not authorized:
                 raise RuntimeError("coordinator admission is invalid, expired, or completed")
-            if self.protocol_activation is None:
+            if self.protocol_activation is None and self.rr_activation is None:
                 raise RuntimeError("schema-2 protocol is not activated")
             if admission is not None and operation_id != admission.operation_id:
                 raise RuntimeError("RPC operation ID does not match its coordinator admission")
@@ -457,6 +548,13 @@ class NodeRuntime:
             else:
                 context = admission.context
                 sender_generation = admission.sender_generation
+            # Eventual-RR uses schema 3; every other mode keeps the approved schema 2.
+            schema = (RR_SCHEMA_VERSION if context.mode == ConsistencyMode.EVENTUAL_RR
+                      else PROTOCOL_SCHEMA_VERSION)
+            activation = (self.rr_activation if schema == RR_SCHEMA_VERSION
+                          else self.protocol_activation)
+            if activation is None:
+                raise RuntimeError(f"schema-{schema} protocol is not activated")
             client = self.rpc_client
             membership = self.membership_runtime.table.snapshot()
             target_row = next(row for row in membership if row.vm_id == target_id)
@@ -469,7 +567,7 @@ class NodeRuntime:
                 manifest=self.manifest, sender_id=self.vm_id,
                 sender_generation=sender_generation, target_id=target_id,
                 epoch=context.epoch, mode=context.mode, op=op, key=key,
-                version=version, value=value, phase=phase, schema=2,
+                version=version, value=value, phase=phase, schema=schema,
                 operation_id=operation_id)
             owner_call = _dispatch_owner(
                 client, target_node, request, manifest=self.manifest, deadline=deadline,
@@ -508,6 +606,15 @@ class NodeRuntime:
 
         replica_report = None
         coordinator_report = None
+        control_report = None
+        if self.multiput is not None:
+            self.multiput.stop()
+        if self.transition is not None:
+            self.transition.stop(timeout=min(2.0, max(0.0, deadline - time.monotonic())))
+        if self.control_service is not None:
+            # New commands stop first; running ones finish within half the budget.
+            control_report = self.control_service.stop(
+                timeout=max(0.0, (deadline - time.monotonic()) / 2))
         if self.coordinator_resources is not None:
             coordinator_report = self.coordinator_resources.shutdown(
                 timeout=max(0.0, deadline - time.monotonic()))
@@ -527,6 +634,7 @@ class NodeRuntime:
         safe_to_close_store = (
             (replica_report is None or replica_report.workers_joined)
             and (coordinator_report is None or coordinator_report.clean)
+            and (control_report is None or control_report.workers_joined)
             and membership_stopped and outstanding_calls == 0)
         store_closed = False
         if self.store is not None and safe_to_close_store:
@@ -535,7 +643,7 @@ class NodeRuntime:
         self._close_logger()
         self._shutdown_report = NodeShutdownReport(
             replica_report, outstanding_calls, membership_stopped, store_closed,
-            coordinator_report)
+            coordinator_report, control_report)
         return self._shutdown_report
 
     def _close_logger(self) -> None:
@@ -570,9 +678,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-mode", choices=[mode.value for mode in ConsistencyMode],
                         default=None,
                         help="initial mode for --bootstrap only; default: strong epoch 1")
+    parser.add_argument("--read-quorum", type=int, default=DEFAULT_R,
+                        help="Eventual R: replies a GET waits for (1..5, default 2)")
+    parser.add_argument("--write-quorum", type=int, default=DEFAULT_W,
+                        help="Eventual W: durable acks a PUT waits for (1..5, default 2)")
+    parser.add_argument("--multiput-file",
+                        help="file whose bytes this VM puts in a multiput (default: 1 KiB of "
+                             "random bytes)")
     parser.add_argument("--schema2-inventory",
                         help="explicit complete ten-node compatible-release inventory")
-    parser.add_argument("--log", help="optional append-only JSON-lines local log path")
+    parser.add_argument("--log", help="optional append-only JSON-lines log path; use "
+                        "machine.<vm number>.log in the MP1 server's directory to query it")
     return parser
 
 
@@ -588,6 +704,8 @@ def main(argv: list[str] | None = None) -> int:
         node = NodeRuntime.from_files(
             vm_id=args.vm_id, manifest_path=args.manifest, database_path=args.db,
             bootstrap=bootstrap, bootstrap_mode=mode, log_path=args.log,
+            read_quorum=args.read_quorum, write_quorum=args.write_quorum,
+            multiput_file=args.multiput_file,
             schema2_inventory_path=args.schema2_inventory,
             event_stream=sys.stdout).start()
     except Exception as error:
@@ -608,7 +726,8 @@ def main(argv: list[str] | None = None) -> int:
             f"READY {node.vm_id} generation={node.generation} "
             f"context={node.context.mode.value}@{node.context.epoch} "
             f"kv={node_config.kv.host}:{node_config.kv.port} "
-            f"membership={node_config.membership.host}:{node_config.membership.port}",
+            f"membership={node_config.membership.host}:{node_config.membership.port} "
+            f"control={node_config.control.host}:{node_config.control.port}",
             flush=True)
         while not stop_requested.wait(0.25):
             pass

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Runs ON a VM: the MP3 command line for this VM, e.g.  ./mp3 put key file
+RUN="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$(dirname "$RUN")"
+export MP3_MANIFEST="$RUN/manifest.json" MP3_VM_ID="$(cat "$RUN/vm_id")"
+exec python3 -m mp3 "$@"

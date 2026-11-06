@@ -1,0 +1,15 @@
+#!/bin/bash
+# Run an MP3 command as a client on one VM and show its output.
+# Usage: ./cmd_mp <vm> "<command>"      e.g.  ./cmd_mp 3 "put k1 @data/business_1"
+#   @data/  -> that VM's dataset dir      @out/  -> that VM's output dir (run/out/)
+# Commands: put, get, ls, liststore, getfromreplica, list_mem_ids, multiput, consistency_mode
+# Exit status is the command's (0 success, 1 operation failed, 2 usage error).
+. "$(dirname "$0")/lib.sh"
+[ $# -ge 2 ] || die 'usage: ./cmd_mp <vm> "<command>"'
+n=$(vm_num "$1") || die "invalid VM '$1'"; shift
+cmd="$*"
+cmd="${cmd//@data\//\$MP3_DATA/}"
+cmd="${cmd//@out\//\$MP3_RUN/out/}"
+case "$cmd" in "multiput("*) cmd="'$cmd'";; esac   # the CLI parses multiput(...) as one argument
+echo "VM $n <- $*"
+vm_sh "$n" "mkdir -p \"\$MP3_RUN/out\"; cd \"\$MP3_RUN\" && ./mp3 $cmd"

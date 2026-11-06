@@ -1,0 +1,11 @@
+#!/bin/bash
+# Show a node's console output.  Usage: ./show_mp <vm> [-f]   (-f follows)
+. "$(dirname "$0")/lib.sh"
+[ $# -ge 1 ] || die "usage: ./show_mp <vm> [-f]"
+n=$(vm_num "$1") || die "invalid VM '$1'"
+if [ "${2:-}" = -f ]; then
+    if [ "$MP3_TARGET" = local ]; then tail -n 80 -f "$(vm_root "$n")/run/node.out"
+    else ssh -t "${SSH_OPTS[@]}" "$MP3_USER@$(vm_host "$n")" "tail -n 80 -f $(vm_root "$n")/run/node.out"; fi
+else
+    vm_sh "$n" 'tail -n 80 "$MP3_RUN/node.out"'
+fi

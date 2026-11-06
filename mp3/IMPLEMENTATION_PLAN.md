@@ -1605,3 +1605,218 @@ The independent reviewer checked the actual Eventual response qualification and
 KD-12 contract, found no blocker, and confirmed the Strong capacity assertions were
 not weakened. These are local tests only; no production code, MP1/MP2, `SPEC.md`, or
 university VM was changed.
+
+## Step 4 Batch A execution evidence — November 5, 2026
+
+**Scope:** control endpoint (KD-14), schema-3 wire groundwork and background worker capacity
+(KD-13/KD-15), and working `put`/`get` commands. Approved choices are in `KEY_DECISIONS.md`
+("Step 4 approval record"); the approval note carries no date, Krishna remains the authority.
+No Eventual-RR coordinator, mode switching, `ls`, `liststore`, `getfromreplica`,
+`list_mem_ids`, `multiput` or `consistency_mode` was implemented in this batch.
+
+| Task | Status | Evidence |
+|---|---|---|
+| 4A-1 manifest `control` endpoint | VERIFIED locally | `test_control.ManifestControlEndpointTests`, all fixtures updated |
+| 4A-2 schema 3 wire + activation + replica gate | VERIFIED locally | `test_schema3` (16 tests) |
+| 4A-3 control service and client | VERIFIED locally | `test_control` (38 tests) incl. fake-runtime and ten-node CLI runs |
+| 4A-4 CLI `put`/`get` | VERIFIED locally | `test_cli`, `test_control.ControlClusterTests`, plus ten real `mp3.node` processes with the real CLI (Strong and Eventual-noRR) |
+| 4A-5 background executor | COMPLETE (no caller yet) | `CoordinatorResources.background`, shutdown report |
+
+**Commands run and results (Python 3.11.9, Darwin):**
+`python3 -B -m compileall -q mp3` ok; `python3 -B -m unittest discover -s mp3/tests` printed
+`Ran 259 tests in 196.278s OK` (205 before this batch). Real-process run: put from vm01 and
+get from vm08 returned the same bytes; a missing key returned NOT_FOUND exit 1 and left the
+output file untouched; `get` to a named pipe was refused with exit 2; every node stopped with
+`clean=true`.
+
+**Independent review (Claude Haiku, read-only):** round 1 found 5 defects (reused command ID,
+command deadline versus request deadline, truncated completion-unknown marker, missing
+schema-3 owner check, collector rejecting schema 3); round 2 on the fixes found a put-budget
+check tied to `command_timeout`, an unchecked non-regular `get` destination and four minor
+items. All were fixed with tests; known limits are listed in `EXPLANATION.md`. Reviewer reports
+are model output; the main agent verified each cited line before changing code.
+
+**Not verified:** any university VM, multi-process separate hosts, Eventual-RR, git history
+(no repository metadata in this folder, so nothing was committed or pushed).
+
+## Step 4 Batch B execution evidence — November 5, 2026
+
+**Scope:** Eventual-RR (KD-13), structured machine logs and MP1 query (KD-17), configurable
+R/W per node. Not in this batch: mode switching, `ls`, `liststore`, `getfromreplica`,
+`list_mem_ids`, `multiput`, `consistency_mode`.
+
+| Task | Status | Evidence |
+|---|---|---|
+| 4B-1 Eventual-RR PUT (schema 3) and GET (first R, bounded comparison, one repair pass) | VERIFIED locally | `tests/test_rr.py` (20), ten-node loopback clusters |
+| 4B-2 repair never overwrites newer writes; conflict/absent/unreachable/R-unreachable cases | VERIFIED locally | `test_rr` race, conflict, down-owner, R-impossible tests |
+| 4B-3 `read_repair` JSON log event, no value bytes, one line per event | VERIFIED locally | `test_rr` log tests, hostile-key test |
+| 4B-4 MP1 query of MP3 logs with the unchanged MP1 server and client | VERIFIED locally | `tests/test_mp1_logs.py` (4); no adapter built (approved condition met) |
+| 4B-5 node R/W settings and flags | VERIFIED locally | `test_rr`, `test_control`; real-process run with R=1, W=1 |
+| 4B-6 Eventual-RR through the control endpoint and CLI | VERIFIED locally | `test_control` RR round trip; real processes |
+
+**Commands and results (Python 3.11.9, Darwin):**
+`python3 -B -m compileall -q mp3` ok; `python3 -B -m unittest discover -s mp3/tests` printed
+`Ran 284 tests in 229.959s OK` (259 after Batch A; 205 before Step 4). Real-process runs: ten
+`mp3.node` processes with `--bootstrap-mode eventual-RR --read-quorum 1 --write-quorum 1
+--log machine.N.log`: put from vm03 and get from vm07 returned the same bytes; the unchanged
+`mp1/server.py 7 <port>` and `mp1/client.py query_machine` found the `read_repair` event in
+`machine.7.log`; every node stopped `clean=true`. `diff -rq` showed `mp1/` and `mp2/`
+identical to the copy taken before Step 4.
+
+**Independent review (Claude Haiku, read-only):** one round on Batch B found three real
+defects, all fixed with tests: background work pinned coordinator workers and ten attempt
+slots (now a separate background pool with its own repair reservation); time limits were
+anchored to coordinator start (now to admission, total at most 20 s including settle waits);
+the report was released before its log line was written (now logged first). Minor items fixed:
+exception after the client reply no longer logs a false result; the collector no longer accepts
+the repair phase it never used. One test of the main agent was flaky (first R replies could all
+be NOT_FOUND) and was made deterministic; it then passed five consecutive runs.
+
+**Known limits:** a repair that meets a newer write records `SUPERSEDED_NEWER` and does not
+propagate that newer value; log files are not rotated (approved); background comparison waits up
+to the read cutoff, so a very slow replica delays only the report, not the client; node shutdown
+waits at most its own timeout for an in-flight comparison.
+
+**Not verified:** any university VM, multi-host behavior, git history (no repository metadata).
+
+## Step 4 Batch C execution evidence — November 5, 2026
+
+**Scope:** cluster-wide consistency-mode switching (KD-16): durable fence and transition state,
+vm01 prepare/commit/activate protocol, crash recovery, `consistency_mode` command. Not in this
+batch: `ls`, `liststore`, `getfromreplica`, `list_mem_ids`, `multiput`.
+
+| Task | Status | Evidence |
+|---|---|---|
+| 4C-1 durable transition state, fence, atomic clear/retain, epoch burn, journal | VERIFIED locally | `tests/test_transition_storage.py` (19) |
+| 4C-2 vm01 all-ten prepare, durable commit decision, commit, activate, success only after ten ACTIVE | VERIFIED locally | `tests/test_transition.py` (26), ten loopback nodes |
+| 4C-3 all six directed changes; Strong<->Eventual clears, Eventual<->Eventual retains; membership/ring untouched | VERIFIED locally | `test_all_six_directed_transitions_obey_the_data_rules` |
+| 4C-4 abort path, burned epochs, BUSY, NO_CHANGE, concurrent same-target join | VERIFIED locally | `AbortTests`, `ModeChangeTests` |
+| 4C-5 crash and replay at each stage, participant crash, missed ACTIVATE, orphan release, vm01 self-abort retry | VERIFIED locally | `CrashRecoveryTests`, `ReviewFixTests` |
+| 4C-6 fence: explicit TRANSITIONING errors, stale-epoch writes cannot resurrect data | VERIFIED locally | `FencingTests` |
+| 4C-7 `consistency_mode` command | VERIFIED locally | `test_cli_consistency_mode_command`; ten real node processes |
+
+**Commands and results (Python 3.11.9, Darwin):** `python3 -B -m compileall -q mp3` ok;
+`python3 -B -m unittest discover -s mp3/tests` printed `Ran 329 tests in 373.056s OK` (284 after
+Batch B). Real processes (ten `mp3.node`): Strong to Eventual-noRR cleared the data; the same mode
+again returned `NO_CHANGE`; with one node `kill -9`'d the change was refused (`TIMEOUT`,
+unreachable) and succeeded after `--recover`; with vm01 `kill -9`'d a change was refused and
+succeeded after vm01 restarted; Eventual-RR and Strong changes then worked and every node stopped
+`clean=true`.
+
+**Independent review (Claude Haiku, read-only), one round, six defects, all fixed with tests:**
+`tx_commit` did not verify vm01's decision (a stray message could clear one node and leave it
+fenced); a node fenced by a PREPARE vm01 never journaled was never released; vm01 never retried a
+failed abort of its own row; a stray abort could shadow the open transition; mode requests could
+exhaust control workers; a BaseException in the driver could leave a run open forever. Minor items
+also fixed: acknowledgements must carry the expected phase, the local storage deadline honors the
+sender's budget, and a stopping manager stops driving. One regression of the main agent (a shutdown
+check made three crash tests return immediately) was fixed by adding `pause_recovery()`.
+
+**Known limits:** control messages are not authenticated; a change while any node is unreachable is
+refused; vm01 down means no new change and fenced nodes stay fenced until it returns; in-process crash
+tests stand in for a new process by clearing the single-start guard, while the real-process runs
+`kill -9` a participant and vm01 between changes (not in the middle of one).
+
+**Not verified:** any university VM, kill -9 of vm01 in the middle of a change, git history.
+
+## Step 4 Batch D execution evidence — November 5, 2026
+
+**Scope:** the last five of the eight commands (`ls`, `liststore`, `getfromreplica`, `list_mem_ids`,
+`multiput`) and the removal of the `NOT_IMPLEMENTED` stub (`pending.py`). With Batches A to C, all
+eight required commands now run. Not in scope and not done: ten-VM deployment, benchmarks, report.
+
+| Task | Status | Evidence |
+|---|---|---|
+| 4D-1 `ls` from the manifest alone | VERIFIED locally | `LsTests`; real processes |
+| 4D-2 `liststore` (bounded pages, cursor in body, key IDs, VM ring ID, fenced refusal) | VERIFIED locally | `StorageListingTests`, `ListStoreCommandTests`, `ReviewFixTests` |
+| 4D-3 `list_mem_ids` sorted by ring ID incl. suspected nodes | VERIFIED locally | `ListMemIdsTests`; real processes (killed node shows SUSPECTED) |
+| 4D-4 `getfromreplica` (exactly one schema-1 local read, no quorum, no repair, atomic file) | VERIFIED locally | `GetFromReplicaTests` (call spy), real processes |
+| 4D-5 `multiput` (ARM/READY/GO, abort, lease, duplicates, per-VM report) | VERIFIED locally | `MultiputTests`, `MultiputParticipantTests`, scripted coordinator tests |
+| 4D-6 all eight commands in all three modes | VERIFIED locally | `AllEightCommandsTests` |
+
+**Commands and results (Python 3.11.9, Darwin):** `python3 -B -m compileall -q mp3` ok;
+`python3 -B -m unittest discover -s mp3/tests` printed `Ran 361 tests in 507.114s OK` (329 after
+Batch C; 205 before Step 4). Real processes (ten `mp3.node`): all eight commands ran from the real
+CLI, including a `multiput` using vm03's own 4000-byte file (`--multiput-file`) and a mode change
+that cleared the keys; with a node `kill -9`'d, `multiput` reported the two reachable VMs
+NOT_STARTED and the dead one UNKNOWN, wrote nothing, `getfromreplica` to the dead node returned an
+explicit ERROR, and `list_mem_ids` showed it SUSPECTED; every node stopped `clean=true`.
+
+**Independent review (Claude Haiku, read-only), one round, six defects, all fixed with tests:**
+ARMED values never expired and were not bounded; a GO reply (or its resend) that already said DONE
+dropped the put result and made a successful multiput report ERROR; a VM that lost its ARM stalled
+the report for the full budget and was labeled started; the multiput ignored the request deadline;
+`getfromreplica` could fill every control worker; the `liststore` cursor was sent in the 16 KiB
+metadata field (a limit that stored keys can only reach by direct installs, but the cursor now
+travels in the body). Minor items also fixed: a put refused by a fenced node reports NOT_STARTED, an
+exception after a possible start carries "completion unknown", the CLI allows 1 to 10 VMs, reply
+JSON is parsed defensively, ports are matched as ASCII digits, and a `liststore` cursor that does
+not advance is an error.
+
+**Known limits:** `multiput` GO is concurrent, not atomic, and different VMs' clocks are never
+compared; duplicate suppression is in memory, so a VM that restarts after accepting GO reports
+UNKNOWN (nothing is replayed); IPv6 `[host]:port` is not accepted by `getfromreplica`; control
+messages are not authenticated.
+
+**Not verified:** any university VM, multi-host behavior, git history (no repository metadata),
+benchmarks, the report, the demo.
+
+## Cleanup pass (behavior-preserving) — November 5, 2026
+
+**Scope (from the Step 4 plan):** inspect comments, imports and dead code; remove only clearly stale
+or redundant items; keep explanations of ABD, versions, durable writes, epochs, restart fencing,
+leases, ownership and shutdown; no refactor and no algorithm, schema or API change. Run as a
+separate gate after Step 4, with a snapshot of the code taken first so the diff is reviewable.
+
+**How candidates were found:** no lint tool is installed and dependencies stay minimal, so a small
+AST script (kept outside the project) listed unused imports, top-level names referenced nowhere, and
+locals that are assigned but never read. Each candidate was confirmed by grep (including strings,
+tests, and the untouched `mp1/` and `mp2/`) before removal.
+
+**Removed or changed (code):**
+- Unused imports: `ConsistencyMode` and `RpcOperation` in `coordinator.py`, `FIRST_COMPLETED` in
+  `eventual.py`, `Iterable` in `membership.py`, `ReplicaRequest` in `node.py`; and in tests `json`,
+  `contextlib`, `RpcStatus`, `RpcCompletion`, `key_position`, `ring_id_hex`, `OperationStatus`.
+- Unused constant `config.STRONG_QUORUM` (`strong.py` keeps its own `QUORUM_SIZE = 3`).
+- Stub-era types `models.Status` and `models.OperationResult`: nothing used them after `pending.py`
+  was deleted in Batch D. Their two tests (`DomainTests`) were removed with them; the
+  empty-versus-missing rule is still covered by the storage, RPC and command tests.
+- An unused loop index in `coordinator.collect_distinct`, an unused local in `transition._poll_cluster`,
+  and an unused local in `node.start` (the `current_context()` call stays: it validates the
+  recovered context).
+- Stale module docstrings (`__init__`, `attempts`, `coordinator`, `eventlog`, `storage`, `models`,
+  `node`) that still described finished features as pending or future.
+
+**Documentation corrected:** `README.md` (status paragraphs, Step 4 design status, the old "CLI
+commands remain NOT_IMPLEMENTED" and "MP1 integration remains future work" statements, "What
+remains") and `EXPLANATION.md` (removed types, the `pending.py` section, the `main` row, two stale
+test rows, two status paragraphs). Historical batch sections of the plan and journal are left as the
+record of their time.
+
+**Deliberately deferred (recorded, not hidden):**
+- `coordinator.AttemptLedger` and `AttemptState` are unused in production (only tested). They are
+  part of the reviewed Batch 1 contract and removing them needs plan, explanation and test edits.
+- `framing.recv_frame_deadline` and `framing.send_frame_deadline` are unused in production (only
+  tested) for the same reason.
+- `legacy_membership.py` is the byte-identical MP2 reference and stays, by decision.
+- `AGENTS.md` still contains the Phase 0 rule "Pending operations must visibly fail with
+  NOT_IMPLEMENTED". It is the shared team rule file, so changing it needs the owners' approval.
+
+**Verification:** `python3 -B -m unittest discover -s mp3/tests` printed `Ran 359 tests in 499.227s
+OK` (361 before, minus the two removed tests); `python3 -B -m mp3 --smoke` ok; a ten-process run of
+put, get, ls, liststore, getfromreplica, list_mem_ids, multiput and consistency_mode worked and
+every node stopped `clean=true`. **Independent review (Claude Haiku, read-only):** confirmed no code
+behavior changed and that every removed name has no live reference in `mp3/`, `mp1/` or `mp2/`; it
+found four stale documentation statements and two stale list entries, all fixed above.
+
+## Step 5 (local part): deployment and demo scripts
+
+Added `deploy/` (see `deploy/README.md`): MP2-style `deploy_mp`, `run_mp`, `kill_mp`, `stop_mp`,
+`cmd_mp`, `show_mp`, `status_mp`, `logs_mp`, `reset_mp`, `attach_mp`, `push_data`, `check_prep`; manifest
+and inventory generator `gen_manifest.py`; per-test demo scripts `test1.sh`, `test2.sh`, `test3.sh`
+(all choices are arguments) and a timed `rehearse.sh`. A `MP3_TARGET=local` mode runs the same scripts
+against ten local processes. Evidence: `rehearse.sh` passed Tests 1-3 end to end locally (fresh ten
+processes; kill -9 and recover; multiput; read repair; five replicas identical). NOT done: nothing has
+run on the university VMs (no authorization yet); tmux and python version on the VMs are unchecked.
+Observed: under concurrent Eventual puts, a put overtaken by a newer version reports an error
+(the Step 3 design: superseded replies are not acknowledgements); the winner still converges everywhere.

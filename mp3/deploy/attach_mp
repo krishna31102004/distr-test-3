@@ -1,0 +1,8 @@
+#!/bin/bash
+# Open the node's tmux session on a VM (window "node": output, window "cli": shell for ./mp3).
+# Detach with Ctrl-b d.  Usage: ./attach_mp <vm>
+. "$(dirname "$0")/lib.sh"
+[ $# -eq 1 ] || die "usage: ./attach_mp <vm>"
+n=$(vm_num "$1") || die "invalid VM '$1'"
+[ "$MP3_TARGET" = remote ] || die "attach_mp is for the VMs (local practice: tmux attach -t mp3)"
+exec ssh -t "${SSH_OPTS[@]}" "$MP3_USER@$(vm_host "$n")" "tmux attach-session -t mp3"
