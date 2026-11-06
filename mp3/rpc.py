@@ -23,6 +23,7 @@ from .ring import Manifest, Node
 
 SCHEMA_VERSION = 1
 PROTOCOL_SCHEMA_VERSION = 2
+RR_SCHEMA_VERSION = 3
 MAX_JSON_BYTES = 16_384
 MAX_RPC_PAYLOAD = 4 + MAX_JSON_BYTES + MAX_VALUE_BYTES
 MAX_ERROR_BYTES = 1_024
@@ -67,6 +68,9 @@ class RpcOutcomeKind(str, Enum):
 
 PROTOCOL_PHASES = frozenset({"strong_query", "strong_write", "strong_readback",
                              "eventual_read", "eventual_put"})
+# Schema 3 (KD-13): Eventual-RR read, the existing Eventual PUT fanout, and repair.
+RR_PHASES = frozenset({"eventual_put", "eventual_rr_read", "eventual_rr_repair"})
+SUPPORTED_SCHEMAS = (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION)
 
 
 def _validate_phase(op: RpcOperation, mode: ConsistencyMode, phase: str,
@@ -74,6 +78,19 @@ def _validate_phase(op: RpcOperation, mode: ConsistencyMode, phase: str,
     if schema == SCHEMA_VERSION:
         if phase != "local" or operation_id is not None:
             raise RpcProtocolError("schema 1 supports only phase=local without operation_id")
+        return
+    if schema == RR_SCHEMA_VERSION:
+        if phase not in RR_PHASES:
+            raise RpcProtocolError("unsupported schema-3 protocol phase")
+        if operation_id is None:
+            raise RpcProtocolError("schema 3 requires operation_id")
+        _validate_request_id(operation_id)
+        expected_op = (RpcOperation.READ_LOCAL if phase == "eventual_rr_read"
+                       else RpcOperation.INSTALL_IF_NEWER)
+        if op != expected_op:
+            raise RpcProtocolError("operation does not match protocol phase")
+        if mode != ConsistencyMode.EVENTUAL_RR:
+            raise RpcProtocolError("Eventual-RR protocol phase requires Eventual-RR mode")
         return
     if schema != PROTOCOL_SCHEMA_VERSION or phase not in PROTOCOL_PHASES:
         raise RpcProtocolError("unsupported schema or protocol phase")
@@ -246,9 +263,9 @@ class ReplicaRequest:
             raise RpcProtocolError("manifest_id must be lowercase SHA-256 hex")
         _validate_vm_id(self.sender_id, "sender_id")
         _validate_vm_id(self.target_id, "target_id")
-        if not _is_int(self.schema) or self.schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+        if not _is_int(self.schema) or self.schema not in SUPPORTED_SCHEMAS:
             raise RpcProtocolError("unsupported RPC schema")
-        minimum = 1 if self.schema == PROTOCOL_SCHEMA_VERSION else 0
+        minimum = 0 if self.schema == SCHEMA_VERSION else 1
         if not _is_int(self.sender_generation) or self.sender_generation < minimum:
             raise RpcProtocolError("invalid sender_generation for RPC schema")
         if not _is_int(self.epoch) or self.epoch < minimum:
@@ -273,8 +290,8 @@ class ReplicaRequest:
             raise RpcProtocolError("INSTALL_IF_NEWER requires a version")
         if self.version is not None:
             self._validate_version_kind(self.version)
-        if self.schema == PROTOCOL_SCHEMA_VERSION:
-            if self.phase in ("strong_query", "eventual_read"):
+        if self.schema in (PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION):
+            if self.phase in ("strong_query", "eventual_read", "eventual_rr_read"):
                 if self.version is not None or self.value:
                     raise RpcProtocolError("protocol read requires null version and empty body")
             elif self.version is None:
@@ -316,7 +333,7 @@ class ReplicaRequest:
             "version": _version_to_wire(self.version),
             "value_len": self.value_len,
         }
-        if self.schema == PROTOCOL_SCHEMA_VERSION:
+        if self.schema != SCHEMA_VERSION:
             metadata["operation_id"] = self.operation_id
         return metadata
 
@@ -325,11 +342,11 @@ class ReplicaRequest:
         if not isinstance(metadata, dict) or "schema" not in metadata:
             raise RpcProtocolError("request schema is missing")
         schema = metadata["schema"]
-        if not _is_int(schema) or schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+        if not _is_int(schema) or schema not in SUPPORTED_SCHEMAS:
             raise RpcProtocolError("unsupported RPC schema")
         required = {"schema", "request_id", "manifest_id", "sender_id", "sender_generation",
                     "target_id", "epoch", "mode", "op", "phase", "key", "version", "value_len"}
-        if schema == PROTOCOL_SCHEMA_VERSION:
+        if schema != SCHEMA_VERSION:
             required.add("operation_id")
         if set(metadata) != required:
             raise RpcProtocolError("request has missing or unexpected fields")
@@ -385,9 +402,9 @@ class ReplicaResponse:
             raise RpcProtocolError("manifest_id must be lowercase SHA-256 hex")
         _validate_vm_id(self.sender_id, "sender_id")
         _validate_vm_id(self.target_id, "target_id")
-        if not _is_int(self.schema) or self.schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+        if not _is_int(self.schema) or self.schema not in SUPPORTED_SCHEMAS:
             raise RpcProtocolError("unsupported RPC schema")
-        minimum = 1 if self.schema == PROTOCOL_SCHEMA_VERSION else 0
+        minimum = 0 if self.schema == SCHEMA_VERSION else 1
         if not _is_int(self.sender_generation) or self.sender_generation < minimum:
             raise RpcProtocolError("invalid sender_generation for RPC schema")
         if not _is_int(self.epoch) or self.epoch < minimum:
@@ -505,7 +522,7 @@ class ReplicaResponse:
             "durable": self.durable,
             "error": self.error,
         }
-        if self.schema == PROTOCOL_SCHEMA_VERSION:
+        if self.schema != SCHEMA_VERSION:
             metadata["operation_id"] = self.operation_id
         return metadata
 
@@ -514,12 +531,12 @@ class ReplicaResponse:
         if not isinstance(metadata, dict) or "schema" not in metadata:
             raise RpcProtocolError("response schema is missing")
         schema = metadata["schema"]
-        if not _is_int(schema) or schema not in (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION):
+        if not _is_int(schema) or schema not in SUPPORTED_SCHEMAS:
             raise RpcProtocolError("unsupported RPC schema")
         required = {"schema", "request_id", "manifest_id", "sender_id", "sender_generation",
                     "target_id", "epoch", "mode", "op", "phase", "status", "present",
                     "version", "stored_version", "value_len", "durable", "error"}
-        if schema == PROTOCOL_SCHEMA_VERSION:
+        if schema != SCHEMA_VERSION:
             required.add("operation_id")
         if set(metadata) != required:
             raise RpcProtocolError("response has missing or unexpected fields")
@@ -571,7 +588,7 @@ def new_request(*, manifest: Manifest, sender_id: str, sender_generation: int,
                 phase: str = "local", schema: int = SCHEMA_VERSION,
                 operation_id: str | None = None) -> ReplicaRequest:
     """Create a fresh per-RPC request ID; schema 2 callers reuse their operation ID."""
-    if schema == PROTOCOL_SCHEMA_VERSION and operation_id is None:
+    if schema != SCHEMA_VERSION and operation_id is None:
         operation_id = new_operation_id()
     request = ReplicaRequest(
         request_id=str(uuid.uuid4()), manifest_id=manifest.fingerprint,
@@ -774,7 +791,7 @@ class ReplicaClient:
     """Bounded-deadline client for exactly one replica RPC; never retries automatically."""
 
     def __init__(self, manifest: Manifest, membership: MembershipTable, *,
-                 protocol_activation=None):
+                 protocol_activation=None, rr_activation=None):
         if not isinstance(manifest, Manifest) or not isinstance(membership, MembershipTable):
             raise TypeError("manifest and MembershipTable are required")
         if manifest.fingerprint != membership.manifest.fingerprint:
@@ -782,6 +799,7 @@ class ReplicaClient:
         self.manifest = manifest
         self.membership = membership
         self.protocol_activation = protocol_activation
+        self.rr_activation = rr_activation
         # Resolve the fixed manifest once during client setup. Per-operation calls
         # then contain no blocking DNS lookup and can share one deadline across all
         # numeric connect candidates. Resolution errors are returned per target.
@@ -895,13 +913,19 @@ class ReplicaClient:
         if attempt_lease is None and deadline <= time.monotonic():
             return _request_error(RpcOutcomeKind.TIMEOUT, "operation deadline expired")
         if attempt_lease is not None:
+            schema2_put = (request.schema == PROTOCOL_SCHEMA_VERSION
+                           and request.phase == "eventual_put"
+                           and request.op == RpcOperation.INSTALL_IF_NEWER)
+            # Schema 3 lets Eventual-RR leases cover its PUT, read and repair phases.
+            schema3_rr = (request.schema == RR_SCHEMA_VERSION
+                          and request.phase in RR_PHASES)
             if (not isinstance(attempt_lease, AttemptLease)
-                    or request.schema != PROTOCOL_SCHEMA_VERSION
-                    or request.phase != "eventual_put"
-                    or request.op != RpcOperation.INSTALL_IF_NEWER
+                    or not (schema2_put or schema3_rr)
                     or deadline != attempt_lease.hard_deadline):
-                return _request_error(RpcOutcomeKind.ERROR,
-                                      "attempt lease is only valid for schema-2 Eventual PUT")
+                return _request_error(
+                    RpcOutcomeKind.ERROR,
+                    "attempt lease is only valid for schema-2 Eventual PUT "
+                    "or schema-3 Eventual-RR phases")
             try:
                 attempt_lease.check()
             except AttemptCancelled as error:
@@ -925,6 +949,10 @@ class ReplicaClient:
                     and (self.protocol_activation is None
                          or not self.protocol_activation.enabled_for(self.manifest))):
                 raise RpcProtocolError("SCHEMA2_DISABLED")
+            if (request.schema == RR_SCHEMA_VERSION
+                    and (self.rr_activation is None
+                         or not self.rr_activation.enabled_for(self.manifest))):
+                raise RpcProtocolError("SCHEMA3_DISABLED")
             row = next(member for member in self.membership.snapshot()
                        if member.vm_id == target.vm_id)
             if expected_target_generation is None:

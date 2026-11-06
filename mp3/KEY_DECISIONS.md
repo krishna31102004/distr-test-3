@@ -667,12 +667,38 @@ Healthy cluster, sequential per-client operations, both >=180s durations, all-re
 **Planned tests / acceptance:** Workload mix/seed determinism, preload/readback, timestamp math,
   raw aggregation and missing-trial checks. See master plan for matrix and time budget.
 
-## Step 4 design proposals — all listed refinements remain PENDING
+## Step 4 approval record — recorded November 5, 2026
 
-The proposals below are documented for Krishna's review. They do not change the
-existing PENDING status of KD-13, full KD-16, or KD-17, and do not approve new
-KD-06/08/14/15 interface refinements. Specification requirements remain mandatory;
-the choices below describe recommended implementations only.
+**Source:** `CS425_MP3_Step4_Claude_Decision_Approval.md`, supplied by Juhi as Krishna's
+approval note. The note states no approval date; it was recorded here on November 5,
+2026 at Juhi's instruction. Krishna's approval remains the authority; this record
+copies the note and adds rationale. Step 2/3 contracts (C1–C6, KD-11, KD-12 and the
+schema-2 rules) are preserved unchanged. MP1/MP2 sources stay unmodified.
+
+| ID | Decision | Status | Final choice and rationale |
+|---|---|---|---|
+| KD-13 | Read repair | **APPROVED** | First-R response, bounded background collection, one conditional repair pass, separate repair lease, 20-second overall cap. Matches the SPEC requirement to compare all reachable replicas and repair without overwriting newer writes. |
+| KD-16 | Mode switching | **APPROVED** | vm01 as fixed coordinator; all-ten durable prepare, durable commit, activation, epoch fencing and crash recovery. No election or consensus. Success is reported only after all ten ACTIVE acknowledgments. Simplest design that is safe for a fixed ten-node cluster. |
+| KD-16 | Data retention | **APPROVED** | Eventual-noRR ↔ Eventual-RR retains KV data and version timestamps. Strong ↔ Eventual clears KV data and version metadata (mandated by SPEC). |
+| KD-17 | Logs and MP1 | **APPROVED WITH CHANGES** | Append-only JSONL, flush per event. **Deviation 1:** no log rotation initially; monitor size. First run the unchanged MP1 server as a separate process against MP3 logs and verify with the unchanged MP1 client. Build the new MP1 query adapter only if the original server fails required tests. |
+| KD-14 | Commands and control plane | **APPROVED WITH CHANGES** | Separate control endpoint, long-running node daemon, short-lived CLI client, 1 MiB file cap, atomic GET file writes, ARM/READY/GO for concurrent multiput. **Deviation 2:** no durable command replay ledger and no per-origin sequence high-water. Keep command IDs and in-memory duplicate suppression. Never replay uncertain operations after a crash; report UNKNOWN. Do not claim crash-safe exactly-once multiput. |
+| — | Mode-switch timing | **APPROVED** | 30-second controller-local budget, remaining durations propagated, local monotonic clocks. Only durably activated nodes serve the committed mode during partial activation. |
+| KD-01 | Python on VMs | **VERIFICATION PLAN APPROVED** | Check the interpreter on the real university VMs before Step 5. Final runtime compatibility stays PENDING until verified. No VM access is authorized by this record. |
+
+**Standing constraints from the note:** use focused tests, independent review and
+verified commits per batch; prioritize the control endpoint and real PUT/GET commands,
+then Eventual-RR, mode switching, multiput, logging integration and full local
+correctness testing; do not run university VM tests without authorization; do not cut
+required SPEC features to save time.
+
+**Review model for Step 4 (chosen by Juhi):** main agent Claude Sonnet 5.5; independent
+read-only review sub-agent Claude Haiku.
+
+## Step 4 design proposals — superseded by the approval record above
+
+The proposals below are the original recommendations. Where they differ from the
+approval record (KD-17 rotation and adapter, KD-14 replay ledger and sequence
+numbers), the approval record controls. Specification requirements remain mandatory.
 
 ### KD-13 — Eventual-RR scheduling and repair
 

@@ -1,0 +1,42 @@
+#!/bin/bash
+# Start (or restart after a crash) the MP3 node on the given VMs.
+# Usage: ./run_mp all | ./run_mp 3 4
+# First start of a VM bootstraps a fresh database; later starts recover it (data, version
+# metadata, mode and epoch are kept). Each node runs in tmux session "mp3" (window "node"
+# shows its output, window "cli" is a shell for ./mp3 commands); without tmux it uses nohup.
+. "$(dirname "$0")/lib.sh"
+parse_vms "$@" || die "usage: ./run_mp <vm...|all>"
+
+start_one() {
+    local n="$1"
+    if [ -n "$(vm_pid "$n")" ]; then echo "VM $n: already running (pid $(vm_pid "$n"))"; return 0; fi
+    vm_sh "$n" '[ -x "$MP3_RUN/start_node.sh" ]' || { echo "VM $n: not deployed; run ./deploy_mp $n"; return 1; }
+    local life=bootstrap
+    vm_sh "$n" '[ -e "$MP3_RUN/$VMID.db" ]' && life=recover
+    vm_sh "$n" "cd \"\$MP3_RUN\" && export MODE=$MP3_MODE R=$MP3_R W=$MP3_W MP3_DATA && {
+        echo \"--- start \$(date '+%F %T') ($life)\" >> node.out
+        if command -v tmux >/dev/null 2>&1 && [ -z \"\${MP3_NO_TMUX:-}\" ]; then
+            CMD=\"bash start_node.sh 2>&1 | tee -a node.out\"
+            if tmux has-session -t mp3 2>/dev/null; then
+                tmux new-window -d -t mp3 -n node \"cd \$MP3_RUN && \$CMD\"
+            else
+                tmux new-session -d -s mp3 -n node -c \"\$MP3_RUN\" \"\$CMD\"
+                tmux new-window -d -t mp3 -n cli -c \"\$MP3_RUN\"
+            fi
+        else
+            nohup bash start_node.sh >> node.out 2>&1 &
+        fi
+    }" || { echo "VM $n: launch failed"; return 1; }
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        if vm_sh "$n" 'tail -n 30 "$MP3_RUN/node.out" | grep -q "^READY $VMID"'; then
+            echo "VM $n: $life OK, pid $(vm_pid "$n")"; return 0
+        fi
+        [ -n "$(vm_pid "$n")" ] || break
+    done
+    echo "VM $n: FAILED to become ready. node.out:"; vm_sh "$n" 'tail -n 15 "$MP3_RUN/node.out"'
+    return 1
+}
+
+for_each_vm start_one "${VMS[@]}" || die "at least one VM failed to start"

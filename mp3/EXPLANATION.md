@@ -4,9 +4,11 @@ This guide describes the actual files. Step 2 storage, fixed ring/membership,
 single-replica RPC, and the integrated node runtime are locally verified. Step 3
 Batch 1 provides shared schema-2 evidence/scheduling and a durable Strong allocator;
 Batch 2 implements locally verified programmatic Strong ABD PUT/GET; Batch 3 adds
-independently reviewed programmatic Eventual-noRR PUT/GET. **Eventual-RR/read repair,
-consistency-mode switching and the final CLI operations are still pending.** A
-local replica read/install or one coordinator dispatch is not a distributed GET/PUT.
+independently reviewed programmatic Eventual-noRR PUT/GET. Step 4 (Batches A to D, described
+at the end of this file) adds the control endpoint, Eventual-RR read repair, machine logs,
+cluster-wide mode switching and all eight CLI commands. **Everything here is locally verified
+only; nothing has been run on the university VMs.** A local replica read/install or one
+coordinator dispatch is not a distributed GET/PUT.
 
 ## The system we will build
 
@@ -64,10 +66,10 @@ reads or conditionally installs the key's versioned bytes, commits durably befor
 write acknowledgment, and prints/logs receipt and response events. Coordinator
 deadlines bound failures and distinguish an unavailable quorum from an absent key.
 
-Strong PUT/GET and Eventual-noRR PUT/GET now use the programmatic APIs documented
-below. Final file-oriented CLI commands do not call these APIs yet. Eventual-RR and
-read repair remain future implementation. C1–C6 contracts and KD-11/KD-12 are
-approved; no whole-operation global lock is permitted.
+Strong, Eventual-noRR and Eventual-RR PUT/GET are implemented as the programmatic APIs
+documented below, and the CLI calls them through the control endpoint (Step 4 sections at the
+end of this file). C1–C6 contracts and KD-11/KD-12 are approved; no whole-operation global lock
+is permitted.
 
 After a crash, disk contents remain and the process returns on the same fixed ring
 identity. The implemented durable restart generation lets peers recognize it as
@@ -112,13 +114,10 @@ are not resolved/canonicalized; a future production manifest must handle aliases
 
 ### `models.py`
 
-`ConsistencyMode` has the three mandated CLI strings; `Status` has OK, NOT_FOUND,
-TIMEOUT, ERROR, NOT_IMPLEMENTED. These enums have no custom methods. `Command` is
+`ConsistencyMode` has the three mandated CLI strings and no custom methods. `Command` is
 an immutable name/tuple-of-arguments container built by the parser; it does not
-validate itself. `OperationResult` is an immutable local status/message/optional
-bytes container. OK with b'' represents present empty data. Non-OK with bytes is
-rejected. OK without a value is allowed for future non-read local outcomes; this
-does not define a GET response. `Context`, `Version`, `Record`, `ReadResult`, and
+validate itself. (The stub-era `Status` and `OperationResult` types were removed in the
+cleanup pass: nothing used them once every command became real.) `Context`, `Version`, `Record`, `ReadResult`, and
 `InstallResult` are the local storage contract; they are not RPC encodings. Version
 numbers are Python integers and writer IDs use `vm01..vm10/generation` syntax.
 `Version.compare` orders `(number, writer_id)` only when kinds match; callers validate
@@ -126,7 +125,6 @@ the mode/epoch context separately.
 
 | Method | Inputs → output; internal behavior | Actual callers / components | Status / decisions |
 |---|---|---|---|
-| `OperationResult.__post_init__` | generated constructor fields → None; validates enum type, bytes-or-None, and failure carries no value | dataclass constructor, pending.execute, DomainTests; Status | I; KD-06/10/15 final response pending |
 | `Context.__post_init__` | epoch and mode → None; requires positive exact integer epoch and a ConsistencyMode | Context construction, Store; ConsistencyMode | I; local epoch contract |
 | `Version.__post_init__` | kind, nonnegative integer number, writer ID → None; rejects bool numbers and noncanonical/out-of-range VM identities | Version construction, allocator, record decoding | I; C4; no Strong allocator |
 | `Version.compare` | another Version of the same kind → -1/0/1 by number then writer ID | Store.install_if_newer, tests | I; C3/C4 |
@@ -412,19 +410,11 @@ Required distributed operation reachability, returned-version and repair details
 still future protocol/MP1-adapter work; the local RPC event hook alone is not a claimed
 complete trace.
 
-### `pending.py`
+### `pending.py` (removed)
 
-`DECISIONS` maps eight command names to their pending dependencies. This is the
-single stubbed dispatch boundary; there are no separate fake storage/protocol APIs.
-
-| Function | Inputs → output; internal behavior | Actual callers / components | Status / decisions |
-|---|---|---|---|
-| `execute` | Command → OperationResult(NOT_IMPLEMENTED, reason, None); every invocation is guarded, including unknown command if called directly; no IO | cli.main, CliTests; DECISIONS, local result types | **P**: put KD-06/08/09/10/11/12/15; get also KD-13; ls KD-02/03; liststore KD-09; direct read KD-06/08/09/10; membership IDs KD-02..05; multiput KD-06/08/10/11/12/14; mode KD-16 |
-
-Completion criteria: humans approve the relevant design and shared contracts;
-main agent implements actual dispatch/service/file handling with per-command
-acceptance tests, then removes only each supported guard. A parsed command or
-placeholder result must never count as a successful PUT/GET or a performed switch.
+This module returned `NOT_IMPLEMENTED` for every command while the commands were being built.
+Step 4 Batch D made all eight commands real and the cleanup pass deleted it. There is no
+stubbed dispatch any more.
 
 ### `cli.py`
 
@@ -440,7 +430,7 @@ does not impose an unapproved key-length/normalization policy.
 | `parse_command` | string → Command or ValueError; validates known names/arity, nonempty/NUL-free args, mode enum and distinct valid multiput VM labels | main, CliTests; shlex/re, ARITY, ConsistencyMode | I syntax only; KD-14 |
 | `smoke` | none → None or exception; local socketpair, finite timeouts, 1 MiB binary roundtrip + empty frame, inventory sorting and wraparound check; no TCP listener/VM | main(--smoke), CliTests; framing, config, ring, threading | I local check; KD-06/07 not finalized |
 | `smoke.send` (nested helper) | captured sender/payload → None; sends full/empty frames on daemon helper thread, collects exceptions so smoke can fail; joined with finite limit | smoke's thread target; send_frame, local errors list | I local test helper |
-| `main` | optional argv list (default sys.argv[1:]) → int; help/smoke exit 0, invalid command JSON ERROR exit 2, guarded JSON NOT_IMPLEMENTED exit 3; shlex.join preserves shell argument boundaries except one full parenthesized command | __main__, CliTests; parse_command, smoke, pending.execute, json | I bootstrap dispatch, distributed behavior P; KD-14 |
+| `main` | optional argv list (default sys.argv[1:]) → int; help/smoke exit 0, invalid command or configuration JSON ERROR exit 2, a command's own result JSON with exit 0 or 1; shlex.join preserves shell argument boundaries except one full parenthesized command | __main__, CliTests; parse_command, smoke, commands.py, json | I bootstrap dispatch, distributed behavior P; KD-14 |
 
 ### `legacy_membership.py`
 
@@ -615,8 +605,6 @@ types (KD-15), formatter/handlers (KD-17). No distributed server runs.
 | `ConfigTests.test_invalid_inventory` | Empty, malformed, duplicate and bad-port inputs → rejected |
 | `ConfigTests.test_load_local_file` | Temporary UTF-8 inventory with ::1 token → exact host read, no connection |
 | `ConfigTests.test_independent_eventual_quorums` | All 25 legal R/W pairs plus bad values → legal accepted independently, bad rejected |
-| `DomainTests.test_empty_is_distinct_from_missing` | OK b'' vs NOT_FOUND None → different states |
-| `DomainTests.test_invalid_results` | Failure-with-value/text-value/nonenum-status → rejected |
 | `LogTests.test_json_lines_append_and_console` | Temporary existing log and StringIO console; Unicode/newline extras; close/remove handlers finally → parseable appended identical records, fresh-logger guard |
 
 ### `tests/test_ring_membership.py` — fixed ring and restart-aware membership (KD-02/03/04/05, C1/C2)
@@ -655,7 +643,7 @@ file for preservation checks. No value file is read by a distributed operation.
 
 | Method | Fixture/internal behavior → expected assertion |
 |---|---|
-| `test_valid_commands_and_guard` | All command forms/modes → NOT_IMPLEMENTED, decision explanation, no value |
+| `test_every_command_parses` | All eight command forms and modes → a normalized Command |
 | `test_quotes_and_multiput_forms` | Quoted spaces and two multiput forms → normalized Command |
 | `test_invalid_commands` | Bad name/arity/mode/VM, duplicates, empty/NUL arg, broken quote/parentheses → ValueError |
 | `test_main_exit_codes_and_json` | Valid pending/invalid syntax/parenthesized input → JSON status and exit 3/2 |
@@ -683,14 +671,11 @@ membership class, socketpair framing, pathlib, importlib and mock.patch clocks.
 ## Pending components have no imaginary implementation
 
 Local storage, fixed hashing/membership and single-replica KV RPC exist as described
-above. Shared distinct-response collection and bounded dispatch are implemented.
-Strong ABD is implemented through the programmatic API in `strong.py`; Eventual
-coordinators, read repair, mode manager, benchmarks, plotting and deployment
-implementation remain future work.
-The CLI operation entrypoints still terminate at `pending.execute`; the RPC API is a
-library foundation and does not make those commands operational. Later responsibilities
-and decision gates are in the plan and KD-01..18. No fabricated benchmark/report
-content exists.
+above. Shared distinct-response collection and bounded dispatch are implemented, and the
+coordinators, read repair, mode manager and all eight commands now exist (see the Step 3 and
+Step 4 sections). Benchmarks, plotting and deployment scripts do not exist yet. Later
+responsibilities and decision gates are in the plan and KD-01..18. No fabricated
+benchmark/report content exists.
 
 Final Batch 1 refinements: timeout rejects booleans; decimal encoding/decoding
 roundtrips a 2**15000 Strong counter without changing global Python limits.
@@ -942,3 +927,317 @@ releases the older sends and requires valid durable `SUPERSEDED` replies. It ver
 each successful PUT's qualifying owner IDs against captured exact-version response
 evidence, all five older attempts become terminal, and all five local stores retain
 the newer version/value. This is KD-12 behavior, not a change to the protocol.
+
+## Step 4 Batch A — control endpoint, schema 3 groundwork, real `put`/`get` (implemented; KD-14/KD-13/KD-15)
+
+Decisions are recorded in `KEY_DECISIONS.md` ("Step 4 approval record"). This batch adds
+no Eventual-RR coordinator, no read repair, no mode switching and no `ls`/`liststore`/
+`getfromreplica`/`list_mem_ids`/`multiput`/`consistency_mode`; those arrive in Batches B–D.
+
+**`ring.py` — fourth endpoint.** `Node` now has `control: Endpoint` after `log_query`. The
+manifest JSON requires exactly `vm_id, ring_id, kv, membership, log_query, control` per
+node; `Manifest.from_endpoints` needs four endpoints per VM; all 40 endpoints must be
+unique; the fingerprint covers `control`, so changing it changes the manifest identity.
+An old three-endpoint manifest is rejected. Callers: every module that builds or loads a
+manifest. Operators must regenerate the manifest and inventory for all ten VMs together.
+
+**`rpc.py` — schema 3.** New constants `RR_SCHEMA_VERSION = 3`, `RR_PHASES`
+(`eventual_put`, `eventual_rr_read`, `eventual_rr_repair`) and `SUPPORTED_SCHEMAS`.
+Schema 3 requires `operation_id`, Eventual-RR mode, a READ_LOCAL for `eventual_rr_read`
+and INSTALL_IF_NEWER for the other two phases. Reads carry no version or body; installs
+carry a version. Schema 1 and 2 validation is unchanged (schema 2 still rejects RR
+phases and RR mode). `ReplicaClient` takes `rr_activation`; without it a schema-3 call
+returns an ERROR outcome `SCHEMA3_DISABLED` before any socket is opened. An
+`AttemptLease` is now accepted for schema-2 `eventual_put` or any schema-3 RR phase.
+
+**`coordinator.py`.** `Schema3Activation` (same inventory file as schema 2, but every node
+must advertise `schema_version >= 3`); `Schema2Activation.load_inventory` is the shared
+file reader. `CoordinatorResources` owns a third bounded executor `background`
+(`DEFAULT_BACKGROUND_WORKERS=8`, `DEFAULT_BACKGROUND_QUEUE=32`) for later RR comparison and
+repair; it shuts down after coordinators and before outbound attempts, and
+`CoordinatorShutdownReport.background` joins `clean`.
+
+**`replica.py`.** `ReplicaService(rr_activation=...)`. A schema-3 request without
+activation gets ERROR `SCHEMA3_DISABLED`; the fixed-owner check now applies to schema 2
+and 3 (`NOT_PRESCRIBED_OWNER`). No storage call happens before these checks.
+
+**`node.py`.** `NodeRuntime(rr_activation, background_workers, background_queue)`.
+`from_files` builds `rr_activation` from the same `--schema2-inventory` file when all
+nodes advertise schema 3, otherwise leaves it unset. `dispatch_owner` chooses schema 3 in
+Eventual-RR mode and schema 2 otherwise, and raises if the matching activation is
+missing. `start()` starts `ControlService` last, after the node is ready; `stop()` stops
+it first (half the remaining budget), and `NodeShutdownReport.control` is part of
+`clean`. The `READY` line now ends with `control=host:port`.
+
+**`control.py` (new).** Wire: the RPC outer/JSON framing with strict JSON, schema 1,
+exact field sets, and the 1 MiB body cap. `ControlRequest(command_id, manifest_id,
+target_id, command in {put,get,status}, key, value)`; key is strict UTF-8, at most 4096
+bytes; only `put` carries a value. `ControlResponse` carries status
+(`OK/NOT_FOUND/TIMEOUT/ERROR/OVERLOADED`), mode, epoch, version, up to five distinct
+acknowledging owners, the key's 64-hex ring ID, an error text (at most 1024 bytes, no
+NUL) and, for a successful `get`, the value. `ControlService(runtime, workers=8,
+max_pending=16, request_timeout=20, command_timeout=10)` has a fixed worker pool and
+bounded queue, replies OVERLOADED when full, enforces absolute deadlines, closes invalid
+frames without running a command, answers `WRONG_NODE` for a different target, and does
+in-memory duplicate suppression only (approved KD-14 change): a repeated finished `put`
+returns its first result, a repeated `get` or an in-progress command returns an error,
+and at most 256 finished IDs are kept. A command picks Strong or Eventual-noRR from the
+node's current mode; Eventual-RR returns an explicit "not implemented yet (Step 4B)"
+error. A crash forgets everything; uncertain outcomes are never replayed.
+`send_command(manifest, vm_id, command, key, value, timeout)` is the client; it raises
+`ControlError` on connection, timeout or invalid-reply failures and never retries.
+
+**`commands.py` (new).** `run_put`/`run_get` read or write the local file and print one
+JSON result. `read_value_file` rejects files over 1 MiB; `write_value_file_atomic`
+writes a temp file in the destination directory, flushes, fsyncs and `os.replace`s it, so
+a failed or NOT_FOUND `get` never changes the destination. Exit codes: 0 OK, 1 failed
+operation, 2 usage/config (3, for a pending command, was used only in Batch A and no longer exists).
+
+**`cli.py`.** `split_options` takes leading `--manifest PATH` and `--vm-id vmNN` (or
+`MP3_MANIFEST`/`MP3_VM_ID`). `put` and `get` call `commands.py`; without a node
+configuration they fail with exit 2 and touch no file. (In Batch A the other commands still
+returned `NOT_IMPLEMENTED`; Batch D made every command real and removed `pending.py`.)
+
+**Tests added.** `tests/test_schema3.py` (14): schema-3 wire rules, activation gates,
+replica admission, repair semantics and lease acceptance. `tests/test_control.py` (23):
+manifest endpoint rules, control wire validation, service behavior with a fake runtime
+(duplicates, invalid frames, overload, shutdown), file helpers, and `put`/`get` through
+the real CLI on ten loopback nodes in Strong and Eventual-noRR modes. `tests/test_cli.py`
+changed for the new put/get behavior. Fixtures in six existing test files gained the
+fourth endpoint (port stride 4).
+
+### Step 4 Batch A — review corrections (Haiku read-only review, two rounds)
+
+- **Command-ID reuse:** the duplicate memory now stores `(command, key, sha256(value))` with each
+  ID. A reused ID with different content returns `COMMAND_ID_REUSED` and runs nothing.
+- **Deadlines:** a command's deadline is `min(now + command_timeout, request deadline - 1 s)`.
+  A command that cannot get its minimum time returns `TIMEOUT` ("request time ran out before the
+  command started") and is not remembered, so a retry can run. An Eventual-noRR put is judged by
+  the time left in the request (at least 5.5 s) because its own foreground window is 5 s.
+- **Errors:** the completion-unknown marker is added after shortening the base text; an unexpected
+  exception returns only `INTERNAL_ERROR <TypeName>` (plus the marker for a put).
+- **Schema 3 in `coordinator.py`:** `dispatch_owner` applies the prescribed-owner check to schema 2
+  and 3; `collect_distinct` accepts schema 3 with `eventual_rr_read` (a read) and
+  `eventual_rr_repair` (initially treated like `eventual_put`; Batch B removed it from the
+  collector because repair results are classified by the RR coordinator itself).
+- **Files (`commands.py`):** `read_value_file` opens with `O_NONBLOCK` and checks `fstat`, so a pipe
+  cannot block it; `check_destination` refuses an existing non-regular output path before any
+  network call; the atomic write keeps the destination's permissions and syncs the directory.
+  A symbolic link at the destination is replaced, not written through.
+- **Known limits (documented, not fixed):** after 256 newer commands an old ID is forgotten; the
+  OVERLOADED reply is read on the accept thread with a 0.25 s budget, so a slow large upload may
+  just see a closed socket; `from_files` silently leaves schema-3 activation unset when the
+  inventory does not advertise it; Step 4B must give a repair's higher `SUPERSEDED` its own
+  distinct outcome (design section 2.2).
+
+
+## Step 4 Batch B — Eventual-RR, structured logs, MP1 query (implemented; KD-13/KD-17)
+
+Decisions: `KEY_DECISIONS.md` "Step 4 approval record". No mode switching and no remaining
+commands here (Batches C and D).
+
+**`eventual.py` — `EventualRRCoordinator(EventualNoRRCoordinator)`.** `EventualNoRRCoordinator`
+now has `MODE`, `MODE_ERROR`, `GATE_ERROR` and `_activation()`; the RR subclass sets
+Eventual-RR, `SCHEMA3_DISABLED` and `runtime.rr_activation`. PUT is the existing Eventual PUT
+(schema 3, same W rule, same bounded continuation). `eventual_get(key, deadline)` runs in
+two halves:
+
+1. *Foreground (coordinator worker):* one `AttemptLease` anchored at **admission** (read cutoff
+   = reply + 10 s, never past admission + 15 s). It reserves five attempts, reads all five
+   owners with `eventual_rr_read`, and returns the maximum version among the **first R** valid
+   FOUND/NOT_FOUND replies through a Future. R explicit absences return NOT_FOUND; a missing or
+   failed reply is never an absence. If R is unreachable, the unused reads are cancelled, the
+   client gets TIMEOUT/ERROR, and no repair is scheduled. Equal version with different bytes
+   in the first R fails closed.
+2. *Background (bounded `background` executor, no coordinator worker held):* waits until all
+   five reads are terminal or the cutoff, derives evidence from all five (digests only, never
+   value bytes), finds the maximum, and sends **one** `INSTALL_IF_NEWER` (`eventual_rr_repair`)
+   to each reachable owner that was NOT_FOUND or lower. The repair reserves its own attempts,
+   uses a separate lease of at most 5 s, and ends (including a 1 s settle wait) by admission +
+   20 s. Outcomes: `REPAIRED` (durable exact version), `SUPERSEDED_NEWER` (a newer write won;
+   its bytes are not propagated), `FAILED`, `NOT_ATTEMPTED` (capacity, mode/epoch changed,
+   20 s limit). Equal-version/different-bytes anywhere in the comparison set means no repair.
+   Repair is skipped if the node's context changed after the read (epoch fencing).
+
+`ProtocolResult.propagation` is a `ReadRepairHandle`; `handle.wait(timeout)` returns the final
+`ReadRepairReport` (returned status/version, per-owner `ReadEvidence`, maximum version,
+`RepairResult`s, conflict flag, incomplete reason). The report is logged before waiters are
+released. A task dropped at shutdown or a background failure still finishes its report.
+
+**`coordinator.py`.** `KEEP_AFTER_THRESHOLD` keeps queued RR reads alive after R replies;
+`READ_PHASES` includes `eventual_rr_read`. `CONTINUING_PHASES` stays `{"eventual_put"}`.
+
+**`eventlog.py`.** `JsonFormatter` merges flat structured `fields` (never replacing a base key);
+`log_read_repair` writes one event per RR GET: key, returned status/version, reachable
+owners, each owner's result/version/digest/error, maximum version, repairs and conflict flag.
+All events are JSON on one line (control characters and quotes are escaped). Logs use
+`FileHandler`, which flushes each event.
+
+**`node.py` / `control.py`.** `NodeRuntime(read_quorum, write_quorum)` (default 2 and 2, valid
+1..5) and `--read-quorum/--write-quorum` flags; `eventual_put/get` use them. New
+`eventual_rr_put/get`. The control service routes Eventual-RR commands to them (judged like an
+Eventual PUT for time budget). `--log machine.<N>.log` is the file the MP1 server reads.
+
+**MP1.** The unchanged `mp1/server.py <N> [port]` runs as a separate process in the log
+directory and the unchanged `mp1/client.py` `query_machine` finds read-repair events and
+replica receive/respond lines. No adapter was needed (approved KD-17 condition), and MP1/MP2
+were verified identical to the pre-change copy.
+
+**Tests.** `tests/test_rr.py` (20): first-R result with late maximum, first-R absent then later
+found, all absent, repair never overwrites a newer write, equal-version conflict, R=5, unreachable
+owner, R unreachable, log content and order, hostile key in the log, background failure,
+no background capacity, mode-change and 20 s repair limits. `tests/test_mp1_logs.py` (4) runs the
+real MP1 server and client. Control and CLI tests gained Eventual-RR round trips.
+
+## Step 4 Batch C — cluster-wide mode switching (implemented; KD-16)
+
+Decisions: `KEY_DECISIONS.md` "Step 4 approval record" (vm01 coordinator, all-ten barrier,
+durable commit, clear Strong<->Eventual, retain between the Eventual modes, 30-second budget).
+No `ls`, `liststore`, `getfromreplica`, `list_mem_ids` or `multiput` in this batch.
+
+**`models.py`.** `LocalStatus.TRANSITIONING`; `mode_change_clears_data(source, target)` (true
+exactly when one side is Strong); `TransitionInfo` (transition ID, coordinator `vm01`, from and
+target `Context`, phase), which requires a higher target epoch and a different mode.
+
+**`storage.py` (additive tables, created with `CREATE TABLE IF NOT EXISTS`, so older databases
+upgrade in place).** `transition` (one row per transition: PREPARED, COMMITTED, ACTIVE or
+ABORTED; the last 64 terminal rows are kept as tombstones), `authority` (durable
+`epoch_high_water`), `controller_journal` (vm01's PREPARING, COMMIT_DECIDED, GLOBAL_ACTIVE,
+DONE, ABORT_DECIDED, ABORTED states). **The fence:** `_check_context` runs in the same
+transaction as every read, install and version allocation and raises `TransitioningError`
+while a transition is PREPARED or COMMITTED, so nothing can slip between the fence and the
+commit. `read_local`/`install_if_newer` return `TRANSITIONING` and change nothing; the replica
+answers with an explicit non-qualifying error, never NOT_FOUND. Methods:
+`local_phase`, `open_transition`, `transition_state`, `prepare_transition` (idempotent for the
+same payload; refuses a reused ID with a different payload, a context that is not the expected
+one, a second open transition, and an aborted ID), `commit_transition` (one transaction: for
+Strong<->Eventual `DELETE FROM records` and reset `strong_counter` and `last_timestamp`; always
+set the new epoch and mode; mark COMMITTED), `activate_transition` (COMMITTED to ACTIVE),
+`abort_transition` (PREPARED or unknown to ABORTED; refused after commit; an unknown ID gets a
+tombstone only if no other transition is open), `allocate_transition_epoch` (above the
+high-water mark and the active epoch; burned even if the change aborts), and the `journal_*`
+methods (the only legal path is PREPARING, COMMIT_DECIDED, GLOBAL_ACTIVE, DONE, or PREPARING,
+ABORT_DECIDED, ABORTED; COMMIT_DECIDED can never move to an abort state).
+
+**`transition.py` (new).** `TransitionManager(runtime)` on every node.
+*Participant:* `participant_message(command, transition_id, payload)` handles `tx_prepare`
+(validates the payload and that this node can speak the target mode's schema), `tx_commit`
+(only if vm01's journal says COMMIT_DECIDED or later), `tx_activate` (only if vm01's journal
+says GLOBAL_ACTIVE or DONE, verified with vm01), `tx_abort` and `tx_status`.
+*Coordinator (vm01 only; other nodes forward to it):* `request_mode(target, request_id)`.
+It joins a running change to the same target, returns BUSY for a different one, polls all ten
+nodes (any unreachable node means TIMEOUT before anything is fenced), returns NO_CHANGE if all
+ten already run the target, otherwise allocates an epoch, journals PREPARING, then `_drive`
+sends PREPARE to all ten; only when all ten acknowledge **PREPARED** (and the budget allows)
+does it journal COMMIT_DECIDED, then COMMIT (all ten COMMITTED), then journals GLOBAL_ACTIVE,
+then ACTIVATE (all ten ACTIVE), then DONE. A failure before COMMIT_DECIDED records ABORT_DECIDED,
+tells every node to abort, and records ABORTED. After COMMIT_DECIDED a failure returns
+`PENDING` and the change is finished by recovery, never undone.
+*Recovery (a daemon thread on every node):* vm01 replays an open journal (PREPARING means no
+commit was decided, so it aborts; COMMIT_DECIDED and GLOBAL_ACTIVE are replayed) and settles
+its own fenced row from its own journal. Any other node that is fenced asks vm01 for its durable
+decision and applies it (abort, or commit then activate); a transition vm01 has never journaled
+is aborted. If vm01 is unreachable the node stays fenced and retries; nothing is guessed.
+`pause_recovery()`/`resume_recovery()` and `fault_hook(stage)` exist so tests can simulate a
+down vm01 or a crash at a named stage (`before_prepare`, `after_prepare`,
+`after_commit_decided`, `after_commit`, `after_global_active`, `after_activate`).
+
+**`control.py`.** New commands `mode` (key = target mode) and `tx_prepare`, `tx_commit`,
+`tx_activate`, `tx_abort`, `tx_status` (key = transition ID; only `tx_prepare` carries a JSON
+payload of at most 2048 bytes). New statuses `NO_CHANGE`, `BUSY`, `PENDING`, and a small JSON
+`detail` field in replies. A node that is not ACTIVE answers `put`/`get` with an explicit
+`TRANSITIONING` error. A node allows at most 3 concurrent `mode` requests (the rest get BUSY)
+so the node-to-node messages always find a free control worker. The default request timeout is
+now 50 s so a 30-second change fits. `send_command` can reuse a command ID (used to forward a
+mode request to vm01).
+
+**`node.py`, `commands.py`, `cli.py`.** `NodeRuntime.transition` is started after the control
+service and `transition_phase()` reports ACTIVE/PREPARED/COMMITTED. `consistency_mode MODE` is a
+real command; it prints the status, the resulting mode and epoch, and the transition details.
+
+**Limits (documented, not hidden).** Control messages are not authenticated, the same trust model
+as the KV RPC; commit and activate are protected because each is checked against vm01's
+journal. A forged PREPARE can only fence a node, and recovery then aborts it. If vm01 is down no
+new change can start and a fenced node stays fenced until vm01 returns. Success needs all ten
+nodes. A change while any node is unreachable is refused up front (TIMEOUT). The in-process crash
+tests restart a node from its database inside one Python process (clearing the single-start guard)
+to stand in for a new process; the real-process run used `kill -9` on a participant and
+`--recover`.
+
+**Tests.** `tests/test_transition_storage.py` (19): fence, atomic commit rollback, clear versus
+retain, idempotency and tombstones, restart at each phase, older-database upgrade, epoch
+burning, journal path. `tests/test_transition.py` (26): all six directed changes with data rules
+and untouched membership and ring owners, NO_CHANGE, concurrent same-target requests, BUSY,
+unreachable node, abort and epoch burn, crash and replay at each stage, participant crash,
+a node that misses ACTIVATE, old-epoch writes cannot resurrect data, explicit fenced errors,
+message validation, forged commit refused, orphan release, vm01 self-abort retry, wrong-phase
+acknowledgement, a BaseException in the driver, and the mode-request limit.
+
+## Step 4 Batch D — the last five commands and `multiput` (implemented; KD-14)
+
+Decisions: `KEY_DECISIONS.md` "Step 4 approval record" (separate control endpoint, 1 MiB cap, atomic
+output files, ARM/READY/GO for `multiput` with **in-memory** duplicate suppression only, UNKNOWN where
+a crash makes the outcome unknowable, no exactly-once claim). All eight required commands now run;
+`pending.py` was deleted because nothing is pending any more.
+
+**`ls key` (`commands.run_ls`).** Pure local computation from the manifest (no node needed): the
+key's ring ID and the five owners with VM name, ring ID and `host:port`. Ignores liveness and storage.
+
+**`liststore` (`storage.list_keys`, `NodeRuntime.list_store`, `commands.run_liststore`).** One bounded
+page of stored keys per request (at most 2000 keys and 128 KiB), ordered bytewise by UTF-8 and
+resumable with a cursor; a node that is fenced by a mode change refuses with TRANSITIONING. The
+cursor travels in the request body (a long key would overflow the 16 KiB metadata field). The client
+loops page by page, prints each key with its key ID, and stops with an error if a page's cursor does
+not advance. The summary line carries the VM's own ring ID.
+
+**`list_mem_ids` (`commands.run_list_mem_ids`).** The node's `MembershipTable.list_mem_ids()` rows
+(VM, ring ID, status, generation, incarnation, heartbeat), sorted by numeric ring ID, including
+SUSPECTED nodes.
+
+**`getfromreplica VMaddress key file` (`control._read_replica`, `commands.run_getfromreplica`).**
+`VMaddress` is a VM name (`VM3`, `vm03`), a configured KV `host:port`, or a host that names exactly
+one VM. The local node sends **one** schema-1 `READ_LOCAL` (`phase=local`) request to exactly that
+replica through `NodeRuntime.call_replica`; no quorum, no install, no repair. FOUND writes the file
+atomically; NOT_FOUND means only that replica has no copy; an unreachable or fenced replica is an
+explicit TIMEOUT or ERROR; the destination is untouched on anything but FOUND. At most 3 such reads
+run at once per node so they cannot fill the control workers.
+
+**`multiput key VMi ... VMj` (`multiput.py`, `control._run_admin`).** The VM that receives the command
+coordinates, with a 25-second budget clamped to the time left in its request (a multiput with under
+6 seconds left does not start).
+*Participant (every node):* `mp_arm` loads this VM's value (`--multiput-file`, or 1 KiB of random
+bytes), remembers it under the multiput ID with a receipt-local 15-second lease, and replies READY
+with the byte count and a SHA-256 prefix; at most 8 armed values are held and an ARM whose lease ran
+out is freed. `mp_go` starts an ordinary put in the cluster's current mode on a small bounded pool,
+only for an armed, unexpired, unaborted ID; a duplicate GO returns the current state and never starts
+a second put. `mp_abort` cancels an armed multiput (and leaves a tombstone so a later GO is refused)
+but cannot undo a started one. `mp_status` reports ARMED, STARTED, DONE, NOT_STARTED or UNKNOWN with
+the put result. A put refused because the node is fenced reports NOT_STARTED with the reason.
+*Coordinator:* ARM to every selected VM at once; if any is not ready, ABORT to all (a VM that
+confirms is NOT_STARTED, a VM that does not answer is UNKNOWN) and no put starts where aborted. If
+all are READY, GO to all at once (one idempotent resend where a reply was lost), then poll status
+until each put is DONE. A VM that explicitly refuses GO is NOT_STARTED; a VM that forgot the
+multiput after a possible start is UNKNOWN (nothing is replayed). Result: OK only if every VM's put
+was DONE with status OK; PENDING if some puts are started but not confirmed; ERROR otherwise. Each
+row reports the VM's state, put status, version, acknowledging nodes, byte count, SHA-256 prefix, its
+own put duration and the coordinator's GO round trip. All timings are local durations; clocks of
+different VMs are never compared and simultaneous launch is not claimed.
+
+**`control.py`.** New commands `liststore`, `list_mem_ids`, `read_replica`, `multiput`, `mp_arm`,
+`mp_go`, `mp_abort`, `mp_status`; a successful `get`, `read_replica` or `liststore` may carry a body;
+`detail` may be 8 KiB. `mode` and `multiput` share 3 long-request slots; `read_replica` has its own 3.
+
+**`cli.py` / `commands.py`.** `ls` needs only `--manifest`; every other command needs `--manifest` and
+`--vm-id`. `multiput` accepts `VM3`, `vm3` or `vm03` (and the `multiput(key, VM1, VM2)` form), treats
+different spellings of one VM as duplicates, and allows 1 to 10 VMs. Exit codes: 0 success, 1 the
+operation failed, 2 usage or configuration error. Every command prints one final JSON line (plus one
+line per key for `liststore`).
+
+**Tests.** `tests/test_commands.py` (31, including the review fixes): `ls` against the ring, listing pages
+and fencing, `liststore` over several pages and with long keys, `list_mem_ids` order with a suspected
+node, `getfromreplica` (exactly one call, owner, non-owner, address form, empty value, down replica,
+bad address, directory destination, nothing installed), `multiput` (concurrent GO, own file versus
+random bytes, initiator among the VMs, abort when a VM is down with nothing written, invalid
+selections, ARM lease expiry, duplicate GO, GO after abort, bounded memory, fenced node), scripted
+coordinator cases (lost GO reply, lost ARM, UNKNOWN, resend while armed), request-time clamping,
+bounded replica reads, and an end-to-end pass of all eight commands in each of the three modes.

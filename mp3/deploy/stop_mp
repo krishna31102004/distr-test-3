@@ -1,0 +1,18 @@
+#!/bin/bash
+# Gracefully stop the node (SIGTERM; it reports a clean shutdown). Usage: ./stop_mp all | 3 4
+. "$(dirname "$0")/lib.sh"
+parse_vms "$@" || die "usage: ./stop_mp <vm...|all>"
+
+stop_one() {
+    local n="$1" pid i
+    pid=$(vm_pid "$n")
+    if [ -z "$pid" ]; then echo "VM $n: node is not running"; return 0; fi
+    vm_sh "$n" "kill -TERM $pid"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        [ -z "$(vm_pid "$n")" ] && { echo "VM $n: stopped ($(vm_sh "$n" 'grep "^STOPPED" "$MP3_RUN/node.out" | tail -1'))"; return 0; }
+    done
+    echo "VM $n: did not stop within 10 s (use kill_mp)"; return 1
+}
+
+for_each_vm stop_one "${VMS[@]}"

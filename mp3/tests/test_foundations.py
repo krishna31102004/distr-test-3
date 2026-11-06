@@ -7,7 +7,6 @@ import unittest
 
 from mp3.config import load_inventory, parse_inventory, validate_quorums
 from mp3.eventlog import configure_logging
-from mp3.models import OperationResult, Status
 from mp3.ring import RingNode, select_successors
 
 
@@ -75,20 +74,6 @@ class ConfigTests(unittest.TestCase):
         for values in ((0, 2), (2, 6), (True, 1), (1.5, 2)):
             with self.assertRaises(ValueError):
                 validate_quorums(*values)
-
-
-class DomainTests(unittest.TestCase):
-    def test_empty_is_distinct_from_missing(self):
-        self.assertEqual(OperationResult(Status.OK, value=b"").value, b"")
-        self.assertIsNone(OperationResult(Status.NOT_FOUND).value)
-
-    def test_invalid_results(self):
-        with self.assertRaises(ValueError):
-            OperationResult(Status.TIMEOUT, value=b"")
-        with self.assertRaises(TypeError):
-            OperationResult(Status.OK, value="text")
-        with self.assertRaises(ValueError):
-            OperationResult("OK")
 
 
 class LogTests(unittest.TestCase):

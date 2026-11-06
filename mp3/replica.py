@@ -47,7 +47,7 @@ class ReplicaService:
                  request_timeout: float = DEFAULT_REPLICA_REQUEST_TIMEOUT,
                  overload_reply_timeout: float = DEFAULT_OVERLOAD_REPLY_TIMEOUT,
                  logger: logging.Logger | None = None, event_stream=None,
-                 protocol_activation=None):
+                 protocol_activation=None, rr_activation=None):
         if not isinstance(manifest, Manifest) or not isinstance(membership, MembershipTable):
             raise TypeError("manifest and MembershipTable are required")
         if manifest.fingerprint != membership.manifest.fingerprint:
@@ -79,6 +79,7 @@ class ReplicaService:
         self.logger = logger
         self.event_stream = event_stream
         self.protocol_activation = protocol_activation
+        self.rr_activation = rr_activation
 
         self._queue: queue.Queue = queue.Queue(maxsize=max_pending)
         self._stop = threading.Event()
@@ -256,7 +257,11 @@ class ReplicaService:
                 and (self.protocol_activation is None
                      or not self.protocol_activation.enabled_for(self.manifest))):
             return "SCHEMA2_DISABLED"
-        if (request.schema == 2
+        if (request.schema == 3
+                and (self.rr_activation is None
+                     or not self.rr_activation.enabled_for(self.manifest))):
+            return "SCHEMA3_DISABLED"
+        if (request.schema in (2, 3)
                 and self.membership.self_id not in {
                     owner.vm_id for owner in self.manifest.owners(request.key)}):
             return "NOT_PRESCRIBED_OWNER"
@@ -309,6 +314,9 @@ class ReplicaService:
                     request, epoch=result.context.epoch, mode=result.context.mode,
                     op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
                     present=False, durable=False, error="STALE_EPOCH")
+            if result.status == LocalStatus.TRANSITIONING:
+                # Fenced mid mode change: an explicit non-qualifying reply, never NOT_FOUND.
+                return self._error_response(request, "TRANSITIONING")
             return self._error_response(request, "STORAGE_ERROR")
 
         record = Record(request.version, request.value)
@@ -320,6 +328,8 @@ class ReplicaService:
                 request, epoch=result.context.epoch, mode=result.context.mode,
                 op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
                 present=False, durable=False, error="STALE_EPOCH")
+        if result.status == LocalStatus.TRANSITIONING:
+            return self._error_response(request, "TRANSITIONING")
         status_map = {
             LocalStatus.INSTALLED: RpcStatus.INSTALLED,
             LocalStatus.UNCHANGED: RpcStatus.UNCHANGED,

@@ -1,7 +1,6 @@
 """C5 wire schema, binary framing, strict validation, and deadline primitives."""
 
 from dataclasses import replace
-import json
 import socket
 import struct
 import threading
@@ -24,11 +23,12 @@ def make_manifest():
     endpoints = {}
     for number in range(1, 11):
         vm = f"vm{number:02d}"
-        base = 43000 + number * 3
+        base = 43000 + number * 4
         endpoints[vm] = {
             "kv": Endpoint("127.0.0.1", base),
             "membership": Endpoint("127.0.0.1", base + 1),
             "log_query": Endpoint("127.0.0.1", base + 2),
+            "control": Endpoint("127.0.0.1", base + 3),
         }
     return Manifest.from_endpoints(endpoints)
 

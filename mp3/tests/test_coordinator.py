@@ -20,11 +20,12 @@ def manifest_fixture():
     endpoints = {}
     for index in range(1, 11):
         vm_id = f"vm{index:02d}"
-        port = 52000 + index * 3
+        port = 52000 + index * 4
         endpoints[vm_id] = {
             "kv": Endpoint("127.0.0.1", port),
             "membership": Endpoint("127.0.0.1", port + 1),
             "log_query": Endpoint("127.0.0.1", port + 2),
+            "control": Endpoint("127.0.0.1", port + 3),
         }
     return Manifest.from_endpoints(endpoints)
 

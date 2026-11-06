@@ -1,0 +1,16 @@
+#!/bin/bash
+# Crash the MP3 node process on the given VMs with kill -9 (never shuts a VM down, never
+# touches the database or logs). Usage: ./kill_mp 3 7   |   ./kill_mp all
+. "$(dirname "$0")/lib.sh"
+parse_vms "$@" || die "usage: ./kill_mp <vm...|all>"
+
+kill_one() {
+    local n="$1" pid
+    pid=$(vm_pid "$n")
+    if [ -z "$pid" ]; then echo "VM $n: node is not running"; return 0; fi
+    vm_sh "$n" "kill -9 $pid" || { echo "VM $n: kill failed"; return 1; }
+    sleep 1
+    if [ -z "$(vm_pid "$n")" ]; then echo "VM $n: pid $pid killed (kill -9)"; else echo "VM $n: STILL RUNNING"; return 1; fi
+}
+
+for_each_vm kill_one "${VMS[@]}"

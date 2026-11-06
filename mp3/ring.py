@@ -81,6 +81,7 @@ class Node:
     kv: Endpoint
     membership: Endpoint
     log_query: Endpoint
+    control: Endpoint
 
     def __post_init__(self) -> None:
         _validate_vm_id(self.vm_id)
@@ -89,7 +90,7 @@ class Node:
         if self.ring_id != node_position(self.vm_id):
             raise ValueError(f"ring_id does not match approved SHA-256 position for {self.vm_id}")
         if not all(isinstance(endpoint, Endpoint)
-                   for endpoint in (self.kv, self.membership, self.log_query)):
+                   for endpoint in (self.kv, self.membership, self.log_query, self.control)):
             raise TypeError("all service endpoints must be Endpoint values")
 
 
@@ -150,7 +151,7 @@ class Manifest:
         if len(set(positions)) != CLUSTER_SIZE:
             raise ValueError("two VM identities have the same ring position")
         endpoints = [(endpoint.host, endpoint.port) for node in nodes
-                     for endpoint in (node.kv, node.membership, node.log_query)]
+                     for endpoint in (node.kv, node.membership, node.log_query, node.control)]
         if len(set(endpoints)) != len(endpoints):
             raise ValueError("manifest service endpoints must be unique")
         ordered = tuple(sorted(nodes, key=lambda node: node.vm_id))
@@ -166,7 +167,8 @@ class Manifest:
         return {"vm_id": node.vm_id, "ring_id": node.ring_id,
                 "kv": _endpoint_to_dict(node.kv),
                 "membership": _endpoint_to_dict(node.membership),
-                "log_query": _endpoint_to_dict(node.log_query)}
+                "log_query": _endpoint_to_dict(node.log_query),
+                "control": _endpoint_to_dict(node.control)}
 
     @classmethod
     def from_mapping(cls, value: object) -> "Manifest":
@@ -175,10 +177,11 @@ class Manifest:
         nodes = []
         for item in value["nodes"]:
             if not isinstance(item, dict) or set(item) != {
-                    "vm_id", "ring_id", "kv", "membership", "log_query"}:
-                raise ValueError("node must contain exactly vm_id, ring_id, kv, membership, log_query")
+                    "vm_id", "ring_id", "kv", "membership", "log_query", "control"}:
+                raise ValueError(
+                    "node must contain exactly vm_id, ring_id, kv, membership, log_query, control")
             endpoints = {}
-            for name in ("kv", "membership", "log_query"):
+            for name in ("kv", "membership", "log_query", "control"):
                 raw = item[name]
                 if not isinstance(raw, dict) or set(raw) != {"host", "port"}:
                     raise ValueError(f"{name} endpoint must contain exactly host and port")
@@ -206,10 +209,12 @@ class Manifest:
         nodes = []
         for vm_id in sorted(endpoints):
             services = endpoints[vm_id]
-            if set(services) != {"kv", "membership", "log_query"}:
-                raise ValueError(f"{vm_id} must specify kv, membership and log_query endpoints")
+            if set(services) != {"kv", "membership", "log_query", "control"}:
+                raise ValueError(
+                    f"{vm_id} must specify kv, membership, log_query and control endpoints")
             nodes.append(Node(vm_id, node_position(vm_id), services["kv"],
-                              services["membership"], services["log_query"]))
+                              services["membership"], services["log_query"],
+                          services["control"]))
         return cls(tuple(nodes))
 
     def to_json(self) -> str:

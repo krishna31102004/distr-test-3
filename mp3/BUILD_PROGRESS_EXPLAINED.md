@@ -1082,3 +1082,131 @@ The MP1 client treats any `FILENAME:` response as success, so the proposed adapt
 will close without that response on query errors; valid no-match remains an empty
 `FILENAME:` body. These are design clarifications only. No Step 4 behavior has been
 implemented or tested.
+
+## Step 4, Batch A — a real `put` and `get` from the terminal (November 5, 2026)
+
+Until now the Strong and Eventual-noRR logic could only be called from Python tests. Batch A adds
+the missing connection: every node now opens a small **control port**, and the command line sends
+`put` or `get` to its own node, which does the real work with the other replicas.
+
+In plain terms: you start a node on each VM, then run
+`python3 -m mp3 --manifest manifest.json --vm-id vm01 put photo image.png`. The node stores the
+file on the key's five owners and prints the status, the key's ring ID, the version and which
+nodes acknowledged. `get` fetches it into a local file, and only replaces the file if the read
+succeeded. Files up to 1 MiB (including empty files) work.
+
+Other parts of the batch: the manifest has a fourth address per VM (`control`), so every VM's
+manifest and inventory must be regenerated together; schema 3, the message format for the coming
+Eventual-RR mode, is in place but switched off until activated; and there is a separate pool of
+background workers for the read-repair work in Batch B.
+
+Checks: the whole suite passes (259 tests), and we ran ten real node processes and the real
+command line. A second AI reviewer read the code twice and found real problems (a reused command
+ID could return the wrong answer, a command could outlive its request, a `get` could overwrite a
+pipe); all were fixed and tested. Still ahead: Eventual-RR (Batch B), mode switching (C), and the
+other six commands (D). Nothing here was run on the university VMs.
+
+## Step 4, Batch B — Eventual-RR read repair and queryable logs (November 5, 2026)
+
+The third consistency mode now exists. In **Eventual-RR**, a `get` asks all five owners of a key
+but answers you as soon as the first R of them reply (R is 2 by default), using the newest
+version among those replies. After that, in the background, it looks at everything the owners
+said, finds the newest version of all, and fixes any owner that is behind or missing the key by
+sending it that version once. It never overwrites a newer write that arrived in the meantime,
+it never loops, and the whole thing stops 20 seconds after the request started. If it cannot
+get R answers it tells you so with an error or timeout; it never pretends the key is missing.
+
+A node can now write `machine.<N>.log`. Each read repair adds one JSON line: the version it
+returned, which owners answered, what each one said, and every repair it made. The file never
+contains your data. Because it is a plain text file with the name MP1 expects, the original MP1
+search server and client query it with no changes at all; a test and a run on ten real node
+processes both confirmed this, so the extra adapter in the design was not needed.
+
+You can also set R and W per node with `--read-quorum` and `--write-quorum` (the benchmarks will
+use 1 and 1, and 2 and 2).
+
+Checks: the whole suite passes (284 tests) and a ten-process run worked from the terminal. A
+second AI reviewer found three real design problems in my first version (background work held up
+other requests, its time limits started at the wrong moment, and the log line could appear after
+the result was released); all were fixed and tested. Still ahead: mode switching (Batch C) and the
+other six commands (Batch D). Nothing here was run on the university VMs.
+
+## Step 4, Batch C — switching the whole cluster between modes (November 5, 2026)
+
+The `consistency_mode` command now changes all ten computers at once, from any VM. Switching
+between Strong and either Eventual mode wipes every stored value and version number on every node
+(the assignment requires that); switching between the two Eventual modes keeps the data. Computer
+identities, ring positions and the membership list never change.
+
+How it works, in plain steps. vm01 is always the one in charge. It picks a new epoch number and
+asks all ten nodes to freeze (PREPARE); each node writes a durable note and stops serving reads and
+writes. Only when all ten have frozen does vm01 write down its decision to go ahead; after that
+point the change can never be cancelled. Then every node, in a single database transaction, wipes
+or keeps its data and adopts the new mode and epoch. When all ten have done that, vm01 tells them to
+reopen, and each node first double-checks with vm01 that the decision really was made. The command
+reports success only when all ten have reopened.
+
+If something goes wrong before the decision, everything is cancelled and nobody loses data. If a
+computer crashes, it comes back still frozen and asks vm01 what was decided; vm01 also re-sends any
+decided-but-unfinished steps after it restarts. While a node is frozen it answers with a clear
+"TRANSITIONING" error, never "not found", and late messages from the old mode are refused so they
+cannot bring wiped data back.
+
+Checks: the whole suite passes (329 tests), and ten real node processes switched modes, including
+after killing a normal node and after killing vm01 (between changes). A second AI reviewer found six
+real problems (for example a stray message could wipe one node and leave it frozen); all were fixed
+and tested. Still ahead: the last five commands (`ls`, `liststore`, `getfromreplica`,
+`list_mem_ids`, `multiput`). Nothing here was run on the university VMs.
+
+## Step 4, Batch D — the last five commands (November 5, 2026)
+
+All eight commands from the assignment now work from the command line.
+
+- **`ls key`** prints where a key lives: its position on the ring and the five computers that own
+  it, with each one's ring position and address. It needs only the manifest file, no running node.
+- **`liststore`** prints every key stored on that computer with its ring position, then that
+  computer's own ring position and a count. It reads a few thousand keys at a time so a big store
+  never freezes the node.
+- **`list_mem_ids`** prints the whole membership list with ring positions, sorted by ring position,
+  including computers that are suspected to be down.
+- **`getfromreplica VMaddress key file`** asks exactly one computer for its own copy of a key (no
+  voting, no repair) and writes the file only if that computer has the key. It is how you check
+  whether two copies really match.
+- **`multiput key VM3 VM5 ...`** makes several computers put to the same key at the same moment.
+  The computer you run it on asks each one to get ready (ARM), waits until all say READY, then says
+  GO to all of them together. Each computer puts its own value (a file you point it at, or 1 KiB of
+  random bytes). If any computer is not ready, the others are told to stand down and nothing is
+  written. You get one line per computer: whether its put finished, its version, who acknowledged,
+  and how long it took on its own clock.
+
+Honest limits: "at the same moment" means the GO messages are sent together, not that they land on
+the same microsecond, and the computers' clocks are never compared. A computer that restarts after
+accepting GO forgets the multiput and is reported UNKNOWN; nothing is ever replayed.
+
+Checks: the whole suite passes (361 tests), and ten real node processes ran all eight commands,
+including with one computer killed (the multiput refused to start where it could stand down and
+named the dead computer UNKNOWN). A second AI reviewer found six real problems (for example an
+unused armed value was never freed and a retried GO lost its result); all were fixed and tested.
+This finishes Step 4. Still ahead: the optional cleanup pass, then Step 5 (ten university VMs, which
+needs your permission) and Step 6 (benchmarks, report, demo). Nothing has been run on the VMs.
+
+## The cleanup pass (November 5, 2026)
+
+After the last feature was done we tidied the code without changing what it does. The point is
+that someone reading it later should not be told that finished things are "still pending".
+
+What we did: a small script (kept outside the project) listed imports nothing uses, names nothing
+refers to, and variables that are assigned and never read; every candidate was double-checked
+before deleting. We removed those, removed two old types that only the temporary "not implemented"
+stub had used (with the two tests that tested only them), fixed the module descriptions that still
+said things were pending, and corrected the README and the explanation guide where they still
+described the commands as unfinished. We kept every comment that explains the hard parts: how ABD
+works, versions, durable writes, epochs, fencing, leases and shutdown.
+
+What we did not touch, on purpose: a few unused-but-tested helpers (`AttemptLedger` and two framing
+functions), because removing them means editing the reviewed Batch 1 design and its tests for no
+gain; the MP2 reference copy; and `AGENTS.md`, whose old "pending operations return NOT_IMPLEMENTED"
+rule belongs to the team and needs the owners' approval to change.
+
+Checks: all 359 tests pass, ten real node processes still run all the commands, and a second AI
+reviewer confirmed nothing the code does has changed.

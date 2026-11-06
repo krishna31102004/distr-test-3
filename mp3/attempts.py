@@ -1,4 +1,4 @@
-"""Bounded lifetime primitives shared by future Eventual PUT attempts (KD-08/12/14)."""
+"""Bounded lifetime primitives shared by Eventual PUT and read-repair attempts (KD-08/12/13/14)."""
 
 from __future__ import annotations
 

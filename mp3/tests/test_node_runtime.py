@@ -49,11 +49,12 @@ def local_manifest() -> Manifest:
     endpoints = {}
     for number in range(1, 11):
         vm_id = f"vm{number:02d}"
-        ports = [_free_port(reserved) for _ in range(3)]
+        ports = [_free_port(reserved) for _ in range(4)]
         endpoints[vm_id] = {
             "kv": Endpoint("127.0.0.1", ports[0]),
             "membership": Endpoint("127.0.0.1", ports[1]),
             "log_query": Endpoint("127.0.0.1", ports[2]),
+            "control": Endpoint("127.0.0.1", ports[3]),
         }
     return Manifest.from_endpoints(endpoints)
 
