@@ -161,6 +161,9 @@ class FakeRuntime:
         self.manifest = manifest
         self.vm_id = vm_id
         self._context = Context(1, mode)
+        self.read_quorum = 2
+        self.write_quorum = 2
+        self.generation = 1
         self.gate = None
         self.calls = []
         self.deadlines = []
@@ -643,6 +646,9 @@ class ControlClusterTests(unittest.TestCase):
         response = send_command(self.manifest, "vm01", "status")
         self.assertEqual((response.status, response.mode, response.node_id),
                          (ControlStatus.OK, ConsistencyMode.EVENTUAL_NO_RR, "vm01"))
+        detail = json.loads(response.detail)
+        self.assertEqual((detail["read_quorum"], detail["write_quorum"], detail["generation"]),
+                         (2, 2, 1))
 
     def test_node_shutdown_reports_the_control_service_and_closes_its_port(self):
         self.start_cluster(ConsistencyMode.STRONG, ["vm01"])

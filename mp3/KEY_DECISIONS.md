@@ -667,6 +667,13 @@ Healthy cluster, sequential per-client operations, both >=180s durations, all-re
 **Planned tests / acceptance:** Workload mix/seed determinism, preload/readback, timestamp math,
   raw aggregation and missing-trial checks. See master plan for matrix and time budget.
 
+**Implementation evidence (November 6, 2026; does not change decision status):** The local
+benchmark package, 51-trial scheduler, deterministic resident workers, all-five-owner key
+presence verification, metric/report validator, three plots and 12-point LaTeX template
+are implemented. Focused unit tests passed and a short isolated ten-node loopback smoke
+passed. No remote VM measurement or final report was produced. Exact harness choices remain
+PENDING for human review, and actual B-01/B-02 experiment evidence is still outstanding.
+
 ## Step 4 approval record — recorded November 5, 2026
 
 **Source:** `CS425_MP3_Step4_Claude_Decision_Approval.md`, supplied by Juhi as Krishna's

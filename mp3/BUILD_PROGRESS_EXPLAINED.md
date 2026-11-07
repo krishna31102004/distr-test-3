@@ -1241,3 +1241,57 @@ SSH and host-key rules, firewall/port policy, and the university VM's Python and
 versions. The hostnames, username and ports in our scripts come from older repository
 files, so they are assumptions to verify rather than proof the course machines are ready.
 Real ten-VM deployment and failure testing remain for the next authorized task.
+
+## Step 6 — Benchmark tools and report template (November 6, 2026)
+
+We built the machinery for the two required experiments, but we did **not** run them on
+the UIUC VMs. A benchmark client is a small program that repeatedly sends real GET and
+PUT commands to an MP3 node and records each result. Each client waits for its operation
+to finish before starting the next one. Its key choices come from a saved seed, so
+comparable trials can use the same sequence.
+
+The workload package makes exactly 1 KiB PUT values and alternates GET and PUT. Experiment
+1 uses uniform key choices. Experiment 2 sends 99% of GETs and PUTs to the same ten hot
+keys. The scheduler describes 51 trials total: 45 for Experiment 1 and 6 for Experiment
+2, with three trials per setting and at least 180 seconds per client.
+
+Before a measured trial, the preloader writes 100,000 keys through the ordinary MP3
+interface. It checks the exact bytes and version at one prescribed owner per key, then
+uses each node's paginated `liststore` output to prove that the key is present at all five
+owners. That setup time is outside the measurement. When switching Strong/Eventual modes,
+the existing system clears data as required; when R or W changes, nodes restart because
+those settings are loaded at startup. The runner verifies the active settings and
+preloads again before measuring.
+
+```text
+10 node processes + client processes on selected VM identities
+          | persistent GET/PUT requests
+          v
+   raw per-operation JSONL
+          | validate all 51 trials and raw evidence
+          v
+   three plots + edited two-page LaTeX report
+```
+
+The local smoke used ten separate loopback nodes and two client processes. It preloaded
+8 keys (40 prescribed owner copies), ran 406 successful operations with no failures in
+about two seconds per client, and made a plot with a large **NOT FOR REPORT** watermark.
+It touched only `127.0.0.1`. These quick local numbers are just proof that the harness
+connects its pieces; they are not experiment results.
+
+The report builder refuses to make final plots/PDF until it finds the complete 51-trial
+remote dataset. It checks that the raw command/key/value sequence matches the seed, each
+worker lasted the full interval, all preloaded key identities and five-owner inventories
+are present, and the summary numbers can be recomputed from raw operations. The independent
+reviewer checked these conditions and independently ran the final benchmark tests (16/16).
+The full MP3 suite passed 376 tests in 499.335 seconds. The benchmark tests passed 16/16
+locally, and the control suite passed 38/38. `python3 -B -m mp3 --smoke`, CLI help,
+node help, compilation and `git diff --check` also passed. `pdflatex` is not installed, so
+the LaTeX PDF was not compiled here.
+
+What is still missing: verified university host details and compatibility, all actual
+180-second trials, their real graphs and interpretation, and the final compiled report.
+KD-18 remains pending; adding the harness did not approve that decision. The next real
+measurement task must first verify the course hostnames, SSH policy, ports, and remote
+Python/SQLite versions. The exact safe run and report commands are in `README.md` and
+`benchmarks/README.md`.

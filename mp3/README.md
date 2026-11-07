@@ -167,6 +167,77 @@ acknowledging nodes, size and a SHA-256 prefix, and its own timings. If any VM i
 the aborted VMs start a put. Exit codes: 0 success, 1 the operation failed, 2 usage or
 configuration error.
 
+## Benchmark and report framework
+
+The full benchmark harness and LaTeX template are implemented, but no university-VM
+trials have been run. KD-18 remains pending, and local smoke data is never reportable.
+The smoke command starts ten local node processes and two persistent clients; it requires
+explicit local targeting and retains watermarked evidence outside the repository:
+
+```bash
+MP3_TARGET=local python3 -B -m mp3.benchmarks smoke \
+  --duration 2.5 --key-count 8 --output-dir /tmp/mp3-benchmark-smokes
+```
+
+Focused framework/control tests:
+
+```bash
+python3 -B -m unittest mp3.tests.test_benchmarks mp3.tests.test_control -v
+```
+
+The full remote runner has 51 trials at no less than 180 seconds per client and requires
+operator confirmation of an isolated run root. **Do not run this example until the ten-VM
+manifest, hostnames, Python/SQLite versions, SSH policy and ports have been verified.**
+It preloads 100,000 1 KiB keys after each configuration change, verifies each key's exact
+content/version at one prescribed owner and key presence on all five owners, then runs
+closed-loop resident clients. R/W changes restart nodes because those settings are loaded
+at process startup. Example command for the later authorized measurement task:
+
+```bash
+MP3_TARGET=remote MP3_USER=<netid> \
+python3 -B -m mp3.benchmarks full \
+  --manifest /path/to/course-manifest.json \
+  --run-dir results/run-2026-11-06 \
+  --run-id run-2026-11-06 \
+  --remote-root '$HOME/mp3_benchmark_run-2026-11-06' \
+  --confirm-isolated-root run-2026-11-06
+```
+
+After collecting all real trials, copy and edit the template, replace every pending
+placeholder with evidence-based design and results discussion, and save truthful LLM
+transcripts in `<run-dir>/llm_use/`. Then validate all trials, generate the three plots,
+compile the PDF, and verify it is under three pages:
+
+```bash
+cp mp3/report/report.tex results/run-2026-11-06/report.tex
+# Edit report.tex and add the actual transcripts under results/run-2026-11-06/llm_use/.
+python3 -B -m mp3.benchmarks report \
+  --run-dir results/run-2026-11-06 \
+  --report-source results/run-2026-11-06/report.tex \
+  --output results/run-2026-11-06/report.pdf
+```
+
+The report builder requires 51 verified remote trial summaries, retained raw operation
+rows, actual per-client durations, all-five-owner preload evidence and LLM-use transcripts.
+On success it also writes `aggregates/trial_metrics.csv` (including the throughput
+measurement interval and actual worker elapsed bounds) and
+`aggregates/configuration_summary.csv` (mean and sample standard deviation across the three
+trials in each configuration).
+This environment has no `pdflatex`, so PDF compilation remains unverified here. See
+[benchmark runbook](benchmarks/README.md) and [report template](report/README.md).
+
+## Local smoke evidence (November 6, 2026)
+
+The short smoke command above was run with `--duration 2 --key-count 8`: ten loopback node
+processes and two client processes, 8 preload keys and 40 owner copies, 406 successful
+operations, 0 failures, 2.002–2.007 seconds per client, 202.27 successful operations/second,
+9.81 ms mean terminal latency, and a watermarked plot. This is **NOT FOR REPORT** and is
+not a university deployment or benchmark result. Focused benchmark/control tests passed
+54 tests (16 benchmark and 38 control); the benchmark suite passed independently 16/16.
+The full MP3 suite passed **376 tests in 499.335 seconds** after the checkpoint and CSV
+additions. The final benchmark suite passed independently **16/16**. Real trials,
+report discussion, and remote compatibility checks remain.
+
 ## Local foundation APIs
 
 ```python

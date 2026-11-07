@@ -1856,3 +1856,58 @@ Current professor deployment/demo instructions, UIUC DNS, SSH/account and host-k
 firewall/port availability, remote Python/SQLite versions, VM resource limits and real
 ten-VM correctness are unverified. Hostnames, default user and remote ports derive from
 repository precedents and require instructor confirmation. No benchmark was started.
+# Benchmark framework implementation — November 6, 2026
+
+The benchmark/report tooling requested for Step 6 is now implemented on
+`feature/step6-benchmarks-report`. `mp3/benchmarks/` contains deterministic workload
+generation, the complete 51-trial matrix, resident client workers, ordinary-control
+preload and owner-presence evidence, an isolated ten-process local smoke, remote trial
+controller/checkpointing, raw-metric aggregation, validated per-trial/configuration CSVs,
+plots and fail-closed final report
+generation. `mp3/report/report.tex` and its README provide the two-page 12-point
+student-completion template. `control.py` status detail now exposes current R/W and
+generation so clients can verify runtime settings; the control wire schema and operation
+semantics remain unchanged.
+
+Focused verification on Python 3.12.4: the benchmark suite passed **16 tests in 0.053 s**
+and the control suite passed **38 tests in 28.951 s**. The reviewer independently reran
+the final benchmark suite and passed **16/16 in 0.056 s**. The complete suite passed
+**376 tests in 499.335 s**. This covers
+workload reproducibility, exact 1 KiB unique values, operation mix/hot-key rate, matrix
+and seed rules, worker preflight, metric math, checkpoint duration/raw validation,
+summary tampering rejection, preload index validation, CSV trial rows and sample
+statistics. A local run of
+`MP3_TARGET=local python3 -B -m mp3.benchmarks smoke --duration 2 --key-count 8
+--output-dir /tmp/mp3-benchmark-smokes` passed: ten node processes, two client processes,
+8 preload keys/40 owner copies, 406 successful operations, 0 failures, 2.002–2.007 s per
+client, 202.27 successful operations/s, 9.81 ms mean terminal latency, and a watermarked
+throughput/latency plot. This is a short loopback smoke, not a
+submittable measurement. No 180-second trial or university VM was contacted.
+
+Independent review found and drove these focused corrections: retain successful retry
+summaries at the one canonical trial path; require each worker's actual full duration;
+recompute summary counts/latencies/throughput from retained raw rows; validate contiguous
+operation indexes and deterministic key/operation/value sequences; reject duplicate or
+missing preload indexes and verify expected content hashes; and align runbook text with
+the actual temporary smoke output path and preload evidence. The reviewer initially saw
+two test-only failures (a valid one-key uniform fixture and missing fake status fields);
+both were corrected. The reviewer independently inspected the final workload, identity,
+duration, interval, preload and checkpoint validations, ran the focused suite, and found
+no reportability blocker. The review noted that checkpoint reuse does not re-read the
+large preload evidence files; this is acceptable because the final report command
+revalidates those files before producing plots/PDF. A successful `full` run means the
+51-trial execution/checkpoint loop completed, not that the final report gate passed.
+
+The final report emits `aggregates/trial_metrics.csv` and
+`aggregates/configuration_summary.csv` only after the all-51-trial validation gate. The
+full command's `status: OK` records trial-run completion; it does not mean final report
+validation or PDF building succeeded.
+
+`KD-18` stays **PENDING**. This framework implementation does not approve the remaining
+engineering choices and does not complete B-01/B-02: the actual 45+6 measured trials,
+three readings per configuration, data-backed plots and report discussion remain
+NOT_STARTED until the operator verifies the university environment and launches the
+authorized full run. `pdflatex` is not installed in the current environment, so PDF
+compilation/page-count verification remains unperformed. The remote command is
+documented in `benchmarks/README.md`; it requires explicit remote targeting and all-ten
+preflight and is intentionally not run here.

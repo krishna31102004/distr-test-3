@@ -663,7 +663,15 @@ class ControlService:
             return self._run_admin(request, request_deadline)
         context = self.runtime.context
         if request.command == "status":
-            return self._reply(request, ControlStatus.OK)
+            # Read-only benchmark preflight must verify the quorums actually loaded
+            # by this process, rather than trusting only the controller's launch
+            # environment. Keep the existing status command and wire schema.
+            return self._reply(
+                request, ControlStatus.OK,
+                detail=json.dumps({"read_quorum": self.runtime.read_quorum,
+                                   "write_quorum": self.runtime.write_quorum,
+                                   "generation": self.runtime.generation},
+                                  sort_keys=True))
         key_id = ring_id_hex(key_position(request.key))
         phase = getattr(self.runtime, "transition_phase", None)
         if callable(phase) and phase() != "ACTIVE":

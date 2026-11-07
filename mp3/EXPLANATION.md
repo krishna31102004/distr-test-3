@@ -674,9 +674,10 @@ Local storage, fixed hashing/membership and single-replica KV RPC exist as descr
 above. Shared distinct-response collection and bounded dispatch are implemented, and the
 coordinators, read repair, mode manager and all eight commands now exist (see the Step 3 and
 Step 4 sections). Step 5 deployment/lifecycle scripts and a local rehearsal now exist, but
-university-VM compatibility is unverified. Benchmarks, plotting and the report remain future
-work. Later responsibilities and decision gates are in the plan and KD-01..18. No fabricated
-benchmark/report content exists.
+university-VM compatibility is unverified. The benchmark runner, report-data validator,
+plots and LaTeX template are now implemented; real VM measurements and the final measured
+report remain future work. Later responsibilities and decision gates are in the plan and
+KD-01..18. No fabricated benchmark/report content exists.
 
 Final Batch 1 refinements: timeout rejects booleans; decimal encoding/decoding
 roundtrips a 2**15000 Strong counter without changing global Python limits.
@@ -1286,3 +1287,57 @@ DNS, SSH credentials and host-key rules, firewall and port availability, remote 
 SQLite versions, process/resource limits, and actual ten-VM crash/recovery behavior. The
 current remote host/user/port values are repository-derived assumptions, not verified course
 instructions.
+## Benchmark and report framework (implemented; real trials pending)
+
+`benchmarks/matrix.py` provides `full_matrix(base_seed=4252026, duration_seconds=180)` and
+`seed_for(base_seed, experiment, trial)`. It builds the fixed 45 Experiment 1 and six
+Experiment 2 specifications, with matched seeds across comparable configurations.
+`benchmarks/workload.py` provides `Workload.operation(client_id, operation_index)`,
+`unique_value(run_id, client_id, operation_index, size=1024)`, and
+`preload_value(run_id, index, size=1024)`. Workloads alternate GET/PUT, use deterministic
+portable key selection, and generate exactly 1 KiB unique PUT values.
+
+`benchmarks/worker.py` provides `run_worker(...)` and
+`validate_client_configuration(status_reply, mode, read_quorum, write_quorum)`. The
+worker checks the live node settings, waits at a release gate when requested, then sends
+one real control GET/PUT at a time and records every result and monotonic latency to JSONL.
+It does not retry a measured operation. The controller starts each persistent worker on
+the corresponding client VM and does not SSH per operation.
+
+`benchmarks/preload.py` provides `preload(...)`. It uses ordinary control PUTs with
+bounded, recorded setup attempts, reads back exact bytes/version at one prescribed owner
+for each key, and checks every node's paginated `liststore` inventory for that key. Its
+evidence proves key presence at all five prescribed owners and exact content/version at
+the sampled owner; it does not claim a direct content readback from all five copies.
+
+`benchmarks/metrics.py` provides `trial_summary(...)`, `sample_summary(...)`,
+`validate_real_matrix(...)`, `complete_checkpoint(...)`, and `write_json_atomic(...)`.
+It calculates latency from raw operation rows and successful throughput from completed
+successful operations divided by the recorded trial interval. A checkpoint is reusable
+only when its exact expected trial, per-client actual durations, raw files, deterministic
+keys/values and recomputed summary metrics validate.
+
+`benchmarks/controller.py` provides `run_full(...)`. Remote execution requires explicit
+`MP3_TARGET=remote`, a safe unique isolated root, the matching generated manifest and all
+ten nodes. It confirms mode/R/W, restarts nodes when startup R/W changes, repeats the
+preload for each configuration, then runs the full 51-trial matrix. Successful summaries
+always use the canonical `trials/<trial-id>/summary.json` path; failed attempts are kept
+separately. No remote experiment was run for this implementation task.
+
+`benchmarks/smoke.py` provides `run_smoke(...)`, an isolated ten-process loopback
+rehearsal with a small preload and two persistent synchronized clients. `MP3_TARGET=local`
+is mandatory; output is watermarked NOT FOR REPORT. `benchmarks/plotting.py` creates one
+Experiment 1 latency/throughput plot and two Experiment 2 mean bars with sample-standard-
+deviation error bars. `benchmarks/report.py` provides `load_summaries(...)`,
+`_verify_summary_metrics(...)`, `_validate_indexed_keys(...)`,
+`_verify_preload_evidence(...)`, `write_validated_csvs(...)`, and
+`build_final_report(...)`. The CSV writer emits verified per-trial rows and per-configuration
+means/sample standard deviations across three trials. The report gate checks all
+51 real trials, each client's actual duration, deterministic operation/key/value sequence,
+raw metrics, unique complete preload indexes and five prescribed owner inventories before
+plotting. The PDF builder additionally requires edited placeholders, truthful LLM
+transcripts, a 12-point source, `pdflatex`, `pdfinfo` and fewer than three pages.
+
+These APIs are implemented and locally unit-tested. The local ten-process smoke passed;
+no real university VM trial or final report is claimed. KD-18 remains pending as a
+decision; implementing the agreed harness does not approve it or supply actual experiments.
