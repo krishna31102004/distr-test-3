@@ -35,6 +35,11 @@ ABORT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.2
 ARM_LEASE_SECONDS = 15.0       # receipt-local: GO is accepted only this soon after ARM
 PUT_TIMEOUT_SECONDS = 10.0
+# A superseded Eventual PUT may lose its W quorum when concurrent writers race.
+# Retry the same logical multiput participant PUT with a fresh version, but
+# require a new quorum of distinct durable acknowledgments on every attempt.
+MULTIPUT_MAX_EVENTUAL_ATTEMPTS = 8
+MULTIPUT_EVENTUAL_RETRY_BUDGET_SECONDS = 15.0
 RANDOM_VALUE_BYTES = 1024
 MAX_REMEMBERED = 64
 MAX_ARMED = 8                  # live armed values held at once (each may be up to 1 MiB)
@@ -227,11 +232,30 @@ class MultiputManager:
                 return
             else:
                 outcome = self._put(key, value)
+                attempts = 1
+                # Only supersession is retryable. An uncertain timeout is not:
+                # replaying it would conceal a potentially committed write.
+                # Strong ABD is unchanged.
+                while (self.runtime.context.mode != ConsistencyMode.STRONG
+                       and outcome.status.value == "ERROR"
+                       and "SUPERSEDED" in (outcome.error or "")
+                       and attempts < MULTIPUT_MAX_EVENTUAL_ATTEMPTS
+                       and self.runtime.transition_phase() == "ACTIVE"):
+                    # Stagger retries by VM to avoid another simultaneous
+                    # collision while retaining the original GO concurrency.
+                    pause = (min(0.6, 0.05 * (2 ** (attempts - 1)))
+                             + 0.03 * (int(self.vm_id[-2:]) - 1))
+                    if time.monotonic() + pause >= began + MULTIPUT_EVENTUAL_RETRY_BUDGET_SECONDS:
+                        break
+                    time.sleep(pause)
+                    outcome = self._put(key, value)
+                    attempts += 1
                 version = outcome.version
                 result = {"status": outcome.status.value,
                           "version": (None if version is None else
                                       f"{version.kind}:{version.number}:{version.writer_id}"),
-                          "acks": list(outcome.qualifying_owners)}
+                          "acks": list(outcome.qualifying_owners),
+                          "attempts": attempts}
                 if outcome.error:
                     result["error"] = outcome.error[:ERROR_CHARS]
         except Exception as error:
@@ -275,7 +299,7 @@ class MultiputManager:
         """Copy a node's finished-put result into its report row."""
         result = detail.get("result")
         if isinstance(result, dict):
-            row.update({k: result[k] for k in ("status", "version", "acks", "put_ms", "error")
+            row.update({k: result[k] for k in ("status", "version", "acks", "put_ms", "error", "attempts")
                         if k in result})
 
     def coordinate(self, key: str, vms: list[str], *, budget: float | None = None
