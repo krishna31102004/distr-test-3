@@ -50,7 +50,7 @@ import sys, json
 d = json.loads(sys.stdin.read())
 print("multiput status:", d.get("status"), "-", d.get("message", ""))
 for n in d.get("nodes", []):
-    print("  %-5s %-6s version=%s file_sha=%s %s" % (n["vm"], n["status"], n.get("version"), n.get("sha256"), n.get("error", "")))'
+    print("  %-5s %-6s attempts=%s version=%s file_sha=%s %s" % (n["vm"], n["status"], n.get("attempts", "?"), n.get("version"), n.get("sha256"), n.get("error", "")))'
     ;;
 restart)
     [ $# -ge 1 ] || die "usage: restart <vm>"
