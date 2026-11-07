@@ -208,6 +208,22 @@ def _validate_indexed_keys(rows: list[dict], *, key_count: int,
     return by_key
 
 
+def _validate_replica_content_checks(row: dict, expected_owners: list[str],
+                                    expected_hash: str) -> None:
+    """Require exact preloaded bytes to have been read from each prescribed owner."""
+    checks = row.get("replica_content_checks")
+    if (not isinstance(checks, list) or len(checks) != 5
+            or any(not isinstance(check, dict) for check in checks)
+            or [check.get("owner") for check in checks] != expected_owners
+            or any(check.get("status") != "OK"
+                   or check.get("value_verified") is not True
+                   or check.get("value_sha256") != expected_hash
+                   or not isinstance(check.get("version"), str)
+                   or not check["version"]
+                   for check in checks)):
+        raise ValueError("preload content row lacks exact-value evidence from all five owners")
+
+
 def write_validated_csvs(summaries: tuple[dict, ...] | list[dict],
                          output_dir: str | Path) -> tuple[Path, Path]:
     """Write auditable per-trial and per-configuration CSVs from validated summaries."""
@@ -289,13 +305,16 @@ def _verify_preload_evidence(run_dir: Path, report: dict, manifest, *,
         encoded = json.dumps(row, sort_keys=True, ensure_ascii=False)
         digest.update(encoded.encode("utf-8") + b"\n")
         expected_owners = [node.vm_id for node in manifest.owners(key)]
+        checks = row.get("replica_content_checks")
         if (row.get("content_verified") is not True
                 or row.get("owners") != expected_owners
                 or row.get("content_verified_owner") != expected_owners[0]
-                or row.get("content_verified_version") != row.get("version")
                 or row.get("attempts", 0) < 1 or not row.get("version")
                 or row.get("value_sha256") != expected_hash):
-            raise ValueError("preload content row lacks exact durable sample-owner evidence")
+            raise ValueError("preload content row lacks exact durable setup evidence")
+        _validate_replica_content_checks(row, expected_owners, expected_hash)
+        if row.get("content_verified_version") != checks[0]["version"]:
+            raise ValueError("preload sample-owner version disagrees with owner content checks")
         content_by_key[key] = index
     if digest.hexdigest() != report.get("content_evidence_sha256"):
         raise ValueError("preload content evidence digest mismatch")

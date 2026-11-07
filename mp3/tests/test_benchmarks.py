@@ -9,17 +9,122 @@ from types import SimpleNamespace
 import tempfile
 import hashlib
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 
 from mp3.control import ControlStatus
-from mp3.models import ConsistencyMode
+from mp3.models import ConsistencyMode, Version
+from mp3.ring import Endpoint, Manifest
 from mp3.benchmarks.matrix import full_matrix, seed_for
 from mp3.benchmarks.metrics import (complete_checkpoint, sample_summary, trial_summary,
                                     validate_real_matrix)
-from mp3.benchmarks.report import (_validate_indexed_keys, _verify_summary_metrics,
-                                   load_summaries, write_validated_csvs)
+from mp3.benchmarks.report import (_validate_indexed_keys,
+                                   _validate_replica_content_checks,
+                                   _verify_summary_metrics, load_summaries,
+                                   write_validated_csvs)
 from mp3.benchmarks.workload import Workload, preload_value, unique_value
 from mp3.benchmarks.worker import validate_client_configuration
+
+
+def _benchmark_manifest() -> Manifest:
+    service_names = ("kv", "membership", "log_query", "control")
+    endpoints = {
+        f"vm{number:02d}": {
+            service: Endpoint("127.0.0.1", 20_000 + number * 10 + offset)
+            for offset, service in enumerate(service_names)
+        }
+        for number in range(1, 11)
+    }
+    return Manifest.from_endpoints(endpoints)
+
+
+def _preload_reply(*, status=ControlStatus.OK, version=None, value=b"", detail=""):
+    return SimpleNamespace(status=status, version=version, value=value, error=None,
+                           detail=detail)
+
+
+class PreloadAllOwnersTests(unittest.TestCase):
+    def _run_preload(self, temporary: str, *, mismatch_owner: str | None = None,
+                     missing_owner: str | None = None):
+        from mp3.benchmarks import preload as preload_module
+
+        manifest = _benchmark_manifest()
+        key = "bench-key-000000"
+        value = preload_value("runABC", 0)
+        owners = tuple(node.vm_id for node in manifest.owners(key))
+        if mismatch_owner == "first":
+            mismatch_owner = owners[0]
+        if missing_owner == "first":
+            missing_owner = owners[0]
+        read_targets = []
+
+        def fake_send(_manifest, _coordinator, command, request_key="", body=b"", **_kwargs):
+            if command == "put":
+                return _preload_reply(version=Version("eventual", 1, "vm01/1"))
+            if command == "read_replica":
+                owner = json.loads(body.decode("utf-8"))["target"]
+                read_targets.append(owner)
+                if owner == missing_owner:
+                    return _preload_reply(status=ControlStatus.NOT_FOUND)
+                actual = b"wrong" if owner == mismatch_owner else value
+                # Per-owner versions may legitimately differ; content is the condition.
+                number = int(owner[-2:])
+                return _preload_reply(version=Version("eventual", number,
+                                                       f"{owner}/1"), value=actual)
+            if command == "liststore":
+                return _preload_reply(value=json.dumps(
+                    {"keys": [key], "next": None}).encode("utf-8"))
+            self.fail(f"unexpected control command: {command}")
+
+        report_path = Path(temporary) / "preload.json"
+        evidence_path = Path(temporary) / "content.jsonl"
+        presence_path = Path(temporary) / "presence.jsonl"
+        with patch.object(preload_module, "load_manifest", return_value=manifest), \
+                patch.object(preload_module, "send_command", side_effect=fake_send):
+            report = preload_module.preload(
+                manifest_path="unused", run_id="runABC", mode="eventual-noRR",
+                key_count=1, max_attempts=1, workers=1, report_path=report_path,
+                evidence_path=evidence_path, presence_path=presence_path)
+        return report, manifest, owners, read_targets, evidence_path
+
+    def test_preload_reads_exact_value_from_every_prescribed_owner_without_version_equality(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report, _manifest, owners, read_targets, evidence_path = self._run_preload(temporary)
+            self.assertTrue(report["complete"])
+            self.assertEqual(read_targets, list(owners))
+            content_row = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual([check["owner"] for check in content_row["replica_content_checks"]],
+                             list(owners))
+            self.assertEqual(len({check["version"]
+                                  for check in content_row["replica_content_checks"]}), 5)
+            _validate_replica_content_checks(
+                content_row, list(owners),
+                hashlib.sha256(preload_value("runABC", 0)).hexdigest())
+
+    def test_preload_rejects_missing_or_wrong_owner_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report, _manifest, owners, read_targets, _evidence = self._run_preload(
+                temporary, mismatch_owner="first")
+            self.assertEqual(read_targets, list(owners))
+            self.assertFalse(report["complete"])
+            self.assertIn("bench-key-000000", report["failed_keys"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report, _manifest, owners, read_targets, _evidence = self._run_preload(
+                temporary, missing_owner="first")
+            self.assertEqual(read_targets, list(owners))
+            self.assertFalse(report["complete"])
+            self.assertIn("bench-key-000000", report["failed_keys"])
+
+    def test_report_validator_requires_exact_value_evidence_for_all_five_owners(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report, _manifest, owners, _read_targets, evidence_path = self._run_preload(temporary)
+            self.assertTrue(report["complete"])
+            row = json.loads(evidence_path.read_text(encoding="utf-8"))
+            row["replica_content_checks"] = row["replica_content_checks"][:-1]
+            expected_hash = hashlib.sha256(preload_value("runABC", 0)).hexdigest()
+            with self.assertRaisesRegex(ValueError, "all five owners"):
+                _validate_replica_content_checks(row, list(owners), expected_hash)
 
 
 class BenchmarkWorkloadTests(unittest.TestCase):

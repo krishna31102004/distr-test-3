@@ -1305,10 +1305,14 @@ It does not retry a measured operation. The controller starts each persistent wo
 the corresponding client VM and does not SSH per operation.
 
 `benchmarks/preload.py` provides `preload(...)`. It uses ordinary control PUTs with
-bounded, recorded setup attempts, reads back exact bytes/version at one prescribed owner
-for each key, and checks every node's paginated `liststore` inventory for that key. Its
-evidence proves key presence at all five prescribed owners and exact content/version at
-the sampled owner; it does not claim a direct content readback from all five copies.
+bounded, recorded setup attempts, then uses `read_replica` to fetch each key from all five
+prescribed owners. It requires exact byte equality and a present version at every owner,
+records observed versions separately without requiring equality, and also checks paginated
+`liststore` inventories. Report validation rejects evidence that omits an owner or has a
+mismatched value hash. This runs before measurement and its time is excluded from trial
+metrics. The caller is `run_full(...)` or isolated `run_smoke(...)`; it depends on the
+existing control protocol, manifest owner selection, and `preload_value(...)` (KD-02/KD-18;
+verified with focused preload tests and local loopback smoke).
 
 `benchmarks/metrics.py` provides `trial_summary(...)`, `sample_summary(...)`,
 `validate_real_matrix(...)`, `complete_checkpoint(...)`, and `write_json_atomic(...)`.

@@ -1256,9 +1256,10 @@ keys. The scheduler describes 51 trials total: 45 for Experiment 1 and 6 for Exp
 2, with three trials per setting and at least 180 seconds per client.
 
 Before a measured trial, the preloader writes 100,000 keys through the ordinary MP3
-interface. It checks the exact bytes and version at one prescribed owner per key, then
-uses each node's paginated `liststore` output to prove that the key is present at all five
-owners. That setup time is outside the measurement. When switching Strong/Eventual modes,
+interface. It directly reads each key from all five prescribed owners and checks that every
+owner returns the exact bytes. Versions are recorded per owner but are not required to
+match. Paginated `liststore` output is an additional key-presence check. That setup time is
+outside the measurement. When switching Strong/Eventual modes,
 the existing system clears data as required; when R or W changes, nodes restart because
 those settings are loaded at startup. The runner verifies the active settings and
 preloads again before measuring.
@@ -1288,6 +1289,16 @@ The full MP3 suite passed 376 tests in 499.335 seconds. The benchmark tests pass
 locally, and the control suite passed 38/38. `python3 -B -m mp3 --smoke`, CLI help,
 node help, compilation and `git diff --check` also passed. `pdflatex` is not installed, so
 the LaTeX PDF was not compiled here.
+
+A final readiness review found that a key name in `liststore` did not prove all five
+replicas held the preloaded bytes. The preloader now reads each value directly from all five
+prescribed owners. Each must return the exact value and a version; the versions may differ.
+The final-report checker also requires all five content checks, so a missing or stale-value
+copy cannot pass merely because its key appears in an inventory. The 19 benchmark tests
+passed locally and in the independent review. A new NOT FOR REPORT loopback smoke verified
+8 keys on 40 owner copies with 367 successful operations and no failures. This correction
+does not validate university VMs; no continuous health monitor was added, and all ten nodes
+are checked for health/configuration immediately before each trial.
 
 What is still missing: verified university host details and compatibility, all actual
 180-second trials, their real graphs and interpretation, and the final compiled report.

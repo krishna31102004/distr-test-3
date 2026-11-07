@@ -188,10 +188,12 @@ python3 -B -m unittest mp3.tests.test_benchmarks mp3.tests.test_control -v
 The full remote runner has 51 trials at no less than 180 seconds per client and requires
 operator confirmation of an isolated run root. **Do not run this example until the ten-VM
 manifest, hostnames, Python/SQLite versions, SSH policy and ports have been verified.**
-It preloads 100,000 1 KiB keys after each configuration change, verifies each key's exact
-content/version at one prescribed owner and key presence on all five owners, then runs
-closed-loop resident clients. R/W changes restart nodes because those settings are loaded
-at process startup. Example command for the later authorized measurement task:
+It preloads 100,000 1 KiB keys after each configuration change, directly reads the exact
+bytes from each key's five prescribed owners, and checks key presence through each node's
+paginated `liststore` output. Owner versions are recorded separately; they need not match.
+It then runs closed-loop resident clients. R/W changes restart nodes because those
+settings are loaded at process startup. Example command for the later authorized
+measurement task:
 
 ```bash
 MP3_TARGET=remote MP3_USER=<netid> \
@@ -232,11 +234,11 @@ The short smoke command above was run with `--duration 2 --key-count 8`: ten loo
 processes and two client processes, 8 preload keys and 40 owner copies, 406 successful
 operations, 0 failures, 2.002–2.007 seconds per client, 202.27 successful operations/second,
 9.81 ms mean terminal latency, and a watermarked plot. This is **NOT FOR REPORT** and is
-not a university deployment or benchmark result. Focused benchmark/control tests passed
-54 tests (16 benchmark and 38 control); the benchmark suite passed independently 16/16.
-The full MP3 suite passed **376 tests in 499.335 seconds** after the checkpoint and CSV
-additions. The final benchmark suite passed independently **16/16**. Real trials,
-report discussion, and remote compatibility checks remain.
+not a university deployment or benchmark result. The original focused benchmark/control
+run passed 54 tests (16 benchmark and 38 control), and the pre-correction full MP3 suite
+passed **376 tests in 499.335 seconds**. The all-owner preload correction adds three
+focused tests: the current benchmark suite passes **19/19** locally and independently.
+Real trials, report discussion, and remote compatibility checks remain.
 
 ## Local foundation APIs
 

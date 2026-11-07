@@ -15,17 +15,22 @@ from .workload import preload_value
 
 
 def _record_at_owner(manifest: Manifest, coordinator: str, owner: str,
-                     key: str, value: bytes) -> tuple[bool, str | None, str, str | None]:
+                     key: str, value: bytes) -> dict:
     body = json.dumps({"target": owner}, sort_keys=True).encode("utf-8")
     reply = send_command(manifest, coordinator, "read_replica", key, body, timeout=25.0)
     if reply.status == ControlStatus.NOT_FOUND:
-        return False, None, reply.status.value, reply.error
+        return {"owner": owner, "status": reply.status.value, "version": None,
+                "value_sha256": None, "value_verified": False, "error": reply.error}
     if reply.status != ControlStatus.OK:
-        return False, None, reply.status.value, reply.error
+        return {"owner": owner, "status": reply.status.value, "version": None,
+                "value_sha256": None, "value_verified": False, "error": reply.error}
     version = reply.version
     version_text = None if version is None else (
         f"{version.kind}:{version.number}:{version.writer_id}")
-    return reply.value == value, version_text, reply.status.value, reply.error
+    actual_digest = hashlib.sha256(reply.value).hexdigest()
+    return {"owner": owner, "status": reply.status.value, "version": version_text,
+            "value_sha256": actual_digest, "value_verified": reply.value == value,
+            "error": reply.error}
 
 
 def _liststore(manifest: Manifest, vm_id: str) -> set[str]:
@@ -58,10 +63,10 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
             evidence_path: str | Path, presence_path: str | Path | None = None) -> dict:
     """Use ordinary MP3 PUTs and direct owner reads; never write local DB files.
 
-    Each key gets a bounded number of recorded setup PUTs until one designated owner
-    confirms exact bytes and version. Then paginated `liststore` snapshots establish
-    that all five ring owners contain each preloaded key. This is setup only; no
-    retries are hidden in measured worker operations.
+    Each key gets a bounded number of recorded setup PUTs until all five designated
+    owners directly return the exact value. Versions are recorded per owner but need
+    not match. Paginated `liststore` snapshots additionally confirm key inventory.
+    This is setup only; no retries are hidden in measured worker operations.
     """
     manifest = load_manifest(manifest_path)
     mode = ConsistencyMode(mode)
@@ -88,20 +93,28 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
             last_version = reply.version
             version_text = None if last_version is None else (
                 f"{last_version.kind}:{last_version.number}:{last_version.writer_id}")
-            # A successful protocol result is necessary but not sufficient for preload.
-            confirmed, observed_version, read_status, read_error = False, None, None, None
+            # A successful protocol result is necessary but not sufficient: Eventual
+            # W and Strong ABD can both complete before all five copies are verified.
+            replica_checks = []
             if reply.status == ControlStatus.OK and version_text is not None:
-                present, observed_version, read_status, read_error = _record_at_owner(
-                    manifest, coordinator, owners[0], key, value)
-                confirmed = present and observed_version == version_text
+                replica_checks = [_record_at_owner(manifest, coordinator, owner, key, value)
+                                  for owner in owners]
+            expected_digest = hashlib.sha256(value).hexdigest()
+            confirmed = (len(replica_checks) == len(owners) == 5
+                         and all(check["status"] == ControlStatus.OK.value
+                                 and check["version"] is not None
+                                 and check["value_verified"]
+                                 and check["value_sha256"] == expected_digest
+                                 for check in replica_checks))
             last = {"index": index, "key": key, "owners": list(owners),
-                    "value_sha256": hashlib.sha256(value).hexdigest(),
+                    "value_sha256": expected_digest,
                     "attempts": attempt, "put_status": reply.status.value,
                     "put_error": reply.error, "version": version_text,
                     "content_verified_owner": owners[0],
-                    "content_verified_version": observed_version,
-                    "content_read_status": read_status,
-                    "content_read_error": read_error, "content_verified": confirmed}
+                    "content_verified_version": (replica_checks[0]["version"]
+                                                  if replica_checks else None),
+                    "replica_content_checks": replica_checks,
+                    "content_verified": confirmed}
             if confirmed:
                 return last
             time.sleep(0.05)

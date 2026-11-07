@@ -1903,6 +1903,31 @@ The final report emits `aggregates/trial_metrics.csv` and
 full command's `status: OK` records trial-run completion; it does not mean final report
 validation or PDF building succeeded.
 
+**Final readiness correction:** review found that the earlier combination of one exact-value
+read plus five-owner `liststore` key presence did not prove that each replica held the
+preloaded value. `preload(...)` now reads the key from every prescribed owner and requires
+the exact bytes and a present version at all five. It records versions individually (equal
+versions are not a preload requirement), and report validation requires exactly the five
+prescribed successful content checks. Focused tests cover differing owner versions, a
+missing owner value, a different value despite key presence, and rejection of incomplete
+five-owner report evidence. This correction is local and tested; no full trial or university
+VM was used. The controller verifies all ten nodes' mode, R/W, ALIVE state and generation
+agreement before each trial. It does not continuously monitor health during a trial,
+consistent with this task's scope restriction against adding monitoring; real measurements
+must run on a healthy cluster without intentional failures.
+
+Focused verification after this correction: `python3 -B -m unittest
+mp3.tests.test_benchmarks -v` passed **19 tests in 0.176 s**; the independent reviewer
+reran it and passed **19 tests in 0.170 s**. The new loopback smoke, run with
+`MP3_TARGET=local python3 -B -m mp3.benchmarks smoke --duration 2 --key-count 8
+--output-dir /tmp/mp3-benchmark-readiness-smokes`, passed with ten node processes, two
+client processes, 8 keys/40 verified replica copies, 367 successful operations, 0 failures,
+and an Experiment 1 plot labeled NOT FOR REPORT. The full MP3 suite was not rerun because
+the correction only changes benchmark preloading/report validation; its last full result
+remains 376 tests before these three tests were added. `pdflatex` is unavailable, so the
+template was reviewed but no PDF/page count was verified. No VMs or full-duration trial were
+used.
+
 `KD-18` stays **PENDING**. This framework implementation does not approve the remaining
 engineering choices and does not complete B-01/B-02: the actual 45+6 measured trials,
 three readings per configuration, data-backed plots and report discussion remain

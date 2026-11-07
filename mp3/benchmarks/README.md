@@ -54,11 +54,12 @@ retained. Never run the full command merely to check connectivity.
 The benchmark dataset is 100,000 deterministic 1 KiB keys under a dedicated
 `bench-key-` prefix. The 20 `business_*` demo files are separate and are not used as
 preload records. Preload retries are setup actions and are explicitly counted. For
-each key, the preloader reads exact bytes and version from one prescribed owner, then
-checks every node's paginated `liststore` inventory to confirm that the key exists on
-all five prescribed owners. Retained evidence binds each key to its exact ring owners
-and rejects missing or duplicate key indexes. Preload duration is excluded from
-trial timing.
+each key, the preloader directly reads its value from each of the five prescribed
+owners and requires the exact bytes plus a present version at every owner. It records
+versions independently; equality is not required. Paginated `liststore` inventories
+provide a second key-presence check. Retained evidence binds each key to its exact ring
+owners and rejects missing or duplicate key indexes. Preload duration is excluded
+from trial timing.
 
 ## Final plots and PDF
 
