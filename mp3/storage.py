@@ -132,7 +132,9 @@ class Store:
                     pass
             elif not self.path.is_file():
                 raise StorageError("existing database required; bootstrap explicitly")
-            with self._transaction(write=True) as db:
+            # Recovery validates every stored record. A populated benchmark DB
+            # can take longer than the 5-second per-operation deadline.
+            with self._transaction(write=True, startup=True) as db:
                 if bootstrap is not None:
                     db.execute("CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
                     db.execute("CREATE TABLE records (key TEXT PRIMARY KEY, kind TEXT NOT NULL, number TEXT NOT NULL, writer TEXT NOT NULL, value BLOB NOT NULL)")
@@ -190,9 +192,14 @@ class Store:
             raise StorageError(f"cannot open store: {error}") from error
 
     @contextmanager
-    def _transaction(self, *, write=False, deadline=None):
-        """Bound admission and SQLite waits; rollback any unsuccessful operation."""
-        local_deadline = time.monotonic() + self.timeout
+    def _transaction(self, *, write=False, deadline=None, startup=False):
+        """Bound admission and SQLite waits; rollback any unsuccessful operation.
+
+        Startup performs full-database integrity and record validation, so give
+        that one-time scan a longer deadline without relaxing GET/PUT deadlines.
+        """
+        local_deadline = time.monotonic() + (
+            max(self.timeout, 120.0) if startup else self.timeout)
         if deadline is not None:
             try:
                 valid_deadline = (type(deadline) in (int, float)
