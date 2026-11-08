@@ -57,11 +57,29 @@ def _liststore(manifest: Manifest, vm_id: str) -> set[str]:
         cursor = following
 
 
+def capture_local_inventory(*, manifest_path: str | Path, vm_id: str,
+                            output_path: str | Path) -> dict:
+    """Run on the owning VM to avoid repeated laptop-to-VM paginated RPCs."""
+    manifest = load_manifest(manifest_path)
+    manifest.node(vm_id)
+    keys = sorted(_liststore(manifest, vm_id))
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(output.name + ".pending")
+    pending.write_text(json.dumps({
+        "vm_id": vm_id, "manifest_id": manifest.fingerprint,
+        "keys": keys,
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    return {"vm_id": vm_id, "key_count": len(keys), "output": str(output)}
+
+
 def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | str,
             key_count: int, key_prefix: str = "bench-key-", max_attempts: int = 5,
             workers: int = 16, report_path: str | Path,
             evidence_path: str | Path, presence_path: str | Path | None = None,
-            cluster_epoch: int | None = None) -> dict:
+            cluster_epoch: int | None = None, shard_index: int = 0,
+            shard_count: int = 1) -> dict:
     """Use ordinary MP3 PUTs and direct owner reads; never write local DB files.
 
     Each key gets a bounded number of recorded setup PUTs until all five designated
@@ -73,6 +91,11 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
     mode = ConsistencyMode(mode)
     if key_count < 1 or max_attempts < 1 or workers < 1:
         raise ValueError("key_count, max_attempts and workers must be positive")
+    if (type(shard_count) is not int or type(shard_index) is not int
+            or not 1 <= shard_count <= 10 or not 0 <= shard_index < shard_count):
+        raise ValueError("invalid bounded preload shard")
+    # Each key belongs to exactly one shard, with its normal designated coordinator.
+    selected = range(shard_index, key_count, shard_count)
     report_path, evidence_path = Path(report_path), Path(evidence_path)
     presence_path = Path(presence_path) if presence_path else evidence_path.with_name(
         "preload-owner-presence.jsonl")
@@ -91,7 +114,9 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
         old = json.loads(report_path.read_text(encoding="utf-8"))
         identity = {"run_id": run_id, "manifest_id": manifest.fingerprint,
                     "mode": mode.value, "key_count": key_count, "key_prefix": key_prefix}
-        if any(old.get(field) != expected for field, expected in identity.items()):
+        if (any(old.get(field) != expected for field, expected in identity.items())
+                or old.get("shard_index", 0) != shard_index
+                or old.get("shard_count", 1) != shard_count):
             raise RuntimeError("existing preload evidence identity differs; refusing to reuse it")
         old_epoch = old.get("cluster_epoch")
         if cluster_epoch is not None:
@@ -106,7 +131,7 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
             for line in stream:
                 row = json.loads(line)
                 index = row.get("index")
-                if type(index) is not int or index < 0 or index >= key_count or index in seen:
+                if (type(index) is not int or index not in selected or index in seen):
                     raise RuntimeError("corrupt preload evidence index; refusing resume")
                 seen.add(index)
                 key, value = f"{key_prefix}{index:06d}", preload_value(run_id, index)
@@ -140,15 +165,27 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
                 version_text = None if last_version is None else (
                     f"{last_version.kind}:{last_version.number}:{last_version.writer_id}")
                 replica_checks = []
+                confirmed = False
                 if reply.status == ControlStatus.OK and version_text is not None:
-                    replica_checks = [_record_at_owner(manifest, coordinator, owner, key, value)
-                                      for owner in owners]
-                confirmed = (len(replica_checks) == len(owners) == 5
-                             and all(check["status"] == ControlStatus.OK.value
-                                     and check["version"] is not None
-                                     and check["value_verified"]
-                                     and check["value_sha256"] == expected_digest
-                                     for check in replica_checks))
+                    # Eventual W=1 can acknowledge before all five asynchronous
+                    # replica installs complete. Poll existing writes first
+                    # rather than issuing up to five costly replacement PUTs.
+                    verify_rounds = 4 if shard_count > 1 else 1
+                    for verification in range(verify_rounds):
+                        replica_checks = [
+                            _record_at_owner(manifest, coordinator, owner, key, value)
+                            for owner in owners
+                        ]
+                        confirmed = (len(replica_checks) == len(owners) == 5
+                                     and all(check["status"] == ControlStatus.OK.value
+                                             and check["version"] is not None
+                                             and check["value_verified"]
+                                             and check["value_sha256"] == expected_digest
+                                             for check in replica_checks))
+                        if confirmed:
+                            break
+                        if verification + 1 < verify_rounds:
+                            time.sleep(0.05 * (verification + 1))
                 last = {"index": index, "key": key, "owners": list(owners),
                         "value_sha256": expected_digest,
                         "attempts": attempt, "put_status": reply.status.value,
@@ -175,11 +212,11 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
     with pending_path.open("w", encoding="utf-8") as evidence:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mp3-preload") as pool:
             # At most workers*2 outstanding operations; verified keys do no RPCs.
-            for first in range(0, key_count, workers * 2):
-                last_index = min(key_count, first + workers * 2)
+            for first in range(0, len(selected), workers * 2):
+                batch = selected[first:first + workers * 2]
                 pending = {index: pool.submit(one, index)
-                           for index in range(first, last_index) if index not in cached}
-                for index in range(first, last_index):
+                           for index in batch if index not in cached}
+                for index in batch:
                     if index in cached:
                         row = cached[index]
                     else:
@@ -197,6 +234,28 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
                     digest.update(line.encode("utf-8") + b"\n")
         evidence.flush()
     pending_path.replace(evidence_path)
+
+    # A VM-local shard only verifies its assigned 1/10 of the keys.
+    # The controller will merge all ten proofs and independently verify
+    # the global five-owner inventory before recording a full preload.
+    if shard_count > 1:
+        result = {
+            "schema": 1, "run_id": run_id, "manifest_id": manifest.fingerprint,
+            "mode": mode.value, "cluster_epoch": cluster_epoch,
+            "key_count": key_count, "key_prefix": key_prefix,
+            "shard_index": shard_index, "shard_count": shard_count,
+            "expected_keys": len(selected), "verified_keys": len(selected) - len(failures),
+            "resumed_verified_keys": len(cached),
+            "retried_keys": len(selected) - len(cached),
+            "complete": not failures,
+            "failed_keys": failures, "failure_details": failure_details[:20],
+            "content_evidence_sha256": digest.hexdigest(),
+            "elapsed_seconds": time.monotonic() - started,
+            "content_evidence_file": str(evidence_path),
+        }
+        report_path.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n",
+                               encoding="utf-8")
+        return result
 
     # One bounded page walk per node is much less expensive than 500k control reads.
     node_keys: dict[str, set[str]] = {}
@@ -237,6 +296,7 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
         "schema": 1, "run_id": run_id, "manifest_id": manifest.fingerprint,
         "mode": mode.value, "cluster_epoch": cluster_epoch,
         "key_count": key_count, "key_prefix": key_prefix,
+        "shard_index": shard_index, "shard_count": shard_count,
         "resumed_verified_keys": len(cached), "retried_keys": key_count - len(cached),
         "replication_factor": 5, "all_five_owners_verified": not failures,
         "complete": not failures and key_count > 0,

@@ -57,7 +57,12 @@ def run_worker(*, manifest_path: str | Path, client_id: str, mode: str,
                          + "\n", encoding="utf-8")
     if gate_path is not None:
         gate = Path(gate_path)
+        # Failed controller start attempts must not leave orphaned workers
+        # waiting forever or interfering with future benchmark trials.
+        gate_deadline = time.monotonic() + 180.0
         while not gate.exists():
+            if time.monotonic() >= gate_deadline:
+                raise TimeoutError("benchmark start gate was never released")
             time.sleep(0.05)
     start_mono, started_utc = time.monotonic(), utc_now()
     raw_path, summary_path = Path(raw_path), Path(summary_path)

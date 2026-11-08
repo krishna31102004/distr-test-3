@@ -18,7 +18,7 @@ start_one() {
     vm_sh "$n" "cd \"\$MP3_RUN\" && export MODE=$MP3_MODE R=$MP3_R W=$MP3_W MP3_DATA && {
         echo \"--- start \$(date '+%F %T') ($life)\" >> node.out
         if command -v tmux >/dev/null 2>&1 && [ -z \"\${MP3_NO_TMUX:-}\" ]; then
-            CMD=\"bash start_node.sh 2>&1 | tee -a node.out\"
+            CMD=\"env MODE=$MP3_MODE R=$MP3_R W=$MP3_W bash start_node.sh 2>&1 | tee -a node.out\"
             if tmux has-session -t mp3 2>/dev/null; then
                 tmux new-window -d -t mp3 -n node \"cd \$MP3_RUN && \$CMD\"
             else

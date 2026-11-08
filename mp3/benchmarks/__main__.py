@@ -11,6 +11,7 @@ import sys
 from ..models import ConsistencyMode
 from .controller import run_full
 from .matrix import MIN_DURATION_SECONDS
+from .preload import preload, capture_local_inventory
 from .report import build_final_report
 from .smoke import run_smoke
 from .worker import run_worker
@@ -41,6 +42,25 @@ def _parser() -> argparse.ArgumentParser:
                       help="record a new attempt; do not overwrite prior failure artifacts")
     full.add_argument("--minimum-client-seconds", type=int, default=MIN_DURATION_SECONDS,
                       help=argparse.SUPPRESS)
+
+    shard = commands.add_parser("preload-shard",
+                                help="VM-local, restartable one-of-ten preload shard")
+    shard.add_argument("--manifest", required=True)
+    shard.add_argument("--run-id", required=True)
+    shard.add_argument("--mode", required=True)
+    shard.add_argument("--cluster-epoch", required=True, type=int)
+    shard.add_argument("--key-count", required=True, type=int)
+    shard.add_argument("--shard-index", required=True, type=int)
+    shard.add_argument("--shard-count", required=True, type=int)
+    shard.add_argument("--workers", required=True, type=int)
+    shard.add_argument("--report", required=True)
+    shard.add_argument("--evidence", required=True)
+
+    inventory = commands.add_parser("preload-inventory",
+                                    help="snapshot the local VM's paginated owner inventory")
+    inventory.add_argument("--manifest", required=True)
+    inventory.add_argument("--vm-id", required=True)
+    inventory.add_argument("--output", required=True)
 
     worker = commands.add_parser("worker", help="run one persistent closed-loop client")
     worker.add_argument("--manifest", required=True)
@@ -84,6 +104,18 @@ def main(argv: list[str] | None = None) -> int:
                 remote_root=args.remote_root, confirm_isolated_root=args.confirm_isolated_root,
                 ssh_user=args.ssh_user, base_seed=args.base_seed,
                 retry_failed=args.retry_failed)
+        elif args.subcommand == "preload-shard":
+            result = preload(
+                manifest_path=args.manifest, run_id=args.run_id, mode=args.mode,
+                key_count=args.key_count, workers=args.workers,
+                report_path=args.report, evidence_path=args.evidence,
+                presence_path=args.report + ".unused-presence.jsonl",
+                cluster_epoch=args.cluster_epoch, shard_index=args.shard_index,
+                shard_count=args.shard_count)
+        elif args.subcommand == "preload-inventory":
+            result = capture_local_inventory(
+                manifest_path=args.manifest, vm_id=args.vm_id,
+                output_path=args.output)
         elif args.subcommand == "worker":
             result = run_worker(
                 manifest_path=args.manifest, client_id=args.client_id, mode=args.mode,

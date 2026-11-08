@@ -1,0 +1,27 @@
+name: MP3 benchmark optimizer regression
+on:
+  push:
+    branches:
+      - perf/mp3-benchmark-fast-compliant
+  pull_request:
+    branches:
+      - fix/mp3-benchmark-preload-resume
+  workflow_dispatch:
+
+jobs:
+  benchmark-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install report plotting dependency
+        run: python -m pip install matplotlib
+      - name: Python syntax validation
+        run: python -m compileall -q mp3
+      - name: Benchmark and storage regression tests
+        run: python -B -m unittest mp3.tests.test_benchmarks mp3.tests.test_storage -v
+      - name: Real loopback benchmark smoke test
+        run: MP3_TARGET=local python -B -m mp3.benchmarks smoke

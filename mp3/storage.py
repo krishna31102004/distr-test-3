@@ -225,8 +225,8 @@ class Store:
             if remaining <= 0:
                 raise StorageError("storage deadline expired")
             db = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
-                                 timeout=remaining, isolation_level=None)
-            db.execute(f"PRAGMA busy_timeout={max(1, int(remaining * 1000))}")
+                                 timeout=min(remaining, self.timeout), isolation_level=None)
+            db.execute(f"PRAGMA busy_timeout={max(1, int(min(remaining, self.timeout) * 1000))}")
             if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise StorageError("WAL unavailable")
             db.execute("PRAGMA synchronous=FULL")
@@ -236,7 +236,7 @@ class Store:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise StorageError("storage deadline expired")
-            db.execute(f"PRAGMA busy_timeout={max(1, int(remaining * 1000))}")
+            db.execute(f"PRAGMA busy_timeout={max(1, int(min(remaining, self.timeout) * 1000))}")
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             if time.monotonic() >= deadline:

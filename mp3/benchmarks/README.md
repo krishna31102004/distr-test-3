@@ -43,8 +43,26 @@ demo root or an already-existing isolated root. Repeating the same run ID and lo
 results directory resumes a checkpoint only when the manifest matches and all ten
 isolated roots still exist. The controller deploys and starts
 the current tree there, switches modes through the existing mode command, restarts
-all nodes when R/W startup settings change, verifies all ten nodes' mode/R/W and
-ALIVE membership, and preloads/verifies the full dataset before each new config.
+all nodes when R/W startup settings change, and verifies all ten nodes' mode/R/W and
+ALIVE membership. It preserves a completed Strong setup proof in the same live epoch.
+After Strong->Eventual clears all stored values, ten independent VM-local
+preload workers each install and verify their assigned 10,000 keys via ordinary
+PUTs and direct five-owner reads. The ten JSONL proof shards are merged in
+index order, and all ten VMs produce fresh local liststore inventories. Failed
+shards resume from verified per-key evidence; their original evidence is not
+overwritten until a complete replacement exists. The laptop is only an
+orchestrator and collector for the lengthy VM-local setup.
+
+For subsequent Eventual-only configuration changes (including R/W restarts),
+the controller retains the initially verified 100,000-key dataset and audits
+fresh all-five owner inventories instead of issuing 100,000 redundant PUTs.
+This is permitted because Eventual-noRR<->Eventual-RR mode switches and
+ordinary node restarts preserve records in this implementation. Historical
+content evidence is explicitly labeled with its original mode and epoch;
+after measured PUTs, it is **not** a claim that values are still equal to the
+original bytes. A Strong<->Eventual switch always invalidates the preserved
+dataset and requires another full preload. A mode/epoch change that cannot
+be matched to the controller's durable lineage also invalidates reuse.
 Experiment 1 has 45 trials and Experiment 2 has 6. The full command runs all 51
 trials at the required 180 seconds per client; it has no short-duration option.
 Every trial is checkpointed with raw JSONL and a JSON summary. Failed attempts are
@@ -60,6 +78,29 @@ versions independently; equality is not required. Paginated `liststore` inventor
 provide a second key-presence check. Retained evidence binds each key to its exact ring
 owners and rejects missing or duplicate key indexes. Preload duration is excluded
 from trial timing.
+
+## Optimized setup, recovery and measurements
+
+The mandatory 51 trials, 180 seconds per client, 100,000 keys, 1 KiB values,
+10 university VMs, replication factor 5, and real three-sample statistics are
+**unchanged**. All operations are issued through the existing KV protocol.
+The VM-local setup work is separate from timed client measurements. The
+controller prints each configuration, setup reuse, and trial checkpoint.
+
+Do not run the full controller twice simultaneously. If a controller exits
+while a VM-side preload is running, keep the same run ID and root; the VM
+jobs can finish independently, and the next controller invocation recognizes
+completed shards. Do not delete DB/WAL/SHM, proof files, remote roots, or
+successful trial results. If a full trial itself fails, failed artifacts are
+preserved under failures/ and a new attempt may be required. Always ensure
+all ten benchmark nodes have recovered and that their control ports respond
+before resuming the controller.
+
+The remote VMs must contain this version of the mp3 package and its
+preload-shard/preload-inventory commands. To upgrade an existing isolated
+benchmark root: gracefully stop its nodes, deploy the new code with the
+exact `MP3_REMOTE_ROOT`, recover with `run_mp all`, and confirm 10/10 UP.
+Never deploy over a live node or overwrite the demo checkout.
 
 ## Final plots and PDF
 
