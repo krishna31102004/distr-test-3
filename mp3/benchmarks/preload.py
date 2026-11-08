@@ -130,35 +130,41 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
         owners = tuple(node.vm_id for node in manifest.owners(key))
         coordinator = f"vm{(index % 10) + 1:02d}"
         last = None
+        expected_digest = hashlib.sha256(value).hexdigest()
         for attempt in range(1, max_attempts + 1):
-            reply = send_command(manifest, coordinator, "put", key, value, timeout=25.0)
-            last_version = reply.version
-            version_text = None if last_version is None else (
-                f"{last_version.kind}:{last_version.number}:{last_version.writer_id}")
-            # A successful protocol result is necessary but not sufficient: Eventual
-            # W and Strong ABD can both complete before all five copies are verified.
-            replica_checks = []
-            if reply.status == ControlStatus.OK and version_text is not None:
-                replica_checks = [_record_at_owner(manifest, coordinator, owner, key, value)
-                                  for owner in owners]
-            expected_digest = hashlib.sha256(value).hexdigest()
-            confirmed = (len(replica_checks) == len(owners) == 5
-                         and all(check["status"] == ControlStatus.OK.value
-                                 and check["version"] is not None
-                                 and check["value_verified"]
-                                 and check["value_sha256"] == expected_digest
-                                 for check in replica_checks))
-            last = {"index": index, "key": key, "owners": list(owners),
-                    "value_sha256": expected_digest,
-                    "attempts": attempt, "put_status": reply.status.value,
-                    "put_error": reply.error, "version": version_text,
-                    "content_verified_owner": owners[0],
-                    "content_verified_version": (replica_checks[0]["version"]
-                                                  if replica_checks else None),
-                    "replica_content_checks": replica_checks,
-                    "content_verified": confirmed}
-            if confirmed:
-                return last
+            # Transient DNS and control timeouts must consume an attempt,
+            # not abandon the key and force another 100,000-key preload.
+            try:
+                reply = send_command(manifest, coordinator, "put", key, value, timeout=25.0)
+                last_version = reply.version
+                version_text = None if last_version is None else (
+                    f"{last_version.kind}:{last_version.number}:{last_version.writer_id}")
+                replica_checks = []
+                if reply.status == ControlStatus.OK and version_text is not None:
+                    replica_checks = [_record_at_owner(manifest, coordinator, owner, key, value)
+                                      for owner in owners]
+                confirmed = (len(replica_checks) == len(owners) == 5
+                             and all(check["status"] == ControlStatus.OK.value
+                                     and check["version"] is not None
+                                     and check["value_verified"]
+                                     and check["value_sha256"] == expected_digest
+                                     for check in replica_checks))
+                last = {"index": index, "key": key, "owners": list(owners),
+                        "value_sha256": expected_digest,
+                        "attempts": attempt, "put_status": reply.status.value,
+                        "put_error": reply.error, "version": version_text,
+                        "content_verified_owner": owners[0],
+                        "content_verified_version": (replica_checks[0]["version"]
+                                                      if replica_checks else None),
+                        "replica_content_checks": replica_checks,
+                        "content_verified": confirmed}
+                if confirmed:
+                    return last
+            except (ControlError, OSError, TimeoutError) as error:
+                last = {"index": index, "key": key, "owners": list(owners),
+                        "value_sha256": expected_digest, "attempts": attempt,
+                        "content_verified": False,
+                        "error": f"{type(error).__name__}: {error}"}
             time.sleep(0.05)
         assert last is not None
         return last
