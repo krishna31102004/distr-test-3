@@ -133,7 +133,11 @@ def load_summaries(run_dir: str | Path) -> tuple[dict, ...]:
             preload = row.get("preload_evidence", {})
             if preload.get("mode") != row.get("spec", {}).get("mode"):
                 raise ValueError(f"{path}: preload mode differs from trial mode")
-            preload_id = preload.get("content_evidence_sha256")
+            # Retained Eventual modes share historical content evidence but
+            # each configuration has its own freshly captured owner inventory.
+            preload_id = (preload.get("content_evidence_sha256"),
+                          preload.get("owner_presence_file"),
+                          preload.get("mode"), preload.get("cluster_epoch"))
             if preload_id not in checked_preloads:
                 _verify_preload_evidence(run_dir, preload, manifest,
                                          expected_run_id=run_record.get("run_id"),
@@ -287,6 +291,14 @@ def _verify_preload_evidence(run_dir: Path, report: dict, manifest, *,
             or (expected_run_id is not None and report.get("run_id") != expected_run_id)
             or (expected_mode is not None and report.get("mode") != expected_mode)):
         raise ValueError("preload report must prove 100,000 keys and RF=5")
+    if report.get("preload_method") == "retained-eventual-with-fresh-inventory":
+        if (report.get("retained_source_mode") not in ("eventual-noRR", "eventual-RR")
+                or report.get("mode") not in ("eventual-noRR", "eventual-RR")
+                or type(report.get("retained_source_epoch")) is not int
+                or type(report.get("cluster_epoch")) is not int
+                or report["retained_source_epoch"] > report["cluster_epoch"]
+                or report.get("retained_source_digest") != report.get("content_evidence_sha256")):
+            raise ValueError("retained Eventual preload lacks valid source provenance")
     content_path = (run_dir / report.get("content_evidence_file", "")).resolve()
     presence_path = (run_dir / report.get("owner_presence_file", "")).resolve()
     if run_dir.resolve() not in content_path.parents or run_dir.resolve() not in presence_path.parents:
