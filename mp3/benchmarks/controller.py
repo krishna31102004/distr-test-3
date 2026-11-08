@@ -116,7 +116,12 @@ def _wait_file(user: str, host: str, root_name: str, path: str,
     """Wait for a worker sentinel inside its isolated root, not $HOME itself."""
     remote_path = f"$HOME/{root_name}/{path}"
     while time.monotonic() < deadline:
-        result = _ssh(user, host, f'test -f "{remote_path}"', timeout=10.0)
+        try:
+            result = _ssh(user, host, f'test -f "{remote_path}"', timeout=10.0)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            print(f"[benchmark] transient SSH READY probe on {host}: {error}", flush=True)
+            time.sleep(1.0)
+            continue
         if result.returncode == 0:
             return
         time.sleep(1.0)
@@ -198,7 +203,11 @@ def _launch_trial(spec, *, manifest: Manifest, user: str, root_name: str,
         for vm, host, _gate, _ready, _raw, summary, _log in launched:
             if vm in completed:
                 continue
-            result = _ssh(user, host, f'test -f "$HOME/{root_name}/{summary}"', timeout=10.0)
+            try:
+                result = _ssh(user, host, f'test -f "$HOME/{root_name}/{summary}"', timeout=10.0)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                print(f"[benchmark] transient SSH completion probe on {vm}: {error}", flush=True)
+                continue
             if result.returncode == 0:
                 completed.add(vm)
         if len(completed) < len(launched):
