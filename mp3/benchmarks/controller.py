@@ -110,13 +110,26 @@ def _snapshot(manifest: Manifest, expected_mode: str | None = None,
     raise TimeoutError(f"all ten nodes did not reach healthy current membership: {last_error}")
 
 
-def _wait_file(user: str, host: str, path: str, deadline: float) -> None:
+def _wait_file(user: str, host: str, root_name: str, path: str,
+               deadline: float) -> None:
+    """Wait for a worker sentinel inside its isolated root, not $HOME itself."""
+    remote_path = f"$HOME/{root_name}/{path}"
     while time.monotonic() < deadline:
-        result = _ssh(user, host, f'test -f "$HOME/{path}"', timeout=10.0)
+        result = _ssh(user, host, f'test -f "{remote_path}"', timeout=10.0)
         if result.returncode == 0:
             return
-        time.sleep(0.25)
-    raise TimeoutError(f"worker on {host} did not create {path}")
+        time.sleep(1.0)
+    # A missing sentinel can mean the worker exited before its initial status
+    # call. Capture the adjacent worker log so failures are actionable.
+    filename = path.rsplit("/", 1)[-1]
+    client_id = filename.removeprefix("READY-").removesuffix(".json")
+    log = path.rsplit("/", 1)[0] + f"/{client_id}.worker.log"
+    diagnostic = _ssh(user, host,
+                      f'tail -n 20 "$HOME/{root_name}/{log}" 2>&1',
+                      timeout=10.0)
+    raise TimeoutError(
+        f"worker on {host} did not create {remote_path}; "
+        f"worker log: {diagnostic.stdout.strip() or diagnostic.stderr.strip()}")
 
 
 def _collect(user: str, host: str, relative_path: str, destination: Path) -> None:
@@ -161,7 +174,7 @@ def _launch_trial(spec, *, manifest: Manifest, user: str, root_name: str,
 
     ready_deadline = time.monotonic() + 60.0
     with ThreadPoolExecutor(max_workers=10) as pool:
-        tasks = [pool.submit(_wait_file, user, host, ready, ready_deadline)
+        tasks = [pool.submit(_wait_file, user, host, root_name, ready, ready_deadline)
                  for _vm, host, _gate, ready, _raw, _summary, _log in launched]
         for task in tasks:
             task.result()
