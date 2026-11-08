@@ -20,6 +20,7 @@ from ..ring import Manifest, load_manifest
 from .matrix import full_matrix, spec_dict
 from .metrics import complete_checkpoint, read_jsonl, trial_summary, write_json_atomic
 from .preload import preload
+from .distributed import run_distributed, inherit_eventual
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,48}\Z")
 _USER = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -331,6 +332,9 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
     current_config = None
     preload_evidence = None
     summaries = []
+    lineage_path = run_dir / "preloads" / "lineage.json"
+    lineage = (json.loads(lineage_path.read_text(encoding="utf-8"))
+               if lineage_path.is_file() else {})
     matrix = full_matrix(base_seed)
     for spec in matrix:
         trial_dir = run_dir / "trials" / spec.trial_id
@@ -350,14 +354,33 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
             target_mode = spec.mode
             snapshot = _snapshot(manifest)
             current_mode = next(iter(snapshot["nodes"].values()))["mode"]
+            current_epoch = snapshot["epoch"]
+
+            # Reuse lineage only if the current live mode/epoch matches the
+            # last controller-verified state. External or interrupted mode
+            # changes invalidate proof reuse, never silently assume safety.
+            source = None
+            if (lineage.get("mode") == current_mode
+                    and lineage.get("epoch") == current_epoch
+                    and current_mode != "strong"):
+                source_path = lineage.get("eventual_source")
+                if source_path and (run_dir / source_path).is_file():
+                    possible = json.loads((run_dir / source_path).read_text(encoding="utf-8"))
+                    if (possible.get("complete") is True
+                            and possible.get("mode") in ("eventual-noRR", "eventual-RR")
+                            and possible.get("manifest_id") == manifest.fingerprint):
+                        source = possible
+
             if current_mode != target_mode:
                 mode_reply = send_command(manifest, "vm01", "mode", key=target_mode,
                                           timeout=55.0)
                 if mode_reply.status != ControlStatus.OK:
                     raise RuntimeError(f"mode change to {target_mode} failed: "
                                        f"{mode_reply.error or mode_reply.status.value}")
+                if (current_mode == "strong") != (target_mode == "strong"):
+                    source = None  # The storage engine deletes every KV record.
+                snapshot = _snapshot(manifest, target_mode)
             if spec.read_quorum is not None:
-                snapshot = _snapshot(manifest)
                 any_quorum_differs = any(
                     row["read_quorum"] != spec.read_quorum
                     or row["write_quorum"] != spec.write_quorum
@@ -373,22 +396,65 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                                  spec.read_quorum, spec.write_quorum)
             preload_prefix = (f"{spec.experiment}-{target_mode}-r{spec.read_quorum}-"
                               f"w{spec.write_quorum}")
-            preload_evidence = preload(
-                manifest_path=manifest_path, run_id=run_id, mode=target_mode,
-                key_count=100_000, key_prefix="bench-key-", workers=16,
-                report_path=run_dir / "preloads" / f"{preload_prefix}.json",
-                evidence_path=run_dir / "preloads" / f"{preload_prefix}.content.jsonl",
-                presence_path=run_dir / "preloads" / f"{preload_prefix}.owners.jsonl",
-                cluster_epoch=snapshot["epoch"])
-            if not preload_evidence["complete"]:
-                raise RuntimeError(f"all-five preload failed: {preload_evidence['failed_keys'][:5]}")
-            preload_evidence["cluster_snapshot"] = snapshot
-            preload_evidence["content_evidence_file"] = str(
-                Path(preload_evidence["content_evidence_file"]).resolve().relative_to(run_dir))
-            preload_evidence["owner_presence_file"] = str(
-                Path(preload_evidence["owner_presence_file"]).resolve().relative_to(run_dir))
             preload_report_path = run_dir / "preloads" / f"{preload_prefix}.json"
+            cached = (json.loads(preload_report_path.read_text(encoding="utf-8"))
+                      if preload_report_path.is_file() else None)
+            if (cached is not None and cached.get("complete") is True
+                    and cached.get("cluster_epoch") == snapshot["epoch"]
+                    and cached.get("mode") == target_mode
+                    and cached.get("manifest_id") == manifest.fingerprint
+                    and cached.get("run_id") == run_id
+                    and (run_dir / cached.get("content_evidence_file", "")).is_file()
+                    and (run_dir / cached.get("owner_presence_file", "")).is_file()
+                    and (current_mode == target_mode
+                         or source is not None or target_mode == "strong")):
+                # Stable current cluster: no need to repeat 600k proof RPCs.
+                preload_evidence = cached
+            elif source is not None and target_mode in ("eventual-noRR", "eventual-RR"):
+                # Reads/writes may change values, so historical five-copy
+                # content evidence plus FRESH five-owner inventory is required.
+                preload_evidence = inherit_eventual(
+                    manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
+                    mode=target_mode, epoch=snapshot["epoch"],
+                    prefix=preload_prefix, source=source)
+            else:
+                # Ten persistent VM-local preload shards; recovered checkpoints
+                # continue on the VMs even when this SSH controller disconnects.
+                preload_evidence = run_distributed(
+                    manifest_path=manifest_path, run_dir=run_dir,
+                    run_id=run_id, mode=target_mode,
+                    epoch=snapshot["epoch"], prefix=preload_prefix,
+                    root_name=root_name, user=ssh_user, ssh=_ssh, collect=_collect)
+            if not preload_evidence["complete"]:
+                raise RuntimeError("preload evidence not verified")
+            preload_evidence["cluster_snapshot"] = snapshot
+            for evidence_field in ("content_evidence_file", "owner_presence_file"):
+                evidence_file = Path(preload_evidence[evidence_field])
+                if evidence_file.is_absolute():
+                    preload_evidence[evidence_field] = str(
+                        evidence_file.resolve().relative_to(run_dir))
             write_json_atomic(preload_report_path, preload_evidence)
+            if target_mode == "strong":
+                source = None
+            elif source is None:
+                source = preload_evidence
+            # Preserve the original fully verified initial eventual proof.
+            source_path = None
+            if source is not None:
+                source_prefix = (f"{'exp1' if source is not preload_evidence else spec.experiment}-"
+                                 f"{source['mode']}-r"
+                                 f"{1 if source is not preload_evidence else spec.read_quorum}-w"
+                                 f"{1 if source is not preload_evidence else spec.write_quorum}")
+                # The source's file path is recorded explicitly, not guessed
+                # from the present mode or trial.
+                source_path = (lineage.get("eventual_source") if
+                               lineage.get("eventual_source") and
+                               source is not preload_evidence else
+                               str(preload_report_path.relative_to(run_dir)))
+            lineage = {"mode": target_mode, "epoch": snapshot["epoch"],
+                       "eventual_source": source_path,
+                       "manifest_id": manifest.fingerprint}
+            write_json_atomic(lineage_path, lineage)
             current_config = config
 
         attempt_dir = trial_dir
