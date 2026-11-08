@@ -121,7 +121,14 @@ start_log_query() {
     pid=$(log_query_pid "$n")
     if [ -n "$pid" ]; then echo "VM $n: MP1 log server already running (pid $pid)"; return 0; fi
     LOG_QUERY_STARTED=1
-    vm_sh "$n" "[ -f \"\$MP3_RUN/server.py\" ] && [ -f \"\$MP3_RUN/protocol.py\" ] && cd \"\$MP3_RUN\" && nohup python3 -B server.py $n $port >> log_query.out 2>&1 </dev/null &"
+    # Background only the server process, not the whole "check && cd && start" list.
+    # Backgrounding the AND-list left a shell holding the SSH session open.
+    vm_sh "$n" "if [ -f \"\$MP3_RUN/server.py\" ] && [ -f \"\$MP3_RUN/protocol.py\" ]; then
+        cd \"\$MP3_RUN\" || exit 1
+        nohup python3 -B server.py $n $port >> log_query.out 2>&1 </dev/null &
+    else
+        exit 1
+    fi" || return 1
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if vm_sh "$n" "python3 - $port <<'PY'
