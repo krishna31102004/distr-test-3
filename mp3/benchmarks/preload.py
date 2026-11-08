@@ -165,15 +165,27 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
                 version_text = None if last_version is None else (
                     f"{last_version.kind}:{last_version.number}:{last_version.writer_id}")
                 replica_checks = []
+                confirmed = False
                 if reply.status == ControlStatus.OK and version_text is not None:
-                    replica_checks = [_record_at_owner(manifest, coordinator, owner, key, value)
-                                      for owner in owners]
-                confirmed = (len(replica_checks) == len(owners) == 5
-                             and all(check["status"] == ControlStatus.OK.value
-                                     and check["version"] is not None
-                                     and check["value_verified"]
-                                     and check["value_sha256"] == expected_digest
-                                     for check in replica_checks))
+                    # Eventual W=1 can acknowledge before all five asynchronous
+                    # replica installs complete. Poll existing writes first
+                    # rather than issuing up to five costly replacement PUTs.
+                    verify_rounds = 4 if shard_count > 1 else 1
+                    for verification in range(verify_rounds):
+                        replica_checks = [
+                            _record_at_owner(manifest, coordinator, owner, key, value)
+                            for owner in owners
+                        ]
+                        confirmed = (len(replica_checks) == len(owners) == 5
+                                     and all(check["status"] == ControlStatus.OK.value
+                                             and check["version"] is not None
+                                             and check["value_verified"]
+                                             and check["value_sha256"] == expected_digest
+                                             for check in replica_checks))
+                        if confirmed:
+                            break
+                        if verification + 1 < verify_rounds:
+                            time.sleep(0.05 * (verification + 1))
                 last = {"index": index, "key": key, "owners": list(owners),
                         "value_sha256": expected_digest,
                         "attempts": attempt, "put_status": reply.status.value,
