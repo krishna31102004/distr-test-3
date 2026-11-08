@@ -336,13 +336,17 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
     lineage = (json.loads(lineage_path.read_text(encoding="utf-8"))
                if lineage_path.is_file() else {})
     matrix = full_matrix(base_seed)
-    for spec in matrix:
+    print(f"[benchmark] {len(matrix)} mandatory 180s trials; "
+          f"run={run_id}; existing checkpoints preserved", flush=True)
+    for trial_number, spec in enumerate(matrix, 1):
         trial_dir = run_dir / "trials" / spec.trial_id
         canonical_summary_path = trial_dir / "summary.json"
         if canonical_summary_path.exists():
             existing_summary = json.loads(canonical_summary_path.read_text(encoding="utf-8"))
             # Reuse only a complete full-duration checkpoint with retained raw records.
             if complete_checkpoint(existing_summary, run_dir, spec_dict(spec)):
+                print(f"[benchmark] {trial_number}/51 checkpoint verified: "
+                      f"{spec.trial_id}", flush=True)
                 summaries.append(existing_summary)
                 continue
             if not retry_failed:
@@ -351,6 +355,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
 
         config = (spec.mode, spec.read_quorum, spec.write_quorum)
         if current_config != config:
+            print(f"[benchmark] configuring {spec.mode}, "
+                  f"R={spec.read_quorum}, W={spec.write_quorum}", flush=True)
             target_mode = spec.mode
             snapshot = _snapshot(manifest)
             current_mode = next(iter(snapshot["nodes"].values()))["mode"]
@@ -410,6 +416,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                          or source is not None or target_mode == "strong")):
                 # Stable current cluster: no need to repeat 600k proof RPCs.
                 preload_evidence = cached
+                print(f"[benchmark] reused verified preload {preload_prefix}",
+                      flush=True)
             elif source is not None and target_mode in ("eventual-noRR", "eventual-RR"):
                 # Historical five-copy content evidence plus a FRESH owner
                 # inventory, captured independently on every university VM.
@@ -417,6 +425,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                     manifest_path=manifest_path, run_dir=run_dir,
                     run_id=run_id, prefix=preload_prefix, epoch=snapshot["epoch"],
                     root_name=root_name, user=ssh_user, ssh=_ssh, collect=_collect)
+                print(f"[benchmark] verifying retained Eventual data "
+                      f"for {preload_prefix}", flush=True)
                 preload_evidence = inherit_eventual(
                     manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
                     mode=target_mode, epoch=snapshot["epoch"],
@@ -424,6 +434,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
             else:
                 # Ten persistent VM-local preload shards; recovered checkpoints
                 # continue on the VMs even when this SSH controller disconnects.
+                print(f"[benchmark] starting 10 VM-local preload shards "
+                      f"for {preload_prefix}", flush=True)
                 preload_evidence = run_distributed(
                     manifest_path=manifest_path, run_dir=run_dir,
                     run_id=run_id, mode=target_mode,
@@ -431,6 +443,9 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                     root_name=root_name, user=ssh_user, ssh=_ssh, collect=_collect)
             if not preload_evidence["complete"]:
                 raise RuntimeError("preload evidence not verified")
+            print(f"[benchmark] 100,000 keys / five owners verified; "
+                  f"method={preload_evidence.get('preload_method', 'original')}",
+                  flush=True)
             preload_evidence["cluster_snapshot"] = snapshot
             for evidence_field in ("content_evidence_file", "owner_presence_file"):
                 evidence_file = Path(preload_evidence[evidence_field])
@@ -468,6 +483,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
         try:
             # Verify full healthy cluster and current R/W immediately before every trial.
             _snapshot(manifest, spec.mode, spec.read_quorum, spec.write_quorum)
+            print(f"[benchmark] trial {trial_number}/51 START: {spec.trial_id}",
+                  flush=True)
             summary = _launch_trial(spec, manifest=manifest, user=ssh_user,
                                     root_name=root_name, run_id=run_id,
                                     run_dir=run_dir, preload_report=preload_evidence,
@@ -480,6 +497,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
             # retry material stays isolated under failures/<trial>-attempt-NN.
             write_json_atomic(canonical_summary_path, summary)
             summaries.append(summary)
+            print(f"[benchmark] trial {trial_number}/51 COMPLETE: {spec.trial_id}",
+                  flush=True)
         except Exception as error:
             partial_files = []
             remote_trial = (f"benchmark/{run_id}/trials/{spec.trial_id}/"
