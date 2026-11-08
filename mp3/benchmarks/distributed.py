@@ -173,11 +173,11 @@ def inherit_eventual(*, manifest_path, run_dir, run_id: str, mode: str,
 
 
 def collect_vm_inventories(*, manifest_path, run_dir, run_id: str,
-                           prefix: str, root_name: str, user: str,
+                           prefix: str, epoch: int, root_name: str, user: str,
                            ssh, collect) -> dict[str, set[str]]:
     """Scan and transfer all ten inventories on the campus LAN, not the Mac."""
     manifest = load_manifest(manifest_path)
-    folder = f"benchmark/{run_id}/inventories/{prefix}"
+    folder = f"benchmark/{run_id}/inventories/{prefix}-epoch{epoch}"
     local = Path(run_dir).resolve() / "preloads" / "inventories" / prefix
     local.mkdir(parents=True, exist_ok=True)
     jobs = []
@@ -237,7 +237,7 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
     """Ten VM-local background workers survive laptop/SSH disconnects."""
     manifest = load_manifest(manifest_path)
     run_dir = Path(run_dir).resolve()
-    remote = f"benchmark/{run_id}/preloads/{prefix}"
+    remote = f"benchmark/{run_id}/preloads/{prefix}-epoch{epoch}"
     local = run_dir / "preloads" / "shards" / prefix
     local.mkdir(parents=True, exist_ok=True)
     jobs = []
@@ -305,7 +305,7 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
         shards.append((json.loads(report_file.read_text()), proof_file))
     inventories = collect_vm_inventories(
         manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
-        prefix=prefix, root_name=root_name, user=user, ssh=ssh, collect=collect)
+        prefix=prefix, epoch=epoch, root_name=root_name, user=user, ssh=ssh, collect=collect)
     return merge_shards(
         manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
         mode=mode, cluster_epoch=epoch, prefix=prefix,
