@@ -96,9 +96,10 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
     if report_path.is_file() and evidence_path.is_file():
         old = json.loads(report_path.read_text(encoding="utf-8"))
         identity = {"run_id": run_id, "manifest_id": manifest.fingerprint,
-                    "mode": mode.value, "key_count": key_count, "key_prefix": key_prefix,
-                    "shard_index": shard_index, "shard_count": shard_count}
-        if any(old.get(field) != expected for field, expected in identity.items()):
+                    "mode": mode.value, "key_count": key_count, "key_prefix": key_prefix}
+        if (any(old.get(field) != expected for field, expected in identity.items())
+                or old.get("shard_index", 0) != shard_index
+                or old.get("shard_count", 1) != shard_count):
             raise RuntimeError("existing preload evidence identity differs; refusing to reuse it")
         old_epoch = old.get("cluster_epoch")
         if cluster_epoch is not None:
