@@ -20,7 +20,7 @@ from ..ring import Manifest, load_manifest
 from .matrix import full_matrix, spec_dict
 from .metrics import complete_checkpoint, read_jsonl, trial_summary, write_json_atomic
 from .preload import preload
-from .distributed import run_distributed, inherit_eventual
+from .distributed import run_distributed, inherit_eventual, collect_vm_inventories
 
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,48}\Z")
 _USER = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -411,12 +411,16 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                 # Stable current cluster: no need to repeat 600k proof RPCs.
                 preload_evidence = cached
             elif source is not None and target_mode in ("eventual-noRR", "eventual-RR"):
-                # Reads/writes may change values, so historical five-copy
-                # content evidence plus FRESH five-owner inventory is required.
+                # Historical five-copy content evidence plus a FRESH owner
+                # inventory, captured independently on every university VM.
+                inventories = collect_vm_inventories(
+                    manifest_path=manifest_path, run_dir=run_dir,
+                    run_id=run_id, prefix=preload_prefix,
+                    root_name=root_name, user=ssh_user, ssh=_ssh, collect=_collect)
                 preload_evidence = inherit_eventual(
                     manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
                     mode=target_mode, epoch=snapshot["epoch"],
-                    prefix=preload_prefix, source=source)
+                    prefix=preload_prefix, source=source, owner_keys=inventories)
             else:
                 # Ten persistent VM-local preload shards; recovered checkpoints
                 # continue on the VMs even when this SSH controller disconnects.
