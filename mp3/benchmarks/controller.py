@@ -264,17 +264,39 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                 or existing_run.get("target") != "remote_university_vm"):
             raise ValueError("existing run.json does not match this run id/manifest")
         resuming = True
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        checks = {pool.submit(_ssh, ssh_user, host,
-                              f'test -e "$HOME/{root_name}"' if resuming else
-                              f'test ! -e "$HOME/{root_name}"', timeout=15.0): host
-                  for host in hosts}
-        wrong_state = [host for future, host in checks.items() if future.result().returncode != 0]
+    # Inspect directories sequentially. During a long preload the user's Mac
+    # may temporarily lose UIUC DNS; ten concurrent fresh SSH handshakes can
+    # also amplify such failures. Keep connectivity errors distinct from actual
+    # missing/existing roots so recovery never asks to delete valid data.
+    wrong_state = []
+    for host in hosts:
+        command = (f'if test -d "$HOME/{root_name}"; then echo EXISTS; '
+                   'else echo MISSING; fi')
+        result = None
+        for attempt in range(3):
+            try:
+                result = _ssh(ssh_user, host, command, timeout=20.0)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                if attempt == 2:
+                    raise ConnectionError(f"{host}: SSH inspection failed: {error}") from error
+                time.sleep(attempt + 1)
+                continue
+            if result.returncode == 0 and result.stdout.strip() in {"EXISTS", "MISSING"}:
+                break
+            if attempt == 2:
+                raise ConnectionError(
+                    f"{host}: SSH inspection failed (exit {result.returncode}): "
+                    f"{result.stderr.strip() or result.stdout.strip()}")
+            time.sleep(attempt + 1)
+        state = result.stdout.strip()
+        if (resuming and state != "EXISTS") or (not resuming and state != "MISSING"):
+            wrong_state.append(host)
     if wrong_state:
-        expectation = "all isolated roots must still exist to resume" if resuming else \
-            "isolated root already exists; no data was modified"
-        raise FileExistsError("isolated benchmark root already exists on: "
-                              + ", ".join(wrong_state) + f"; {expectation}")
+        if resuming:
+            raise FileNotFoundError("isolated benchmark directory missing on: "
+                                    + ", ".join(wrong_state) + "; refusing to resume")
+        raise FileExistsError("isolated benchmark directory already exists on: "
+                              + ", ".join(wrong_state) + "; no data was modified")
 
     (run_dir / "preloads").mkdir(exist_ok=True)
     (run_dir / "trials").mkdir(exist_ok=True)
