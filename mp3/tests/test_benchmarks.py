@@ -175,6 +175,21 @@ class PreloadAllOwnersTests(unittest.TestCase):
             self.assertEqual(len(evidence_path.read_text().splitlines()), 2)
 
 
+    def test_worker_ready_probe_uses_isolated_root(self):
+        from mp3.benchmarks import controller
+        with patch.object(controller, "_ssh", return_value=SimpleNamespace(
+                returncode=0, stdout="", stderr="")) as probe:
+            controller._wait_file(
+                "kbalaji4", "fa26-cs425-4801.cs.illinois.edu",
+                "mp3_benchmark_bench-20261107",
+                "benchmark/bench-20261107/trials/example/READY-vm01.json",
+                controller.time.monotonic() + 5)
+            self.assertIn(
+                '$HOME/mp3_benchmark_bench-20261107/benchmark/'
+                'bench-20261107/trials/example/READY-vm01.json',
+                probe.call_args.args[2])
+
+
 class BenchmarkWorkloadTests(unittest.TestCase):
     def test_value_is_exactly_1024_bytes_and_operation_values_are_unique(self):
         values = [unique_value("runA", "vm01", index) for index in range(100)]
