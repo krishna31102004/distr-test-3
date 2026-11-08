@@ -34,14 +34,16 @@ start_one() {
         return 1
     }
     local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    # Large recovered SQLite stores need more than the initial bootstrap's 10 s.
+    # A bounded startup scan may legitimately take up to 120 s.
+    for ((i=1; i<=150; i++)); do
         sleep 1
         if vm_sh "$n" 'tail -n 30 "$MP3_RUN/node.out" | grep -q "^READY $VMID"'; then
             echo "VM $n: $life OK, pid $(vm_pid "$n")"; return 0
         fi
         [ -n "$(vm_pid "$n")" ] || break
     done
-    echo "VM $n: FAILED to become ready. node.out:"; vm_sh "$n" 'tail -n 15 "$MP3_RUN/node.out"'
+    echo "VM $n: FAILED to become ready within 150s. node.out:"; vm_sh "$n" 'tail -n 15 "$MP3_RUN/node.out"'
     [ "$log_query_started" = 1 ] && stop_log_query "$n" >/dev/null 2>&1
     return 1
 }
