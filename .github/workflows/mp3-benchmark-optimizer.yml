@@ -3,6 +3,9 @@ on:
   push:
     branches:
       - perf/mp3-benchmark-fast-compliant
+  pull_request:
+    branches:
+      - fix/mp3-benchmark-preload-resume
   workflow_dispatch:
 
 jobs:
