@@ -415,7 +415,7 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                 # inventory, captured independently on every university VM.
                 inventories = collect_vm_inventories(
                     manifest_path=manifest_path, run_dir=run_dir,
-                    run_id=run_id, prefix=preload_prefix,
+                    run_id=run_id, prefix=preload_prefix, epoch=snapshot["epoch"],
                     root_name=root_name, user=ssh_user, ssh=_ssh, collect=_collect)
                 preload_evidence = inherit_eventual(
                     manifest_path=manifest_path, run_dir=run_dir, run_id=run_id,
