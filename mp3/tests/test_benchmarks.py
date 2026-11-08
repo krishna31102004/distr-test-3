@@ -190,6 +190,121 @@ class PreloadAllOwnersTests(unittest.TestCase):
                 probe.call_args.args[2])
 
 
+    def test_vm_preload_shard_verifies_only_assigned_indices_and_resumes(self):
+        from mp3.benchmarks import preload as module
+        manifest = _benchmark_manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            puts = []
+            def fake_send(_manifest, _coordinator, command, key="", body=b"", **_):
+                if command == "put":
+                    puts.append(key)
+                    return _preload_reply(version=Version("strong", 1, "vm01/1"))
+                if command == "read_replica":
+                    index = int(key.rsplit("-", 1)[1])
+                    return _preload_reply(version=Version("strong", 1, "vm01/1"),
+                                          value=preload_value("runABC", index))
+                self.fail("sharded preloader must not run global inventory")
+            opts = dict(manifest_path="unused", run_id="runABC", mode="strong",
+                        key_count=4, shard_index=1, shard_count=2,
+                        cluster_epoch=1, workers=1, max_attempts=1,
+                        report_path=root / "shard.json",
+                        evidence_path=root / "shard.jsonl")
+            with patch.object(module, "load_manifest", return_value=manifest), \
+                    patch.object(module, "send_command", side_effect=fake_send):
+                report = module.preload(**opts)
+                self.assertTrue(report["complete"])
+                self.assertEqual(report["verified_keys"], 2)
+                self.assertEqual(puts, ["bench-key-000001", "bench-key-000003"])
+                recovered = module.preload(**opts)
+                self.assertEqual(recovered["resumed_verified_keys"], 2)
+                self.assertEqual(len(puts), 2)
+                rows = [json.loads(x) for x in (root / "shard.jsonl").read_text().splitlines()]
+                self.assertEqual([x["index"] for x in rows], [1, 3])
+
+    def test_distributed_merge_requires_real_five_owner_evidence(self):
+        from mp3.benchmarks import distributed
+        manifest = _benchmark_manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shards = []
+            for shard_index in range(10):
+                rows = []
+                for index in range(shard_index, 20, 10):
+                    key = f"bench-key-{index:06d}"
+                    owners = [node.vm_id for node in manifest.owners(key)]
+                    digest = hashlib.sha256(preload_value("runABC", index)).hexdigest()
+                    checks = [
+                        {"owner": vm, "status": "OK", "version": "strong:1:vm01/1",
+                         "value_sha256": digest, "value_verified": True, "error": None}
+                        for vm in owners
+                    ]
+                    rows.append({
+                        "index": index, "key": key, "owners": owners,
+                        "value_sha256": digest, "attempts": 1, "version": "strong:1:vm01/1",
+                        "content_verified_owner": owners[0],
+                        "content_verified_version": checks[0]["version"],
+                        "replica_content_checks": checks, "content_verified": True,
+                    })
+                file = root / f"shard-{shard_index:02d}.jsonl"
+                file.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                report = {"complete": True, "shard_index": shard_index,
+                          "shard_count": 10, "run_id": "runABC",
+                          "manifest_id": manifest.fingerprint, "mode": "strong",
+                          "cluster_epoch": 1, "key_count": 20,
+                          "verified_keys": 2}
+                shards.append((report, file))
+            owned = {
+                vm.vm_id: {f"bench-key-{i:06d}" for i in range(20)
+                           if vm.vm_id in [n.vm_id for n in manifest.owners(f"bench-key-{i:06d}")]}
+                for vm in manifest.nodes
+            }
+            with patch.object(distributed, "load_manifest", return_value=manifest), \
+                    patch.object(distributed, "_liststore",
+                                 side_effect=lambda _manifest, vm: owned[vm]):
+                result = distributed.merge_shards(
+                    manifest_path="unused", run_dir=root, run_id="runABC",
+                    mode="strong", cluster_epoch=1, prefix="exp1-strong-rNone-wNone",
+                    shards=shards, key_count=20)
+                self.assertTrue(result["complete"])
+                self.assertEqual(result["verified_keys"], 20)
+                self.assertEqual(len((root / result["content_evidence_file"]).read_text().splitlines()), 20)
+                self.assertEqual(len((root / result["owner_presence_file"]).read_text().splitlines()), 20)
+                rows = [json.loads(line) for line in shards[0][1].read_text().splitlines()]
+                rows[0]["replica_content_checks"][0]["value_verified"] = False
+                shards[0][1].write_text("".join(json.dumps(row) + "\n" for row in rows))
+                with self.assertRaisesRegex(RuntimeError, "five-replica proof"):
+                    distributed.merge_shards(
+                        manifest_path="unused", run_dir=root, run_id="runABC",
+                        mode="strong", cluster_epoch=1, prefix="bad",
+                        shards=shards, key_count=20)
+
+    def test_eventual_reuse_keeps_historical_content_proof_and_updates_presence(self):
+        from mp3.benchmarks import distributed
+        manifest = _benchmark_manifest()
+        source = {"mode": "eventual-noRR", "cluster_epoch": 2,
+                  "run_id": "runABC", "manifest_id": manifest.fingerprint,
+                  "complete": True, "all_five_owners_verified": True,
+                  "key_count": 100_000, "content_evidence_sha256": "abcd",
+                  "content_evidence_file": "preloads/baseline.content.jsonl"}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(distributed, "load_manifest", return_value=manifest), \
+                    patch.object(distributed, "inventory_proof", return_value="new-inventory"):
+                result = distributed.inherit_eventual(
+                    manifest_path="unused", run_dir=root, run_id="runABC",
+                    mode="eventual-RR", epoch=3, prefix="rr", source=source)
+            self.assertEqual(result["retained_source_epoch"], 2)
+            self.assertEqual(result["retained_source_mode"], "eventual-noRR")
+            self.assertEqual(result["mode"], "eventual-RR")
+            self.assertEqual(result["content_evidence_sha256"], "abcd")
+            self.assertEqual(result["inventory_evidence_sha256"], "new-inventory")
+            with self.assertRaisesRegex(ValueError, "verified retained eventual"):
+                distributed.inherit_eventual(
+                    manifest_path="unused", run_dir=root, run_id="runABC",
+                    mode="strong", epoch=4, prefix="invalid", source=source)
+
+
 class BenchmarkWorkloadTests(unittest.TestCase):
     def test_value_is_exactly_1024_bytes_and_operation_values_are_unique(self):
         values = [unique_value("runA", "vm01", index) for index in range(100)]
