@@ -11,7 +11,7 @@ import sys
 from ..models import ConsistencyMode
 from .controller import run_full
 from .matrix import MIN_DURATION_SECONDS
-from .preload import preload
+from .preload import preload, capture_local_inventory
 from .report import build_final_report
 from .smoke import run_smoke
 from .worker import run_worker
@@ -55,6 +55,12 @@ def _parser() -> argparse.ArgumentParser:
     shard.add_argument("--workers", required=True, type=int)
     shard.add_argument("--report", required=True)
     shard.add_argument("--evidence", required=True)
+
+    inventory = commands.add_parser("preload-inventory",
+                                    help="snapshot the local VM's paginated owner inventory")
+    inventory.add_argument("--manifest", required=True)
+    inventory.add_argument("--vm-id", required=True)
+    inventory.add_argument("--output", required=True)
 
     worker = commands.add_parser("worker", help="run one persistent closed-loop client")
     worker.add_argument("--manifest", required=True)
@@ -106,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
                 presence_path=args.report + ".unused-presence.jsonl",
                 cluster_epoch=args.cluster_epoch, shard_index=args.shard_index,
                 shard_count=args.shard_count)
+        elif args.subcommand == "preload-inventory":
+            result = capture_local_inventory(
+                manifest_path=args.manifest, vm_id=args.vm_id,
+                output_path=args.output)
         elif args.subcommand == "worker":
             result = run_worker(
                 manifest_path=args.manifest, client_id=args.client_id, mode=args.mode,
