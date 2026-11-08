@@ -127,6 +127,54 @@ class PreloadAllOwnersTests(unittest.TestCase):
                 _validate_replica_content_checks(row, list(owners), expected_hash)
 
 
+    def test_partial_preload_resumes_only_failed_keys_and_preserves_verified_evidence(self):
+        from mp3.benchmarks import preload as preload_module
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = _benchmark_manifest()
+            run_id = "runABC"
+            report_path = Path(temporary) / "preload.json"
+            evidence_path = Path(temporary) / "content.jsonl"
+            presence_path = Path(temporary) / "owners.jsonl"
+            puts = []
+            fail_second = True
+
+            def send(_manifest, _coordinator, command, key="", body=b"", **_kwargs):
+                nonlocal fail_second
+                if command == "put":
+                    puts.append(key)
+                    if key == "bench-key-000001" and fail_second:
+                        return _preload_reply(status=ControlStatus.ERROR)
+                    return _preload_reply(version=Version("strong", 1, "vm01/1"))
+                if command == "read_replica":
+                    index = int(key.rsplit("-", 1)[1])
+                    return _preload_reply(version=Version("strong", 1, "vm01/1"),
+                                          value=preload_value(run_id, index))
+                if command == "liststore":
+                    return _preload_reply(value=json.dumps(
+                        {"keys": ["bench-key-000000", "bench-key-000001"],
+                         "next": None}).encode("utf-8"))
+                self.fail(f"unexpected control command {command}")
+
+            args = dict(manifest_path="unused", run_id=run_id, mode="strong",
+                        key_count=2, max_attempts=1, workers=1,
+                        report_path=report_path, evidence_path=evidence_path,
+                        presence_path=presence_path, cluster_epoch=1)
+            with patch.object(preload_module, "load_manifest", return_value=manifest), \
+                    patch.object(preload_module, "send_command", side_effect=send):
+                failed = preload_module.preload(**args)
+                self.assertFalse(failed["complete"])
+                self.assertEqual(puts.count("bench-key-000000"), 1)
+                self.assertEqual(puts.count("bench-key-000001"), 1)
+                fail_second = False
+                recovered = preload_module.preload(**args)
+            self.assertTrue(recovered["complete"])
+            self.assertEqual(recovered["resumed_verified_keys"], 1)
+            self.assertEqual(recovered["retried_keys"], 1)
+            self.assertEqual(puts.count("bench-key-000000"), 1)
+            self.assertEqual(puts.count("bench-key-000001"), 2)
+            self.assertEqual(len(evidence_path.read_text().splitlines()), 2)
+
+
 class BenchmarkWorkloadTests(unittest.TestCase):
     def test_value_is_exactly_1024_bytes_and_operation_values_are_unique(self):
         values = [unique_value("runA", "vm01", index) for index in range(100)]
