@@ -57,6 +57,23 @@ def _liststore(manifest: Manifest, vm_id: str) -> set[str]:
         cursor = following
 
 
+def capture_local_inventory(*, manifest_path: str | Path, vm_id: str,
+                            output_path: str | Path) -> dict:
+    """Run on the owning VM to avoid repeated laptop-to-VM paginated RPCs."""
+    manifest = load_manifest(manifest_path)
+    manifest.node(vm_id)
+    keys = sorted(_liststore(manifest, vm_id))
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(output.name + ".pending")
+    pending.write_text(json.dumps({
+        "vm_id": vm_id, "manifest_id": manifest.fingerprint,
+        "keys": keys,
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    return {"vm_id": vm_id, "key_count": len(keys), "output": str(output)}
+
+
 def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | str,
             key_count: int, key_prefix: str = "bench-key-", max_attempts: int = 5,
             workers: int = 16, report_path: str | Path,
