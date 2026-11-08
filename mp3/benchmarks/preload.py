@@ -60,7 +60,8 @@ def _liststore(manifest: Manifest, vm_id: str) -> set[str]:
 def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | str,
             key_count: int, key_prefix: str = "bench-key-", max_attempts: int = 5,
             workers: int = 16, report_path: str | Path,
-            evidence_path: str | Path, presence_path: str | Path | None = None) -> dict:
+            evidence_path: str | Path, presence_path: str | Path | None = None,
+            cluster_epoch: int | None = None) -> dict:
     """Use ordinary MP3 PUTs and direct owner reads; never write local DB files.
 
     Each key gets a bounded number of recorded setup PUTs until all five designated
@@ -82,6 +83,47 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
     failures: list[str] = []
     failure_details: list[dict] = []
     digest = hashlib.sha256()
+    # A failed preload may already have verified nearly every key. Reuse only
+    # complete five-owner content proofs from the same run, mode and cluster epoch.
+    # The original evidence is retained until the replacement is complete.
+    cached: dict[int, dict] = {}
+    if report_path.is_file() and evidence_path.is_file():
+        old = json.loads(report_path.read_text(encoding="utf-8"))
+        identity = {"run_id": run_id, "manifest_id": manifest.fingerprint,
+                    "mode": mode.value, "key_count": key_count, "key_prefix": key_prefix}
+        if any(old.get(field) != expected for field, expected in identity.items()):
+            raise RuntimeError("existing preload evidence identity differs; refusing to reuse it")
+        old_epoch = old.get("cluster_epoch")
+        if cluster_epoch is not None:
+            # Legacy partial reports did not record epoch. The original strong
+            # bootstrap was epoch 1; other legacy contexts cannot be verified.
+            if old_epoch is None and mode == ConsistencyMode.STRONG and cluster_epoch == 1:
+                old_epoch = 1
+            if old_epoch != cluster_epoch:
+                raise RuntimeError("preload epoch changed; refusing stale checkpoint reuse")
+        with evidence_path.open("r", encoding="utf-8") as stream:
+            seen: set[int] = set()
+            for line in stream:
+                row = json.loads(line)
+                index = row.get("index")
+                if type(index) is not int or index < 0 or index >= key_count or index in seen:
+                    raise RuntimeError("corrupt preload evidence index; refusing resume")
+                seen.add(index)
+                key, value = f"{key_prefix}{index:06d}", preload_value(run_id, index)
+                owners = [node.vm_id for node in manifest.owners(key)]
+                checksum = hashlib.sha256(value).hexdigest()
+                checks = row.get("replica_content_checks", [])
+                if (row.get("content_verified") is True
+                        and row.get("key") == key and row.get("owners") == owners
+                        and row.get("value_sha256") == checksum
+                        and isinstance(checks, list) and len(checks) == 5
+                        and [check.get("owner") for check in checks] == owners
+                        and all(check.get("status") == ControlStatus.OK.value
+                                and check.get("version")
+                                and check.get("value_verified") is True
+                                and check.get("value_sha256") == checksum
+                                for check in checks)):
+                    cached[index] = row
 
     def one(index: int) -> dict:
         key, value = f"{key_prefix}{index:06d}", preload_value(run_id, index)
@@ -121,29 +163,34 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
         assert last is not None
         return last
 
-    with evidence_path.open("w", encoding="utf-8") as evidence:
+    # Atomic replacement is important: a disconnect during the targeted retry
+    # must never destroy the 99k+ successful entries from the prior attempt.
+    pending_path = evidence_path.with_name(evidence_path.name + ".pending")
+    with pending_path.open("w", encoding="utf-8") as evidence:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mp3-preload") as pool:
-            # Keep both the active work and executor's normally unbounded submission
-            # queue at a small fixed ceiling, even for the 100k-key run.
+            # At most workers*2 outstanding operations; verified keys do no RPCs.
             for first in range(0, key_count, workers * 2):
                 last_index = min(key_count, first + workers * 2)
-                pending = {pool.submit(one, index): index
-                           for index in range(first, last_index)}
-                for future in as_completed(pending):
-                    index = pending[future]
-                    try:
-                        row = future.result()
-                    except Exception as error:
-                        row = {"index": index, "key": f"{key_prefix}{index:06d}",
-                               "owners": [], "content_verified": False,
-                               "error": f"{type(error).__name__}: {error}"}
+                pending = {index: pool.submit(one, index)
+                           for index in range(first, last_index) if index not in cached}
+                for index in range(first, last_index):
+                    if index in cached:
+                        row = cached[index]
+                    else:
+                        try:
+                            row = pending[index].result()
+                        except Exception as error:
+                            row = {"index": index, "key": f"{key_prefix}{index:06d}",
+                                   "owners": [], "content_verified": False,
+                                   "error": f"{type(error).__name__}: {error}"}
                     if not row.get("content_verified"):
                         failures.append(row["key"])
                         failure_details.append(row)
                     line = json.dumps(row, sort_keys=True, ensure_ascii=False)
                     evidence.write(line + "\n")
-                    evidence.flush()
                     digest.update(line.encode("utf-8") + b"\n")
+        evidence.flush()
+    pending_path.replace(evidence_path)
 
     # One bounded page walk per node is much less expensive than 500k control reads.
     node_keys: dict[str, set[str]] = {}
@@ -182,7 +229,9 @@ def preload(*, manifest_path: str | Path, run_id: str, mode: ConsistencyMode | s
         failures.extend(presence_errors[:100])
     result = {
         "schema": 1, "run_id": run_id, "manifest_id": manifest.fingerprint,
-        "mode": mode.value, "key_count": key_count, "key_prefix": key_prefix,
+        "mode": mode.value, "cluster_epoch": cluster_epoch,
+        "key_count": key_count, "key_prefix": key_prefix,
+        "resumed_verified_keys": len(cached), "retried_keys": key_count - len(cached),
         "replication_factor": 5, "all_five_owners_verified": not failures,
         "complete": not failures and key_count > 0,
         "verified_keys": key_count - len(set(presence_errors)),
