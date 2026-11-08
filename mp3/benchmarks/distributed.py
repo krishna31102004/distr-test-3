@@ -173,6 +173,7 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
     local = run_dir / "preloads" / "shards" / prefix
     local.mkdir(parents=True, exist_ok=True)
     jobs = []
+    previously_complete = set()
     for idx in range(10):
         host = manifest.node(f"vm{idx+1:02d}").control.host
         label = f"shard-{idx:02d}"
@@ -182,7 +183,9 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
                    f'test -f "$HOME/{root_name}/{report}" && '
                    f'grep -q \'"complete": true\' "$HOME/{root_name}/{report}"',
                    timeout=20)
-        if test.returncode != 0:
+        if test.returncode == 0:
+            previously_complete.add(idx)
+        else:
             args = ["--manifest", "run/manifest.json", "--run-id", run_id,
                     "--mode", mode, "--cluster-epoch", str(epoch),
                     "--key-count", "100000", "--shard-index", str(idx),
@@ -203,7 +206,7 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
         jobs.append((idx, host, report, content, log, exit_file))
 
     deadline = time.monotonic() + 7200
-    complete = {}
+    complete = {idx: True for idx in previously_complete}
     while len(complete) < 10:
         if time.monotonic() > deadline:
             raise TimeoutError(f"VM-side preload continuing: {len(complete)}/10 complete; resume safely later")
