@@ -438,19 +438,14 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                 source = None
             elif source is None:
                 source = preload_evidence
-            # Preserve the original fully verified initial eventual proof.
+            # Persist explicit lineage to reject reuse after an untracked
+            # mode switch. The baseline proof remains tied to its original epoch.
             source_path = None
             if source is not None:
-                source_prefix = (f"{'exp1' if source is not preload_evidence else spec.experiment}-"
-                                 f"{source['mode']}-r"
-                                 f"{1 if source is not preload_evidence else spec.read_quorum}-w"
-                                 f"{1 if source is not preload_evidence else spec.write_quorum}")
-                # The source's file path is recorded explicitly, not guessed
-                # from the present mode or trial.
-                source_path = (lineage.get("eventual_source") if
-                               lineage.get("eventual_source") and
-                               source is not preload_evidence else
-                               str(preload_report_path.relative_to(run_dir)))
+                source_path = (lineage.get("eventual_source")
+                               if source is not preload_evidence
+                               and lineage.get("eventual_source")
+                               else str(preload_report_path.relative_to(run_dir)))
             lineage = {"mode": target_mode, "epoch": snapshot["epoch"],
                        "eventual_source": source_path,
                        "manifest_id": manifest.fingerprint}
