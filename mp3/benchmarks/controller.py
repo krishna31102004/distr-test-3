@@ -343,7 +343,8 @@ def run_full(*, manifest_path: str | Path, run_dir: str | Path, run_id: str,
                 key_count=100_000, key_prefix="bench-key-", workers=16,
                 report_path=run_dir / "preloads" / f"{preload_prefix}.json",
                 evidence_path=run_dir / "preloads" / f"{preload_prefix}.content.jsonl",
-                presence_path=run_dir / "preloads" / f"{preload_prefix}.owners.jsonl")
+                presence_path=run_dir / "preloads" / f"{preload_prefix}.owners.jsonl",
+                cluster_epoch=snapshot["epoch"])
             if not preload_evidence["complete"]:
                 raise RuntimeError(f"all-five preload failed: {preload_evidence['failed_keys'][:5]}")
             preload_evidence["cluster_snapshot"] = snapshot
