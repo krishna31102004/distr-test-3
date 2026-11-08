@@ -275,6 +275,9 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
 
     deadline = time.monotonic() + 7200
     complete = {idx: True for idx in previously_complete}
+    last_reported = time.monotonic()
+    last_count = len(complete)
+    print(f"[preload] verified VM shards: {last_count}/10", flush=True)
     while len(complete) < 10:
         if time.monotonic() > deadline:
             raise TimeoutError(f"VM-side preload continuing: {len(complete)}/10 complete; resume safely later")
@@ -293,6 +296,10 @@ def run_distributed(*, manifest_path, run_dir, run_id: str, mode: str,
                 complete[idx] = True
             elif status not in ("", "RUNNING"):
                 raise RuntimeError(f"VM-local shard {idx} failed (exit {status}); inspect remote shard log; prior proof preserved")
+        if len(complete) != last_count or time.monotonic() - last_reported > 60:
+            print(f"[preload] verified VM shards: {len(complete)}/10; "
+                  f"remaining workers run on the university VMs", flush=True)
+            last_reported, last_count = time.monotonic(), len(complete)
         if len(complete) < 10:
             time.sleep(8)
 
