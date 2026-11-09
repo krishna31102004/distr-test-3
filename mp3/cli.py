@@ -1,5 +1,3 @@
-"""Command-line client: parses the eight commands and runs them against a node."""
-
 import json
 import os
 import re
@@ -35,7 +33,6 @@ Exit codes: 0 success, 1 operation failed, 2 usage or configuration error.
 
 
 def parse_command(line: str) -> Command:
-    """Validate one command; return normalized name/arguments or raise ValueError."""
     if line.strip().startswith("multiput("):
         match = re.fullmatch(r"\s*multiput\(([^()]*)\)\s*", line)
         if not match:
@@ -50,7 +47,6 @@ def parse_command(line: str) -> Command:
         if not 2 <= len(args) <= 11 or any(not re.fullmatch(r"(?i)vm0?(?:[1-9]|10)", vm)
                                            for vm in args[1:]):
             raise ValueError("multiput requires a key and 1 to 10 VM labels (VM1..VM10)")
-        # VM3, vm3 and vm03 are the same machine.
         if len({vm_name(vm) for vm in args[1:]}) != len(args[1:]):
             raise ValueError("multiput VM labels must be distinct")
     elif name not in ARITY or len(args) != ARITY[name]:
@@ -61,7 +57,6 @@ def parse_command(line: str) -> Command:
 
 
 def smoke() -> None:
-    """Check a local socket pair, 1 MiB bytes, inventory and supplied ring IDs."""
     import socket
     import threading
 
@@ -73,7 +68,6 @@ def smoke() -> None:
         errors = []
 
         def send():
-            """Send in parallel so a full-size value cannot fill a local buffer."""
             try:
                 send_frame(sender, payload, max_bytes=MAX_VALUE_BYTES)
                 send_frame(sender, b"", max_bytes=MAX_VALUE_BYTES)
@@ -95,7 +89,6 @@ def smoke() -> None:
 
 
 def split_options(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
-    """Take leading --manifest/--vm-id options (environment fallback); return the rest."""
     manifest = os.environ.get("MP3_MANIFEST")
     vm_id = os.environ.get("MP3_VM_ID")
     rest = list(argv)
@@ -111,7 +104,6 @@ def split_options(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
 
 
 def _load_manifest(path: str, vm_id: str | None = None):
-    """Read the manifest (and check `vm_id` is in it); ValueError explains any problem."""
     try:
         manifest = load_manifest(path)
         if vm_id is not None:
@@ -122,7 +114,6 @@ def _load_manifest(path: str, vm_id: str | None = None):
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Print help/smoke or one JSON result; return 0 success, 1 failed, 2 usage or configuration."""
     argv = sys.argv[1:] if argv is None else argv
     try:
         manifest_path, vm_id, argv = split_options(argv)
@@ -137,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
         print("Smoke OK: framing, inventory, successors")
         return 0
     try:
-        # A parenthesized command can be passed as one quoted shell argument.
         line = argv[0] if len(argv) == 1 else shlex.join(argv)
         command = parse_command(line)
         if command.name == "ls":

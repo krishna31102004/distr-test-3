@@ -1,10 +1,3 @@
-"""Fixed-manifest membership, suspicion, refutation and recovery (KD-03/04/05/C2).
-
-This adapts the heartbeat/snapshot/suspicion ideas from our MP2 membership code.
-The MP2 source remains unchanged; its terminal FAILED state and timestamp identity
-are deliberately not used here because MP3 must recover the same fixed VM owner.
-"""
-
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -184,8 +177,6 @@ class GossipEnvelope:
 
 
 class MembershipTable:
-    """Thread-safe full membership view; down members remain fixed ring owners."""
-
     def __init__(self, manifest: Manifest, self_id: str, *, clock: Callable[[], float] = time.monotonic,
                  suspicion_seconds: float = DEFAULT_SUSPICION_SECONDS,
                  on_event: Callable[[str], None] | None = None):
@@ -213,7 +204,6 @@ class MembershipTable:
         self._target_cursor = 0
 
     def set_local_generation(self, generation: int) -> None:
-        """Install the generation committed by Store.start_incarnation exactly once."""
         if type(generation) is not int or generation < 1:
             raise ValueError("local restart generation must be positive")
         with self._lock:
@@ -231,13 +221,11 @@ class MembershipTable:
             return self._local_generation
 
     def snapshot(self) -> tuple[Member, ...]:
-        """Return every node in ascending ring-position order, including suspects."""
         with self._lock:
             return tuple(sorted(self._members.values(),
                                 key=lambda member: self.manifest.node(member.vm_id).ring_id))
 
     def list_mem_ids(self) -> tuple[tuple[str, int, int, int, MemberState, int], ...]:
-        """Rows for the diagnostic command, sorted by numerical ring nodeID."""
         with self._lock:
             return tuple((member.vm_id, member.restart_generation, member.incarnation,
                           member.heartbeat,
@@ -247,7 +235,6 @@ class MembershipTable:
                              key=lambda row: self.manifest.node(row.vm_id).ring_id))
 
     def owners(self, key: str) -> tuple[Node, ...]:
-        """Membership never filters owner selection by liveness."""
         return self.manifest.owners(key)
 
     def envelope(self) -> GossipEnvelope:
@@ -266,13 +253,13 @@ class MembershipTable:
             return updated
 
     def check_suspicions(self) -> tuple[str, ...]:
-        """Mark stale ALIVE peers SUSPECTED using monotonic elapsed time; never delete."""
         now = self._clock()
         events = []
         with self._lock:
             for vm_id, member in tuple(self._members.items()):
                 if vm_id == self.self_id or member.status != MemberState.ALIVE:
                     continue
+                # mark as suspected, never delete the node
                 if now - self._progress[vm_id] >= self.suspicion_seconds:
                     self._members[vm_id] = Member(vm_id, member.restart_generation,
                                                   member.incarnation, member.heartbeat,
@@ -283,7 +270,6 @@ class MembershipTable:
         return tuple(event.split()[1] for event in events)
 
     def merge_gossip(self, envelope: GossipEnvelope) -> tuple[str, ...]:
-        """Merge only monotonically newer process-generation/incarnation evidence."""
         if not isinstance(envelope, GossipEnvelope):
             raise TypeError("envelope must be a validated GossipEnvelope")
         if envelope.manifest_id != self.manifest.fingerprint:
@@ -299,9 +285,6 @@ class MembershipTable:
         now = self._clock()
         events: list[str] = []
         with self._lock:
-            # Check state-dependent invariants before changing any row. In particular,
-            # a snapshot claiming that this process has a newer durable generation
-            # means local identity/storage state is inconsistent; reject it atomically.
             if incoming_by_id[self.self_id].restart_generation > self.local_generation:
                 raise RuntimeError("gossip claims a newer self generation; local identity is inconsistent")
 
@@ -337,8 +320,6 @@ class MembershipTable:
                         events.append(f"SUSPECT CLEARED {vm_id} incarnation={incoming.incarnation}")
                     continue
 
-                # At equal generation and incarnation, suspicion wins. A heartbeat
-                # cannot refute suspicion; only a newer self-refutation can do that.
                 if incoming.status == MemberState.SUSPECTED and local.status == MemberState.ALIVE:
                     self._members[vm_id] = Member(vm_id, local.restart_generation,
                                                   local.incarnation,
@@ -357,7 +338,6 @@ class MembershipTable:
         return tuple(events)
 
     def next_targets(self, fanout: int = DEFAULT_FANOUT) -> tuple[Node, ...]:
-        """Choose bounded peers from all manifest nodes, including retained suspects."""
         if type(fanout) is not int or not 1 <= fanout <= len(self._members) - 1:
             raise ValueError("fanout must be in 1..9")
         with self._lock:
@@ -394,7 +374,6 @@ def _recv_frame_deadline(sock: socket.socket, deadline: float) -> bytes:
 
 def exchange_gossip(endpoint: object, envelope: GossipEnvelope, manifest: Manifest,
                     *, timeout: float = 0.75) -> GossipEnvelope:
-    """One bounded TCP/framed full-snapshot exchange; no introducer is special."""
     try:
         valid_timeout = (type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0)
     except OverflowError:
@@ -411,8 +390,6 @@ def exchange_gossip(endpoint: object, envelope: GossipEnvelope, manifest: Manife
 
 
 class MembershipService:
-    """Separate membership TCP service with bounded worker admission."""
-
     def __init__(self, endpoint: object, table: MembershipTable, *, workers: int = 8,
                  max_pending: int = 32, io_timeout: float = 2.5):
         if type(workers) is not int or workers < 1 or type(max_pending) is not int \
@@ -437,7 +414,7 @@ class MembershipService:
     def start(self) -> None:
         if self._accept_thread is not None:
             raise RuntimeError("membership service already started")
-        self.table.local_generation  # fail before opening a listener if recovery has not run
+        self.table.local_generation
         server = socket.socket(socket.AF_INET6 if ":" in self.endpoint.host else socket.AF_INET,
                                socket.SOCK_STREAM)
         try:
@@ -486,14 +463,12 @@ class MembershipService:
             conn.settimeout(remaining)
             send_frame(conn, response, max_bytes=MEMBERSHIP_FRAME_LIMIT)
         except (OSError, ValueError, TypeError, RuntimeError):
-            # Invalid/stale messages are discarded; the sender learns via timeout.
             pass
         finally:
             conn.close()
             self._slots.release()
 
     def stop(self) -> bool:
-        """Stop admission and wait for bounded handlers; report listener join."""
         self._stop.set()
         if self._server is not None:
             self._server.close()
@@ -510,8 +485,6 @@ class MembershipService:
 
 
 class MembershipRuntime:
-    """Startup/gossip owner; reserves one durable generation before network admission."""
-
     def __init__(self, store: object, manifest: Manifest, *,
                  suspicion_seconds: float = DEFAULT_SUSPICION_SECONDS,
                  gossip_interval: float = DEFAULT_GOSSIP_INTERVAL,
@@ -562,11 +535,9 @@ class MembershipRuntime:
         return self._generation
 
     def start(self, *, background: bool = True, listen: bool = True) -> None:
-        """Recover store, reserve generation exactly once, then admit membership traffic."""
         if self._started:
             raise RuntimeError("runtime may start only once per process/store startup")
         self._started = True
-        # Recovery and context validation happen before this generation becomes visible.
         self.store.current_context()
         store_path = str(self.store.path)
         with _START_LOCK:
@@ -590,7 +561,6 @@ class MembershipRuntime:
             self._thread.start()
 
     def gossip_round(self) -> tuple[str, ...]:
-        """Probe a bounded rotating sample of all fixed peers, live or suspected."""
         if self._generation is None:
             raise RuntimeError("runtime must start before gossip")
         self.table.tick_heartbeat()
@@ -612,8 +582,6 @@ class MembershipRuntime:
                 outcomes.append(f"{vm_id}:merged:{len(events)}")
             except (OSError, ValueError, TypeError, RuntimeError) as error:
                 outcomes.append(f"{vm_id}:unreachable:{type(error).__name__}")
-        # Completed calls are bounded by fanout; pending network calls have a finite
-        # socket timeout and are not replaced with an unbounded queue of retries.
         if pending:
             outcomes.extend(f"{futures[future]}:pending" for future in pending)
         return tuple(sorted(outcomes))
@@ -629,7 +597,6 @@ class MembershipRuntime:
             self._stop.wait(max(0.0, remaining))
 
     def stop(self) -> bool:
-        """Stop gossip/listening and report whether their threads have joined."""
         if self._stop_report is True:
             return self._stop_report
         self._stop.set()
@@ -639,7 +606,6 @@ class MembershipRuntime:
                 self._thread.join(timeout=max(2.0, self.rpc_timeout * 2))
                 gossip_joined = not self._thread.is_alive()
             else:
-                # A failed Thread.start() during partial startup is already stopped.
                 self._thread = None
         if self._service is not None:
             listener_joined = self._service.stop()

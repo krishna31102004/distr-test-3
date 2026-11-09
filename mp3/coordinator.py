@@ -1,10 +1,3 @@
-"""Shared coordinator evidence, bounded dispatch and schema-2 activation (KD-08/11/12/14/15).
-
-This module contains no coordinator protocol itself (see strong.py and eventual.py). It
-provides the bounded, version-aware primitives they share: the bounded executors, one-shot
-owner dispatch, distinct-owner quorum collection and the schema activation gates.
-"""
-
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, wait
@@ -130,8 +123,6 @@ class OwnerFailure:
 
 
 class OwnerDispatchError(ValueError):
-    """A local preflight rejection with explicit failure evidence and no RPC sent."""
-
     def __init__(self, failure: OwnerFailure):
         self.failure = failure
         super().__init__(failure.error or failure.outcome.value)
@@ -166,8 +157,6 @@ class AttemptReport:
 
 
 class AttemptLedger:
-    """Track exactly one attempt for each of the five stable prescribed owners."""
-
     def __init__(self, owners: Iterable[Node], *, release: Callable[[str], None] | None = None):
         rows = tuple(owners)
         ids = tuple(node.vm_id for node in rows)
@@ -220,12 +209,6 @@ class AttemptLedger:
 
 @dataclass(frozen=True)
 class Schema2Activation:
-    """Explicit operator activation based on a complete ten-identity release inventory.
-
-    The inventory is an assertion from deployment tooling, not a live health check or
-    proof that university machines actually run that release.
-    """
-
     manifest_id: str
     release_id: str
     compatible_nodes: tuple[str, ...]
@@ -256,7 +239,6 @@ class Schema2Activation:
 
     @staticmethod
     def load_inventory(manifest: Manifest, path: str | Path) -> Mapping[str, Mapping[str, object]]:
-        """Read and shape-check an inventory file; return its per-node release records."""
         def unique_object(pairs):
             result = {}
             for key, value in pairs:
@@ -289,13 +271,6 @@ class Schema2Activation:
 
 @dataclass(frozen=True)
 class Schema3Activation:
-    """Operator activation of the Eventual-RR schema (KD-13/KD-15).
-
-    The same release inventory file used for schema 2 activates schema 3 only when
-    every node advertises `schema_version >= 3`; it is an assertion from deployment
-    tooling, not a live health check.
-    """
-
     manifest_id: str
     release_id: str
     compatible_nodes: tuple[str, ...]
@@ -331,8 +306,6 @@ class _Job:
 
 
 class CapacityReservation:
-    """Atomic reservation for one or more bounded worker slots."""
-
     def __init__(self, executor: "BoundedExecutor", count: int, deadline: float):
         self._executor = executor
         self._remaining = count
@@ -364,8 +337,6 @@ class WorkerShutdownReport:
 
 
 class BoundedExecutor:
-    """Fixed workers and bounded queue with atomic active+queued reservations."""
-
     def __init__(self, *, workers: int, max_pending: int, name: str):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be positive")
@@ -445,11 +416,6 @@ class BoundedExecutor:
                 raise RuntimeError("reservation is closed or exhausted")
             future = Future()
             job = _Job(future, function, args, kwargs, lease)
-            # A reservation accounts for active+queued+unsubmitted capacity, but
-            # a burst of submissions can transiently fill the physical queue
-            # before idle workers dequeue. Wait on that already-reserved slot;
-            # a worker notifies after taking a job. This preserves the guarantee
-            # made by reserve() without making the queue itself unbounded.
             while self._queue.full():
                 if self._closed or reservation._closed:
                     raise RuntimeError("executor closed before reserved submission")
@@ -542,7 +508,6 @@ class BoundedExecutor:
             for lease in leases:
                 if lease is not None:
                     lease.cancel()
-        # The workers poll the queue and exit after accepted work reaches zero.
         for thread in self._threads:
             remaining = max(0.0, deadline - time.monotonic())
             thread.join(remaining)
@@ -577,8 +542,6 @@ class CoordinatorShutdownReport:
 
 
 class CoordinatorResources:
-    """Node-owned bounded operation and outbound-attempt workers."""
-
     def __init__(self, *, coordinator_workers: int = DEFAULT_COORDINATOR_WORKERS,
                  coordinator_queue: int = DEFAULT_COORDINATOR_QUEUE,
                  attempt_workers: int = DEFAULT_ATTEMPT_WORKERS,
@@ -591,7 +554,6 @@ class CoordinatorResources:
             self.attempts = BoundedExecutor(
                 workers=attempt_workers, max_pending=attempt_queue, name="mp3-attempt")
             try:
-                # Eventual-RR comparison and repair run here, apart from foreground work.
                 self.background = BoundedExecutor(
                     workers=background_workers, max_pending=background_queue,
                     name="mp3-background")
@@ -608,8 +570,6 @@ class CoordinatorResources:
                                      queue_deadline=queue_deadline)
 
     def shutdown(self, *, timeout: float, force: bool = False) -> CoordinatorShutdownReport:
-        # Close operation admission first. Existing operation tasks can still use
-        # already-reserved outbound slots until they end; then outbound admission closes.
         deadline = time.monotonic() + timeout
         coordinator_report = self.coordinators.shutdown(
             timeout=max(0.0, deadline - time.monotonic()), force=force)
@@ -627,7 +587,6 @@ def dispatch_owner(client, node: Node, request: ReplicaRequest, *, manifest: Man
                    expected_generation: int, executor: BoundedExecutor,
                    reservation: CapacityReservation | None = None,
                    attempt_lease: AttemptLease | None = None) -> OwnerCall:
-    """Dispatch exactly one RPC with dispatch-time generation evidence."""
     if not isinstance(manifest, Manifest):
         raise TypeError("dispatch requires the validated owner manifest")
     if (not isinstance(node, Node) or request.target_id != node.vm_id
@@ -679,13 +638,8 @@ def _failure_from_outcome(owner_id: str, outcome: RpcOutcome) -> OwnerFailure:
                         outcome.error, outcome.completion_unknown)
 
 
-# Phases whose owner sends must all run to completion: the Eventual PUT fanout.
-# Reaching the threshold never cancels the remaining sends. (Repair results are
-# classified by the RR coordinator itself, not by collect_distinct.)
 CONTINUING_PHASES = frozenset({"eventual_put"})
 READ_PHASES = frozenset({"strong_query", "eventual_read", "eventual_rr_read"})
-# Phases whose remaining attempts survive reaching the threshold. An Eventual-RR read
-# keeps every accepted read so the later comparison can see all five replicas.
 KEEP_AFTER_THRESHOLD = CONTINUING_PHASES | {"eventual_rr_read"}
 
 
@@ -712,7 +666,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
                      preflight_failures: Iterable[OwnerFailure] = (),
                      key: str | None = None,
                      clock=time.monotonic) -> QuorumCollection:
-    """Collect phase-qualified evidence once per prescribed stable VM identity."""
     owner_rows = tuple(owners)
     owner_ids = tuple(node.vm_id for node in owner_rows)
     if (not isinstance(manifest, Manifest) or len(owner_ids) != 5
@@ -738,8 +691,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         if key is not None and key != first_key:
             raise ValueError("explicit key does not match dispatched owner requests")
     elif isinstance(key, str):
-        # A complete set of local preflight failures is terminal evidence too;
-        # no synthetic network call should be fabricated just to collect it.
         first_key = key
     else:
         raise ValueError("collector requires calls or an explicit key with failures")
@@ -809,9 +760,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
             return completed_at, pending[future].node.vm_id
 
         completed_ordered = sorted(completed, key=completion_order)
-        # wait(FIRST_COMPLETED) may return several futures at once. Process them
-        # in completion order and stop exactly at the threshold. Leave remaining
-        # futures pending so Eventual PUT's reserved fanout is never discarded.
         for future in completed_ordered:
             call = pending.pop(future)
             owner_id = call.node.vm_id
@@ -915,8 +863,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
             break
 
     if threshold_impossible and phase not in CONTINUING_PHASES:
-        # A bounded phase may stop as soon as terminal outcomes prove the
-        # threshold impossible; no replacement owner is submitted.
         for future, call in tuple(pending.items()):
             if future.cancel():
                 failures.append(OwnerFailure(call.node.vm_id, OwnerOutcome.CANCELLED,
@@ -926,10 +872,6 @@ def collect_distinct(calls: Iterable[OwnerCall], *, owners: Iterable[Node],
         deadline_expired = True
     continuing = []
     for future, call in tuple(pending.items()):
-        # After W, Eventual PUT must preserve every reserved one-shot owner
-        # attempt through its lease/shutdown boundary. For read/Strong phases,
-        # cancel work that has not started; an in-flight RPC cannot be forcefully
-        # canceled by Future.cancel(), so expose it to the caller as continuing.
         if phase not in KEEP_AFTER_THRESHOLD and future.cancel():
             failures.append(OwnerFailure(call.node.vm_id, OwnerOutcome.CANCELLED,
                                          "collection completed before this attempt started"))

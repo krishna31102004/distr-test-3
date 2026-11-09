@@ -1,10 +1,3 @@
-"""Local SQLite store: values with versions, version allocation, and mode-transition state.
-
-One VM's durable data (WAL, synchronous=FULL). It does no replication or networking; the
-coordinators and the replica service build on it. Each operation owns a connection and a
-bounded admission slot. The process lock protects the data path's lifetime, not
-distributed GET/PUT operations.
-"""
 from contextlib import contextmanager
 import fcntl
 import math
@@ -22,7 +15,7 @@ from .models import (ConsistencyMode, Context, Version, Record, ReadResult,
 
 
 class StorageError(RuntimeError):
-    """Storage could not establish or preserve the promised local guarantees."""
+    pass
 
 
 class StaleEpochError(StorageError):
@@ -32,8 +25,6 @@ class StaleEpochError(StorageError):
 
 
 class TransitioningError(StorageError):
-    """The node is between PREPARED and ACTIVE; normal storage is fenced (KD-16)."""
-
     def __init__(self, context, phase):
         super().__init__("node is transitioning between consistency modes")
         self.context = context
@@ -41,13 +32,11 @@ class TransitioningError(StorageError):
 
 
 class TransitionRefused(StorageError):
-    """A transition request does not fit this node's durable state."""
+    pass
 
 
 @dataclass(frozen=True)
 class JournalEntry:
-    """vm01's durable record of one cluster transition it is driving."""
-
     transition_id: str
     request_id: str
     from_context: Context
@@ -56,7 +45,6 @@ class JournalEntry:
 
 
 JOURNAL_OPEN_STATES = ("PREPARING", "COMMIT_DECIDED", "GLOBAL_ACTIVE")
-# COMMIT_DECIDED can never move to an abort state: that is the irrevocability point.
 JOURNAL_MOVES = {
     "PREPARING": {"COMMIT_DECIDED", "ABORT_DECIDED"},
     "COMMIT_DECIDED": {"GLOBAL_ACTIVE"},
@@ -70,7 +58,6 @@ _JOURNAL_COLUMNS = "transition_id,request_id,from_epoch,from_mode,target_epoch,t
 
 
 def _natural(text):
-    """Decode canonical decimal metadata; never silently coerce corrupt state."""
     if not isinstance(text, str) or not re.fullmatch(r"0|[1-9][0-9]*", text):
         raise StorageError("invalid canonical decimal metadata")
     result = 0
@@ -81,7 +68,6 @@ def _natural(text):
 
 
 def _decimal(number):
-    """Encode nonnegative integers without changing Python's global digit limits."""
     chunks = []
     while number >= 10**9:
         number, remainder = divmod(number, 10**9)
@@ -101,11 +87,6 @@ def _kind(context):
 
 class Store:
     def __init__(self, path, *, bootstrap=None, vm_id="vm01", timeout=5.0, capacity=8):
-        """Open/recover explicitly; raise StorageError on invalid or locked state.
-
-        vm_id is persisted on bootstrap and checked on reopen. No existing file
-        is overwritten or initialized implicitly. Parent directory must exist.
-        """
         if not re.fullmatch(r"vm(?:0[1-9]|10)", vm_id):
             raise ValueError("invalid VM identity")
         try:
@@ -127,7 +108,6 @@ class Store:
             self._lockfile = open(str(self.path) + ".lock", "a+b")
             fcntl.flock(self._lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if bootstrap is not None:
-                # Exclusive creation also rejects empty/corrupt pre-existing files.
                 with self.path.open("xb"):
                     pass
             elif not self.path.is_file():
@@ -142,16 +122,13 @@ class Store:
                         ("last_timestamp", "0"), ("strong_counter", "0")])
                 if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                     raise StorageError("database integrity check failed")
-                self._ensure_transition_tables(db)  # additive: old databases upgrade in place
+                self._ensure_transition_tables(db)
                 metadata = dict(db.execute("SELECT name,value FROM meta"))
                 schema1 = {"schema", "vm_id", "epoch", "mode", "generation", "last_timestamp"}
                 schema2 = schema1 | {"strong_counter"}
                 if metadata.get("vm_id") != vm_id:
                     raise StorageError("invalid schema/identity metadata")
                 if metadata.get("schema") == "1" and set(metadata) == schema1:
-                    # Validate all old state before changing metadata. SQLite makes
-                    # the data-preserving schema bump and Strong high-water insert
-                    # one atomic transaction; a killed migration rolls back wholly.
                     self._context = self._read_context(db)
                     _natural(metadata["generation"])
                     _natural(metadata["last_timestamp"])
@@ -191,7 +168,6 @@ class Store:
 
     @contextmanager
     def _transaction(self, *, write=False, deadline=None):
-        """Bound admission and SQLite waits; rollback any unsuccessful operation."""
         local_deadline = time.monotonic() + self.timeout
         if deadline is not None:
             try:
@@ -220,6 +196,7 @@ class Store:
             db = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
                                  timeout=remaining, isolation_level=None)
             db.execute(f"PRAGMA busy_timeout={max(1, int(remaining * 1000))}")
+            # wal and full sync so writes survive a crash
             if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise StorageError("WAL unavailable")
             db.execute("PRAGMA synchronous=FULL")
@@ -237,7 +214,7 @@ class Store:
             db.execute("COMMIT")
         finally:
             if db is not None:
-                db.close()  # Rolls back any still-open transaction, including exceptions.
+                db.close()
             with self._condition:
                 self._active -= 1
                 self._condition.notify_all()
@@ -255,8 +232,6 @@ class Store:
         actual = self._read_context(db)
         if not isinstance(context, Context):
             raise ValueError("context must be a Context")
-        # The fence and the context check share this transaction, so a request can
-        # never slip between a transition's PREPARED record and its commit.
         open_transition = self._open_transition(db)
         if open_transition is not None:
             raise TransitioningError(actual, open_transition[6])
@@ -296,6 +271,7 @@ class Store:
                     raise ValueError("version kind disagrees with mode")
                 row = db.execute("SELECT kind,number,writer,value FROM records WHERE key=?", (key,)).fetchone()
                 previous = None if row is None else self._decode(row)
+                # only keep the write if its version is newer
                 order = 1 if previous is None else record.version.compare(previous.version)
                 status = S.INSTALLED
                 if order > 0:
@@ -322,13 +298,6 @@ class Store:
             return InstallResult(S.ERROR, None, False, self._context, str(error))
 
     def list_keys(self, *, after=None, max_keys=2000, max_bytes=128 * 1024, deadline=None):
-        """One bounded, ordered page of stored key names for `liststore`.
-
-        Returns (keys, next_cursor): `next_cursor` is the last key of this page when more
-        remain, else None; pass it back as `after`. Keys sort bytewise by UTF-8. The page
-        is one short read transaction, so printing never holds the database. A node that
-        is fenced by a mode change refuses (TransitioningError) instead of listing data
-        that is about to be cleared."""
         if after is not None:
             _key(after)
         if type(max_keys) is not int or max_keys < 1 or type(max_bytes) is not int or max_bytes < 1:
@@ -350,7 +319,6 @@ class Store:
         return keys, None
 
     def start_incarnation(self):
-        """Reserve a durable generation; caller invokes once before serving a boot."""
         try:
             with self._transaction(write=True) as db:
                 generation = _natural(db.execute("SELECT value FROM meta WHERE name='generation'").fetchone()[0]) + 1
@@ -360,7 +328,6 @@ class Store:
             raise StorageError(str(error)) from error
 
     def allocate_eventual_version(self, *, context):
-        """Reserve timestamp before publishing; epoch validation shares transaction."""
         try:
             with self._transaction(write=True) as db:
                 actual = self._check_context(db, context)
@@ -377,11 +344,6 @@ class Store:
             raise StorageError(str(error)) from error
 
     def allocate_strong_version(self, *, context, observed_max, deadline=None):
-        """Durably allocate a unique local Strong tag above query/local maxima.
-
-        The short write transaction serializes simultaneous local allocations. It
-        does not span network I/O. The committed counter survives process crashes.
-        """
         try:
             if observed_max is not None and (
                     not isinstance(observed_max, Version) or observed_max.kind != "strong"):
@@ -405,8 +367,6 @@ class Store:
             raise
         except (sqlite3.Error, StorageError, ValueError, TypeError) as error:
             raise StorageError(str(error)) from error
-
-    # -- cluster mode transitions (KD-16) ------------------------------------
 
     @staticmethod
     def _ensure_transition_tables(db):
@@ -434,19 +394,16 @@ class Store:
             Context(_natural(row[4]), ConsistencyMode(row[5])), row[6])
 
     def local_phase(self, *, deadline=None):
-        """ACTIVE when no transition is open here, else PREPARED or COMMITTED."""
         with self._transaction(deadline=deadline) as db:
             row = self._open_transition(db)
             return "ACTIVE" if row is None else row[6]
 
     def open_transition(self, *, deadline=None):
-        """The transition currently fencing this node (PREPARED or COMMITTED), or None."""
         with self._transaction(deadline=deadline) as db:
             row = self._open_transition(db)
             return None if row is None else self._transition_info(row)
 
     def transition_state(self, transition_id=None, *, deadline=None):
-        """Return the named transition (or the latest one) as TransitionInfo, or None."""
         with self._transaction(deadline=deadline) as db:
             if transition_id is None:
                 row = db.execute(f"SELECT {_TRANSITION_COLUMNS} FROM transition "
@@ -461,7 +418,6 @@ class Store:
                    "(SELECT COALESCE(MAX(seq),0) FROM transition) - ?", (TRANSITION_HISTORY,))
 
     def prepare_transition(self, info, *, deadline=None):
-        """Durably fence this node for `info`; idempotent for the same transition."""
         if not isinstance(info, TransitionInfo):
             raise ValueError("TransitionInfo required")
         with self._transaction(write=True, deadline=deadline) as db:
@@ -491,7 +447,6 @@ class Store:
         return "PREPARED"
 
     def commit_transition(self, transition_id, *, deadline=None):
-        """Apply the clear-or-retain action and the new context in ONE transaction."""
         with self._transaction(write=True, deadline=deadline) as db:
             row = db.execute(f"SELECT {_TRANSITION_COLUMNS} FROM transition WHERE transition_id=?",
                              (transition_id,)).fetchone()
@@ -518,7 +473,6 @@ class Store:
         return "COMMITTED"
 
     def activate_transition(self, transition_id, *, deadline=None):
-        """Reopen normal storage once the matching global decision has been verified."""
         with self._transaction(write=True, deadline=deadline) as db:
             row = db.execute(f"SELECT {_TRANSITION_COLUMNS} FROM transition WHERE transition_id=?",
                              (transition_id,)).fetchone()
@@ -535,16 +489,13 @@ class Store:
         return "ACTIVE"
 
     def abort_transition(self, transition_id, *, deadline=None):
-        """Resume the old mode; only a PREPARED (or unknown) transition can abort."""
         with self._transaction(write=True, deadline=deadline) as db:
             row = db.execute(f"SELECT {_TRANSITION_COLUMNS} FROM transition WHERE transition_id=?",
                              (transition_id,)).fetchone()
             if row is None:
                 if self._open_transition(db) is not None:
-                    # A stray abort must not shadow the transition that fences this node.
                     raise TransitionRefused("another transition is open here; "
                                             "cannot record an unrelated abort")
-                # A tombstone, so a delayed PREPARE for this ID is refused later.
                 actual = self._read_context(db)
                 other = (ConsistencyMode.EVENTUAL_NO_RR if actual.mode == ConsistencyMode.STRONG
                          else ConsistencyMode.STRONG)
@@ -565,7 +516,6 @@ class Store:
         return "ABORTED"
 
     def allocate_transition_epoch(self, *, deadline=None):
-        """Burn and return an epoch above the durable high-water mark and the active epoch."""
         with self._transaction(write=True, deadline=deadline) as db:
             actual = self._read_context(db)
             row = db.execute("SELECT value FROM authority WHERE name='epoch_high_water'").fetchone()
@@ -582,7 +532,6 @@ class Store:
                             Context(_natural(row[4]), ConsistencyMode(row[5])), row[6])
 
     def journal_open(self, *, deadline=None):
-        """vm01's unfinished transition, if any."""
         marks = ",".join("?" * len(JOURNAL_OPEN_STATES))
         with self._transaction(deadline=deadline) as db:
             row = db.execute(f"SELECT {_JOURNAL_COLUMNS} FROM controller_journal "
@@ -598,7 +547,6 @@ class Store:
 
     def journal_start(self, transition_id, request_id, from_context, target_context, *,
                       deadline=None):
-        """Record a new PREPARING transition; only one may be open at a time."""
         marks = ",".join("?" * len(JOURNAL_OPEN_STATES))
         with self._transaction(write=True, deadline=deadline) as db:
             if db.execute(f"SELECT 1 FROM controller_journal WHERE state IN ({marks})",
@@ -613,7 +561,6 @@ class Store:
                        "(SELECT MAX(seq) FROM controller_journal) - ?", (TRANSITION_HISTORY,))
 
     def journal_advance(self, transition_id, new_state, *, deadline=None):
-        """Move the journal forward along the only legal path; repeating a state is a no-op."""
         with self._transaction(write=True, deadline=deadline) as db:
             row = db.execute("SELECT state FROM controller_journal WHERE transition_id=?",
                              (transition_id,)).fetchone()
@@ -628,7 +575,6 @@ class Store:
         return new_state
 
     def close(self):
-        """Stop admission, wait for bounded accepted operations, release path lock."""
         with self._condition:
             self._closed = True
             self._condition.notify_all()
@@ -646,5 +592,4 @@ class Store:
 
 
 def open_store(path, *, bootstrap=None, vm_id="vm01", timeout=5.0, capacity=8):
-    """Explicit local store factory; additional identity/budget args are local settings."""
     return Store(path, bootstrap=bootstrap, vm_id=vm_id, timeout=timeout, capacity=capacity)

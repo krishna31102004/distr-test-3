@@ -1,5 +1,3 @@
-"""Bounded TCP service for one local read or conditional replica installation."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -28,19 +26,11 @@ DEFAULT_OVERLOAD_REPLY_TIMEOUT = 0.25
 
 @dataclass(frozen=True)
 class ShutdownReport:
-    """Summary of the bounded service shutdown and any incomplete requests."""
-
     incomplete_requests: int
     workers_joined: bool
 
 
 class ReplicaService:
-    """Serve validated READ_LOCAL and INSTALL_IF_NEWER RPCs over TCP.
-
-    The fixed worker count and bounded queue limit active/queued request handlers.
-    No consistency coordinator, quorum, repair, or client-facing CLI logic lives here.
-    """
-
     def __init__(self, store, manifest: Manifest, membership: MembershipTable, *,
                  workers: int = DEFAULT_REPLICA_WORKERS,
                  max_pending: int = DEFAULT_REPLICA_QUEUE,
@@ -95,14 +85,12 @@ class ReplicaService:
 
     @property
     def address(self) -> tuple[str, int]:
-        """Return the bound address; useful when a test binds port zero."""
         if self._listener is None:
             raise RuntimeError("replica service has not started")
         address = self._listener.getsockname()
         return address[0], address[1]
 
     def start(self) -> None:
-        """Bind the manifest KV endpoint only after restart generation is ready."""
         if self._started or self._stopped:
             raise RuntimeError("replica service may start once")
         self.membership.local_generation
@@ -160,8 +148,6 @@ class ReplicaService:
             try:
                 self._queue.put_nowait((connection, request_deadline))
             except queue.Full:
-                # A bounded fast rejection path preserves an explicit OVERLOADED
-                # result for well-formed callers without creating another worker pool.
                 try:
                     self._reply_overloaded(connection,
                                            min(request_deadline,
@@ -174,8 +160,6 @@ class ReplicaService:
             try:
                 item = self._queue.get(timeout=0.1)
             except queue.Empty:
-                # Shutdown is signaled out of band so every idle worker can wake
-                # even when the bounded queue is smaller than the worker pool.
                 if self._stop.is_set():
                     return
                 continue
@@ -186,8 +170,6 @@ class ReplicaService:
             try:
                 self._handle(connection, deadline)
             except Exception:
-                # A bug in one request must not silently shrink the fixed pool.
-                # The accepted connection and queue accounting are still released.
                 if self.logger is not None:
                     try:
                         self.logger.exception(
@@ -206,8 +188,6 @@ class ReplicaService:
         try:
             connection.close()
         except OSError:
-            # Closing a reset peer can report a socket error; it must not leak
-            # admission accounting or terminate a fixed worker.
             pass
         finally:
             with self._condition:
@@ -241,7 +221,6 @@ class ReplicaService:
             response = self._error_response(request, "OVERLOADED")
             send_response(connection, response, self.manifest, deadline=deadline)
         except (OSError, TimeoutError, ValueError, TypeError, RuntimeError):
-            # A malformed/slow overload request has no trustworthy reply identity.
             return
 
     def _validate_identity(self, request: ReplicaRequest) -> str | None:
@@ -270,7 +249,6 @@ class ReplicaService:
         if (sender is None or sender.restart_generation == 0
                 or request.sender_generation != sender.restart_generation):
             return "INVALID_REQUEST"
-        # SUSPECTED is not an identity change: a matching generation remains valid.
         return None
 
     def _emit(self, request: ReplicaRequest, phase: str) -> None:
@@ -315,7 +293,6 @@ class ReplicaService:
                     op=request.op, phase=request.phase, status=RpcStatus.STALE_EPOCH,
                     present=False, durable=False, error="STALE_EPOCH")
             if result.status == LocalStatus.TRANSITIONING:
-                # Fenced mid mode change: an explicit non-qualifying reply, never NOT_FOUND.
                 return self._error_response(request, "TRANSITIONING")
             return self._error_response(request, "STORAGE_ERROR")
 
@@ -359,12 +336,9 @@ class ReplicaService:
                 send_response(connection, response, self.manifest, deadline=deadline)
                 self._emit(request, "responded")
         except (OSError, TimeoutError, RpcProtocolError, ValueError, TypeError, RuntimeError):
-            # Invalid framing/metadata is closed; no operation is dispatched until
-            # complete request validation and exact-body checks have succeeded.
             return
 
     def stop(self, *, timeout: float | None = None) -> ShutdownReport:
-        """Stop admission and drain accepted work; bound forced shutdown explicitly."""
         if (self._stopped and self._last_shutdown.workers_joined
                 and self._last_shutdown.incomplete_requests == 0):
             return self._last_shutdown
@@ -397,8 +371,6 @@ class ReplicaService:
             incomplete = self._outstanding
 
         if incomplete:
-            # Drop only accepted-but-unstarted work after an explicit forced stop;
-            # every dropped request is counted in the report.
             while True:
                 try:
                     item = self._queue.get_nowait()
@@ -409,9 +381,6 @@ class ReplicaService:
                     self._finish(connection)
                 self._queue.task_done()
 
-            # Queued sockets were closed by _finish above. Shutdown the remaining
-            # active sockets to interrupt bounded network IO; each worker remains
-            # their sole owner for final close/accounting in its finally block.
             with self._condition:
                 active_connections = tuple(self._connections)
             for connection in active_connections:

@@ -1,5 +1,3 @@
-"""Shared domain types: modes, versions, records, contexts and storage results (KD-06/10)."""
-
 from dataclasses import dataclass
 from enum import Enum
 
@@ -45,7 +43,6 @@ class Version:
             raise ValueError("invalid writer identity")
 
     def compare(self, other: "Version") -> int:
-        """Compare within one kind; callers separately validate mode/epoch."""
         if not isinstance(other, Version) or self.kind != other.kind:
             raise ValueError("cannot compare different version kinds")
         left, right = (self.number, self.writer_id), (other.number, other.writer_id)
@@ -78,15 +75,11 @@ class LocalStatus(str, Enum):
 
 
 def mode_change_clears_data(source: "ConsistencyMode", target: "ConsistencyMode") -> bool:
-    """Strong <-> Eventual clears all values and version metadata (SPEC); the two
-    Eventual modes keep them (the approved KD-16 choice)."""
     return (source == ConsistencyMode.STRONG) != (target == ConsistencyMode.STRONG)
 
 
 @dataclass(frozen=True)
 class TransitionInfo:
-    """One node's record of a cluster-wide mode change (KD-16)."""
-
     transition_id: str
     coordinator: str
     from_context: "Context"

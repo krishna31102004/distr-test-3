@@ -1,5 +1,3 @@
-"""Eventual-noRR and Eventual-RR client coordination on the bounded MP3 runtime (KD-12/13)."""
-
 from __future__ import annotations
 
 from concurrent.futures import Future, InvalidStateError, wait
@@ -46,8 +44,6 @@ class PropagationSnapshot:
 
 
 class _ForegroundTransition:
-    """Serialize the one transition from client foreground to lease continuation."""
-
     def __init__(self, lease):
         self.lease = lease
         self._lock = threading.Lock()
@@ -61,7 +57,6 @@ class _ForegroundTransition:
             return self._deadline
 
     def begin_dispatch(self) -> bool:
-        """Atomically fence the first fanout against a foreground timeout."""
         with self._lock:
             if self._deadline is not None and not self._dispatch_started:
                 return False
@@ -75,8 +70,6 @@ class _ForegroundTransition:
 
 
 class PropagationHandle:
-    """Bounded, callback-updated view of one operation's five reserved attempts."""
-
     def __init__(self, operation_id: str, owners, manifest):
         self.operation_id = operation_id
         self._manifest = manifest
@@ -87,7 +80,6 @@ class PropagationHandle:
         self._dispatching = set()
 
     def mark_dispatching(self, owner_id: str) -> None:
-        """Conservatively fence timeout uncertainty before executor submission."""
         with self._lock:
             if owner_id not in self._rows or owner_id in self._futures:
                 raise RuntimeError("invalid propagation dispatch transition")
@@ -172,8 +164,6 @@ class PropagationHandle:
                                 outcome.completion_unknown, response.error)
 
     def snapshot(self) -> PropagationSnapshot:
-        # Poll completed Futures to cover the callback-registration race without
-        # a monitor thread. A snapshot never waits for unfinished owner work.
         with self._lock:
             futures = tuple(self._futures.items())
         for owner_id, future in futures:
@@ -201,12 +191,6 @@ class PropagationHandle:
 
 
 class EventualNoRRCoordinator:
-    """Run first-R Eventual reads and bounded five-owner Eventual writes.
-
-    `EventualRRCoordinator` subclasses this: PUT is identical, only the mode, the
-    schema activation it needs and the GET path differ.
-    """
-
     MODE = ConsistencyMode.EVENTUAL_NO_RR
     MODE_ERROR = "Eventual-noRR operation requires eventual-noRR mode"
     GATE_ERROR = "SCHEMA2_DISABLED"
@@ -528,23 +512,17 @@ class EventualNoRRCoordinator:
                               propagation, error)
 
 
-# ---------------------------------------------------------------------------
-# Eventual-RR (KD-13): first-R client reply, bounded comparison, one repair pass
-# ---------------------------------------------------------------------------
-
 RR_READ_PHASE = "eventual_rr_read"
 RR_REPAIR_PHASE = "eventual_rr_repair"
-RR_READ_LIFETIME_SECONDS = 15.0       # read lease hard cap from admission
-RR_READ_CONTINUATION_SECONDS = 10.0   # read window that follows the client reply
-RR_REPAIR_SECONDS = 5.0               # repair pass budget
-RR_TOTAL_LIFETIME_SECONDS = 20.0      # nothing runs past admission + 20 s
-RR_SETTLE_SECONDS = 1.0               # grace for lease-aware workers to exit
+RR_READ_LIFETIME_SECONDS = 15.0
+RR_READ_CONTINUATION_SECONDS = 10.0
+RR_REPAIR_SECONDS = 5.0
+RR_TOTAL_LIFETIME_SECONDS = 20.0
+RR_SETTLE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
 class ReadEvidence:
-    """One owner's read: a valid reply (outcome None) or why none is usable."""
-
     owner_id: str
     generation: int | None
     outcome: OwnerOutcome | None
@@ -576,8 +554,6 @@ class RepairResult:
 
 @dataclass(frozen=True)
 class ReadRepairReport:
-    """Final evidence for one Eventual-RR GET; carries digests, never value bytes."""
-
     operation_id: str
     returned_status: OperationStatus | None
     returned_version: Version | None
@@ -593,8 +569,6 @@ class ReadRepairReport:
 
 
 class ReadRepairHandle:
-    """Completion view of one RR GET's background comparison and repair."""
-
     def __init__(self, operation_id: str):
         self.operation_id = operation_id
         self._done = threading.Event()
@@ -603,7 +577,6 @@ class ReadRepairHandle:
         self._report: ReadRepairReport | None = None
 
     def claim(self) -> bool:
-        """Take the single right to log and finish this operation's report."""
         with self._lock:
             if self._claimed:
                 return False
@@ -620,7 +593,6 @@ class ReadRepairHandle:
         return self._done.is_set()
 
     def wait(self, timeout: float | None = None) -> ReadRepairReport | None:
-        """Return the final report, or None if it is not ready within `timeout`."""
         if timeout is not None and (type(timeout) not in (int, float)
                                     or not math.isfinite(timeout) or timeout < 0):
             raise ValueError("timeout must be finite and nonnegative")
@@ -634,8 +606,6 @@ def _version_text(version: Version | None) -> str | None:
 
 
 class EventualRRCoordinator(EventualNoRRCoordinator):
-    """Eventual-RR: PUT is the Eventual PUT; GET replies after R then repairs once."""
-
     MODE = ConsistencyMode.EVENTUAL_RR
     MODE_ERROR = "Eventual-RR operation requires eventual-RR mode"
     GATE_ERROR = "SCHEMA3_DISABLED"
@@ -644,11 +614,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
         return self.runtime.rr_activation
 
     def eventual_get(self, key: str, *, deadline: float) -> ProtocolResult:
-        """Return the newest of the first R replies; compare and repair in the background.
-
-        The result's `propagation` is a `ReadRepairHandle` whose `wait()` gives the
-        final report. The client result is frozen when R replies arrive.
-        """
         operation_id = new_operation_id()
         invalid = self._validate_key(key, operation_id)
         if invalid:
@@ -661,7 +626,7 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             return failure
         handle = ReadRepairHandle(operation_id)
         foreground: Future = Future()
-        admitted_at = time.monotonic()  # every RR time limit counts from admission
+        admitted_at = time.monotonic()
         try:
             future = self.runtime.submit_coordinator(
                 self._run_rr_get, key, deadline, self.read_quorum, foreground, handle,
@@ -673,8 +638,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
                                 error="coordinator capacity unavailable")
 
         def settle(done: Future) -> None:
-            # The task normally settles the client result itself; this covers a task
-            # that was cancelled or died before it could.
             if foreground.done():
                 return
             reason = "coordinator canceled" if done.cancelled() else (
@@ -695,12 +658,9 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             return self._result(OperationStatus.TIMEOUT, operation_id, propagation=handle,
                                 error="Eventual-RR GET deadline expired")
 
-    # -- coordinator task ---------------------------------------------------
-
     def _run_rr_get(self, admission: "CoordinatorAdmission", key: str, deadline: float,
                     required: int, foreground: Future, handle: ReadRepairHandle,
                     admitted_at: float) -> None:
-        """Foreground half: five reads, reply after R. The rest runs on the background pool."""
         operation_id, context = admission.operation_id, admission.context
         started = time.monotonic()
 
@@ -768,7 +728,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
                 context=context, deadline=min(deadline, lease.foreground_deadline),
                 preflight_failures=preflight, key=key)
             if not collection.reached:
-                # R is out of reach: stop the unused reads and schedule no repair.
                 self._stop_reads(lease, calls)
                 give_up(self._failure_status(collection),
                         "R replies were not reached; no repair scheduled",
@@ -791,7 +750,7 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
                                        value=returned.value, version=returned.version,
                                        owners=owner_ids, propagation=handle)
             lease.finish_foreground(min(time.monotonic(), lease.foreground_deadline))
-            settle(outcome)  # the client result is frozen from here on
+            settle(outcome)
             client = outcome
         except Exception as error:
             give_up(OperationStatus.ERROR, f"internal error: {type(error).__name__}",
@@ -804,7 +763,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
 
     def _hand_off(self, context, key, owners, calls, preflight, lease, client, handle,
                   admitted_at) -> None:
-        """Give the comparison and repair to the bounded background pool, not a worker."""
         resources = self.runtime.coordinator_resources
         future = None
         try:
@@ -823,7 +781,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             return
 
         def abandoned(done: Future) -> None:
-            # A queued comparison dropped at shutdown must still finish its report.
             if done.cancelled():
                 self._stop_reads(lease, calls)
                 self._finish_report(handle, key, ReadRepairReport(
@@ -849,7 +806,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
 
     @staticmethod
     def _returned_record(collection):
-        """Maximum FOUND record among the first R replies; None if all absent; False on conflict."""
         records = [Record(reply.response.version, reply.response.value)
                    for reply in collection.qualifying
                    if reply.response.status == RpcStatus.FOUND]
@@ -863,8 +819,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             if order > 0:
                 maximum = record
         return maximum
-
-    # -- evidence -----------------------------------------------------------
 
     @staticmethod
     def _failed_read(failure: OwnerFailure) -> ReadEvidence:
@@ -918,16 +872,13 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
         rows.extend(self._failed_read(failure) for failure in preflight)
         return rows
 
-    # -- comparison and the single repair pass ------------------------------
-
     def _compare_and_repair(self, context, key, owners, calls, preflight, lease, client,
                             handle, admitted_at) -> None:
         operation_id = handle.operation_id
         futures = [call.future for call in calls]
-        # Window: until every read is terminal or the read cutoff (<= admission + 15 s).
         wait(futures, timeout=max(0.0, lease.current_deadline() - time.monotonic()))
         for future in futures:
-            future.cancel()  # a read still queued at the cutoff never starts
+            future.cancel()
         wait(futures, timeout=RR_SETTLE_SECONDS)
         gathered = [self._read_evidence(call) for call in calls]
         replies = [row for row, _value in gathered]
@@ -948,11 +899,11 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
                 best_row, best_value = row, value
         maximum = None if best_row is None else best_row.version
         if conflict:
-            # Two different values share one version: which is right is unknowable.
             self._finish_report(handle, key, ReadRepairReport(
                 operation_id, client.status, client.version, tuple(replies), maximum, (),
                 conflict=True, incomplete_reason="conflicting bytes for one version; no repair"))
             return
+        # repair replicas that are missing the max version
         targets = []
         if maximum is not None:
             for row, _value in gathered:
@@ -968,7 +919,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             tuple(repairs)))
 
     def _repair(self, context, operation_id, key, targets, version, value, admitted_at):
-        """Send one conditional install to each stale or missing reachable owner."""
         if not targets:
             return []
 
@@ -982,7 +932,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
             return skipped("node is not accepting work")
         if current != context:
             return skipped("mode or epoch changed after the read")
-        # Everything, including the settle wait below, ends by admission + 20 s.
         window = min(RR_REPAIR_SECONDS, admitted_at + RR_TOTAL_LIFETIME_SECONDS
                      - time.monotonic() - RR_SETTLE_SECONDS)
         if window <= 0.05:
@@ -1003,7 +952,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
         try:
             for owner in targets:
                 try:
-                    # No coordinator admission is held here; the lease bounds the call.
                     calls.append(self.runtime.dispatch_owner(
                         owner, RpcOperation.INSTALL_IF_NEWER, key,
                         deadline=lease.hard_deadline, reservation=reservation,
@@ -1056,7 +1004,6 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
         if (response.status == RpcStatus.SUPERSEDED and response.durable
                 and response.stored_version is not None
                 and response.stored_version.compare(version) > 0):
-            # A newer write won. Its bytes are not in this reply, so nothing is propagated.
             return RepairResult(owner, RepairStatus.SUPERSEDED_NEWER, version,
                                 response.stored_version)
         return failed(response.error or response.status.value)
@@ -1066,7 +1013,7 @@ class EventualRRCoordinator(EventualNoRRCoordinator):
         if not handle.claim():
             return
         try:
-            self._log_report(key, report)  # logged before waiters are released
+            self._log_report(key, report)
         finally:
             handle.finish(report)
 

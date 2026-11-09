@@ -1,17 +1,14 @@
 import time
 import threading
 
-# Membership states used by every node.
 ALIVE = "ALIVE"
 SUSPECTED = "SUSPECTED"
 FAILED = "FAILED"
 LEFT = "LEFT"
 TERMINAL = (FAILED, LEFT)
-# Timeouts for plain Gossip and Gossip+Suspicion.
 PLAIN_FAILURE_TIMEOUT = 2.5
 SUSPECT_TIMEOUT = 1.0
 CONFIRM_TIMEOUT = 1.5
-# Stores the state we track for one member.
 
 
 class Entry:
@@ -31,7 +28,6 @@ class Entry:
             "incarnation": self.incarnation,
             "status": self.status
         }
-# Shared membership state protected by a lock.
 
 
 class MembershipList:
@@ -44,13 +40,11 @@ class MembershipList:
         self.suspicion_enabled = False
         self.drop_rate = 0.0
         self._on_event = on_event or (lambda msg: None)
-    # Update this node's heartbeat before each gossip round.
     def tick_heartbeat(self):
         with self._lock:
             e = self._entries[self.self_id]
             e.heartbeat += 1
             e.last_updated = time.time()
-    # Build the full membership list sent in gossip.
     def snapshot(self):
         with self._lock:
             return [e.to_dict() for e in self._entries.values()]
@@ -64,7 +58,7 @@ class MembershipList:
 
     def all_known_peers(self):
         with self._lock:
-            return [nid for nid in self._entries if nid != self.self_id]  #only consider existing members
+            return [nid for nid in self._entries if nid != self.self_id]
 
     def mark_self_left(self):
         with self._lock:
@@ -78,7 +72,6 @@ class MembershipList:
     def set_drop_rate(self, rate):
         with self._lock:
             self.drop_rate = rate
-    # Merge an incoming membership view into the local one.
     def merge(self, incoming_entries):
         self_refuted = False
         with self._lock:
@@ -136,7 +129,6 @@ class MembershipList:
                             f"LEFT {nid} (communicated via gossip)"
                         )
         return self_refuted
-    # Decide whether incoming data is newer than our local copy.
     def _incoming_wins(self, existing, incoming):
         if existing.status in TERMINAL:
             return False
@@ -151,7 +143,6 @@ class MembershipList:
         if incoming["heartbeat"] != existing.heartbeat:
             return incoming["heartbeat"] > existing.heartbeat
         return False
-    # Move stale members through suspicion or failure states.
     def run_timeout_check(self):
         with self._lock:
             now = time.time()
@@ -186,7 +177,6 @@ class MembershipList:
     def get_suspects_log(self):
         with self._lock:
             return list(self._suspects_log)
-    # Return only members that are still part of the group.
     def list_mem(self):
         with self._lock:
             return [

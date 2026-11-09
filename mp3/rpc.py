@@ -1,5 +1,3 @@
-"""C5 single-replica KV RPC schema, bounded wire codec, and client primitive."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,8 +25,6 @@ RR_SCHEMA_VERSION = 3
 MAX_JSON_BYTES = 16_384
 MAX_RPC_PAYLOAD = 4 + MAX_JSON_BYTES + MAX_VALUE_BYTES
 MAX_ERROR_BYTES = 1_024
-# Python's socket timeout conversion is platform-bounded; no assignment RPC
-# should have a remotely scheduled lifetime measured in decades.
 MAX_SOCKET_TIMEOUT_SECONDS = 2**31 - 1
 _VM_ID = re.compile(r"vm(?:0[1-9]|10)\Z")
 _MANIFEST_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -37,7 +33,7 @@ _WRITER_ID = re.compile(r"(vm(?:0[1-9]|10))/(0|[1-9][0-9]*)\Z")
 
 
 class RpcProtocolError(ValueError):
-    """Wire data violates the approved C5 schema or request binding."""
+    pass
 
 
 class RpcOperation(str, Enum):
@@ -68,7 +64,6 @@ class RpcOutcomeKind(str, Enum):
 
 PROTOCOL_PHASES = frozenset({"strong_query", "strong_write", "strong_readback",
                              "eventual_read", "eventual_put"})
-# Schema 3 (KD-13): Eventual-RR read, the existing Eventual PUT fanout, and repair.
 RR_PHASES = frozenset({"eventual_put", "eventual_rr_read", "eventual_rr_repair"})
 SUPPORTED_SCHEMAS = (SCHEMA_VERSION, PROTOCOL_SCHEMA_VERSION, RR_SCHEMA_VERSION)
 
@@ -133,8 +128,6 @@ def _validate_vm_id(value: object, name: str) -> str:
 def _parse_decimal(value: object, name: str) -> int:
     if not isinstance(value, str) or _DECIMAL.fullmatch(value) is None:
         raise RpcProtocolError(f"{name} must be a canonical nonnegative decimal string")
-    # Chunk parsing avoids Python's global decimal digit limit while the enclosing
-    # 16 KiB metadata cap remains the hard input bound.
     number = 0
     for start in range(0, len(value), 9):
         chunk = value[start:start + 9]
@@ -240,8 +233,6 @@ def _status(value: object) -> RpcStatus:
 
 @dataclass(frozen=True)
 class ReplicaRequest:
-    """One local replica request; `value` is the raw body, not JSON data."""
-
     request_id: str
     manifest_id: str
     sender_id: str
@@ -375,8 +366,6 @@ class ReplicaRequest:
 
 @dataclass(frozen=True)
 class ReplicaResponse:
-    """One replica response; body bytes are present only for READ_LOCAL FOUND."""
-
     request_id: str
     manifest_id: str
     sender_id: str
@@ -469,7 +458,6 @@ class ReplicaResponse:
 
     def validate_for(self, request: ReplicaRequest, target: Node, manifest: Manifest,
                      expected_generation: int) -> None:
-        """Bind this response to the exact request and dispatch-time replica generation."""
         if (self.schema != request.schema or self.request_id != request.request_id
                 or self.operation_id != request.operation_id):
             raise RpcProtocolError("response schema or request_id mismatch")
@@ -569,8 +557,6 @@ class ReplicaResponse:
 
 @dataclass(frozen=True)
 class RpcOutcome:
-    """Transport result; a valid replica response may itself report an operation error."""
-
     kind: RpcOutcomeKind
     response: ReplicaResponse | None = None
     error: str | None = None
@@ -578,7 +564,6 @@ class RpcOutcome:
 
 
 def new_operation_id() -> str:
-    """Create a canonical lowercase UUID4 for one logical client operation."""
     return str(uuid.uuid4())
 
 
@@ -587,7 +572,6 @@ def new_request(*, manifest: Manifest, sender_id: str, sender_generation: int,
                 key: str, version: Version | None = None, value: bytes = b"",
                 phase: str = "local", schema: int = SCHEMA_VERSION,
                 operation_id: str | None = None) -> ReplicaRequest:
-    """Create a fresh per-RPC request ID; schema 2 callers reuse their operation ID."""
     if schema != SCHEMA_VERSION and operation_id is None:
         operation_id = new_operation_id()
     request = ReplicaRequest(
@@ -624,7 +608,6 @@ def encode_response(response: ReplicaResponse, manifest: Manifest) -> bytes:
 
 
 def _recv_payload(sock: socket.socket, *, deadline: float) -> tuple[dict, bytes]:
-    """Read outer and JSON lengths first; reject caps before reading a value body."""
     outer_header = recv_exact_deadline(sock, HEADER.size, deadline=deadline)
     (outer_len,) = HEADER.unpack(outer_header)
     if outer_len < HEADER.size or outer_len > MAX_RPC_PAYLOAD:
@@ -646,7 +629,6 @@ def _recv_payload(sock: socket.socket, *, deadline: float) -> tuple[dict, bytes]
 
 
 def _require_eof(sock: socket.socket, *, deadline: float) -> None:
-    """Enforce one message per connection and reject extra frames or trailing bytes."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("operation deadline expired while checking connection end")
@@ -693,7 +675,6 @@ def _request_error(kind: RpcOutcomeKind, error: BaseException | str, *,
 
 
 def _lease_wait(sock: socket.socket, event: int, lease: AttemptLease) -> None:
-    """Wait for socket readiness while observing lease changes at <=50ms."""
     with selectors.DefaultSelector() as selector:
         selector.register(sock, event)
         while True:
@@ -788,8 +769,6 @@ def _lease_receive_response(sock: socket.socket, manifest: Manifest,
 
 
 class ReplicaClient:
-    """Bounded-deadline client for exactly one replica RPC; never retries automatically."""
-
     def __init__(self, manifest: Manifest, membership: MembershipTable, *,
                  protocol_activation=None, rr_activation=None):
         if not isinstance(manifest, Manifest) or not isinstance(membership, MembershipTable):
@@ -800,9 +779,6 @@ class ReplicaClient:
         self.membership = membership
         self.protocol_activation = protocol_activation
         self.rr_activation = rr_activation
-        # Resolve the fixed manifest once during client setup. Per-operation calls
-        # then contain no blocking DNS lookup and can share one deadline across all
-        # numeric connect candidates. Resolution errors are returned per target.
         self._addresses = {}
         for node in manifest.nodes:
             try:
@@ -815,7 +791,6 @@ class ReplicaClient:
                 self._addresses[node.vm_id] = error
 
     def _connect(self, target: Node, *, deadline: float) -> socket.socket:
-        """Connect to cached numeric addresses, spending only remaining time."""
         addresses = self._addresses[target.vm_id]
         if isinstance(addresses, OSError):
             raise OSError(f"could not resolve KV endpoint for {target.vm_id}: {addresses}")
@@ -842,7 +817,6 @@ class ReplicaClient:
     def _call_replica_with_lease(self, target: Node, request: ReplicaRequest,
                                  payload: bytes, expected_generation: int,
                                  lease: AttemptLease) -> RpcOutcome:
-        """Run one Eventual PUT RPC against the lease's mutable deadline."""
         addresses = self._addresses[target.vm_id]
         if isinstance(addresses, OSError):
             return _request_error(RpcOutcomeKind.UNREACHABLE, addresses)
@@ -862,7 +836,6 @@ class ReplicaClient:
             connection.shutdown(socket.SHUT_WR)
             response = _lease_receive_response(connection, self.manifest, lease)
             response.validate_for(request, target, self.manifest, expected_generation)
-            # Decoding and evidence validation are part of the attempt lifetime.
             lease.check()
             if response.status == RpcStatus.ERROR and response.error.startswith("OVERLOADED"):
                 return RpcOutcome(RpcOutcomeKind.OVERLOADED, response, response.error)
@@ -899,7 +872,6 @@ class ReplicaClient:
     def call_replica(self, target: Node, request: ReplicaRequest, *, deadline: float,
                      expected_target_generation: int | None = None,
                      attempt_lease: AttemptLease | None = None) -> RpcOutcome:
-        """Send one request, enforce its absolute deadline, and bind one response."""
         if type(deadline) not in (int, float):
             return _request_error(RpcOutcomeKind.ERROR,
                                   "deadline must be a finite monotonic timestamp")
@@ -916,7 +888,6 @@ class ReplicaClient:
             schema2_put = (request.schema == PROTOCOL_SCHEMA_VERSION
                            and request.phase == "eventual_put"
                            and request.op == RpcOperation.INSTALL_IF_NEWER)
-            # Schema 3 lets Eventual-RR leases cover its PUT, read and repair phases.
             schema3_rr = (request.schema == RR_SCHEMA_VERSION
                           and request.phase in RR_PHASES)
             if (not isinstance(attempt_lease, AttemptLease)

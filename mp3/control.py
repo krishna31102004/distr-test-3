@@ -1,13 +1,3 @@
-"""Bounded control-plane service and client for user commands (KD-14, Step 4A).
-
-One long-running `NodeRuntime` owns the Store and services. A short-lived CLI process
-sends one strict control request to its local node's `control` endpoint; the node runs
-the operation with its coordinators and replies once. The wire layout reuses the
-bounded RPC framing: outer length, JSON length, strict JSON metadata, raw value body.
-Duplicate suppression is in memory only (approved KD-14 change): a node never
-replays an uncertain operation after a crash, and no exactly-once claim is made.
-"""
-
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -28,7 +18,6 @@ from .framing import HEADER, send_all_deadline
 from .models import ConsistencyMode, Version
 from .replica import ShutdownReport
 from .ring import Manifest, key_position, ring_id_hex
-# Control messages share the RPC codec helpers so caps and strict-JSON rules stay identical.
 from .rpc import (
     MAX_ERROR_BYTES, RpcOperation, RpcOutcomeKind, RpcProtocolError, RpcStatus,
     _encode_payload, _recv_payload, _require_eof, _validate_request_id, _validate_vm_id,
@@ -41,7 +30,6 @@ CONTROL_SCHEMA = 1
 COMMANDS = frozenset({"put", "get", "status", "mode", "tx_prepare", "tx_commit",
                       "tx_activate", "tx_abort", "tx_status", "liststore", "list_mem_ids",
                       "read_replica", "multiput", "mp_arm", "mp_go", "mp_abort", "mp_status"})
-# Commands whose JSON body carries the arguments; `key` names the key being worked on.
 PAYLOAD_COMMANDS = frozenset({"read_replica", "multiput", "mp_arm", "mp_go", "mp_abort",
                               "mp_status"})
 MULTIPUT_COMMANDS = frozenset({"mp_arm", "mp_go", "mp_abort", "mp_status"})
@@ -49,26 +37,21 @@ ADMIN_COMMANDS = frozenset({"liststore", "list_mem_ids", "read_replica", "multip
                            | MULTIPUT_COMMANDS)
 TRANSITION_COMMANDS = frozenset({"tx_prepare", "tx_commit", "tx_activate", "tx_abort",
                                  "tx_status"})
-MAX_PAYLOAD_BYTES = 2048   # the JSON body of a tx_prepare message
+MAX_PAYLOAD_BYTES = 2048
 MAX_DETAIL_BYTES = 8192
-MAX_CURSOR_BYTES = 65536   # the liststore cursor travels in the body, not the 16 KiB metadata
-MULTIPUT_MIN_BUDGET = 6.0  # least request time worth starting a multiput with
+MAX_CURSOR_BYTES = 65536
+MULTIPUT_MIN_BUDGET = 6.0
 MAX_KEY_BYTES = 4096
 DEFAULT_CONTROL_WORKERS = 8
 DEFAULT_CONTROL_QUEUE = 16
 DEFAULT_CONTROL_REQUEST_TIMEOUT = 50.0
 DEFAULT_COMMAND_TIMEOUT = 10.0
 DEFAULT_CLIENT_TIMEOUT = 25.0
-MODE_CLIENT_TIMEOUT = 55.0   # a mode change may take its full 30 s budget plus forwarding
+MODE_CLIENT_TIMEOUT = 55.0
 DEFAULT_OVERLOAD_REPLY_TIMEOUT = 0.25
 MAX_REMEMBERED_COMMANDS = 256
-# Mode changes and multiputs wait on the cluster for many seconds, so only a few may hold
-# control workers at once; the rest get BUSY and node-to-node messages always get through.
 MAX_CONCURRENT_LONG_REQUESTS = 3
-# getfromreplica can wait ~10 s on a dead replica; bound it so it cannot fill the workers.
 MAX_CONCURRENT_REPLICA_READS = 3
-# Time kept free at the end of a request's lifetime so the reply can still be sent,
-# and the least time an Eventual PUT needs (its foreground window is 5 seconds).
 REPLY_MARGIN_SECONDS = 1.0
 EVENTUAL_PUT_BUDGET_SECONDS = 5.5
 NOT_STARTED_ERROR = "request time ran out before the command started"
@@ -78,7 +61,7 @@ _KEY_ID = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class ControlError(RuntimeError):
-    """The control endpoint was unreachable, slow, or sent an invalid reply."""
+    pass
 
 
 class ControlStatus(str, Enum):
@@ -87,9 +70,9 @@ class ControlStatus(str, Enum):
     TIMEOUT = "TIMEOUT"
     ERROR = "ERROR"
     OVERLOADED = "OVERLOADED"
-    NO_CHANGE = "NO_CHANGE"   # a mode change to the mode the whole cluster already runs
-    BUSY = "BUSY"             # a different mode change is already in progress
-    PENDING = "PENDING"       # the change is decided and will finish; not yet confirmed
+    NO_CHANGE = "NO_CHANGE"
+    BUSY = "BUSY"
+    PENDING = "PENDING"
 
 
 _STATUS_MAP = {
@@ -121,8 +104,6 @@ def _exact_fields(metadata: object, required: set[str], what: str) -> dict:
 
 @dataclass(frozen=True)
 class ControlRequest:
-    """One command from a CLI client; `value` is the raw PUT body."""
-
     command_id: str
     manifest_id: str
     target_id: str
@@ -164,7 +145,7 @@ class ControlRequest:
                 raise RpcProtocolError(f"{self.command} requires a JSON payload of at most "
                                        f"{MAX_PAYLOAD_BYTES} bytes")
         elif self.command in TRANSITION_COMMANDS:
-            _validate_request_id(self.key)  # the key is the transition ID
+            _validate_request_id(self.key)
             if (self.command == "tx_prepare") != bool(self.value):
                 raise RpcProtocolError("only tx_prepare carries a payload, and it requires one")
             if len(self.value) > MAX_PAYLOAD_BYTES:
@@ -201,8 +182,6 @@ class ControlRequest:
 
 @dataclass(frozen=True)
 class ControlResponse:
-    """The node's single reply; `value` is present only for a successful get."""
-
     command_id: str
     manifest_id: str
     node_id: str
@@ -215,7 +194,7 @@ class ControlResponse:
     key_id: str | None = None
     error: str | None = None
     value: bytes = b""
-    detail: str = ""   # small JSON text for mode and transition replies
+    detail: str = ""
 
     def __post_init__(self) -> None:
         _validate_request_id(self.command_id)
@@ -293,12 +272,6 @@ def _send_message(sock: socket.socket, metadata: dict, value: bytes, *, deadline
 
 
 class ControlService:
-    """Serve `put`, `get` and `status` for the local `NodeRuntime` over TCP.
-
-    A fixed worker pool and bounded queue limit work. A full queue gets a fast
-    OVERLOADED reply. No command is retried automatically.
-    """
-
     def __init__(self, runtime, *, workers: int = DEFAULT_CONTROL_WORKERS,
                  max_pending: int = DEFAULT_CONTROL_QUEUE,
                  request_timeout: float = DEFAULT_CONTROL_REQUEST_TIMEOUT,
@@ -340,14 +313,11 @@ class ControlService:
         self._long_slots = threading.BoundedSemaphore(MAX_CONCURRENT_LONG_REQUESTS)
         self._replica_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REPLICA_READS)
         self._memory = threading.Lock()
-        # Duplicate suppression is keyed by command ID but also remembers a fingerprint of
-        # the command, so a reused ID with different content is refused, not answered.
         self._inflight: dict[str, tuple] = {}
         self._finished: OrderedDict[str, tuple[tuple, ControlResponse]] = OrderedDict()
 
     @property
     def address(self) -> tuple[str, int]:
-        """Return the bound address; useful when a test binds port zero."""
         if self._listener is None:
             raise RuntimeError("control service has not started")
         address = self._listener.getsockname()
@@ -427,7 +397,6 @@ class ControlService:
             try:
                 self._handle(connection, deadline)
             except Exception:
-                # One bad request must not shrink the fixed worker pool.
                 pass
             finally:
                 try:
@@ -481,7 +450,6 @@ class ControlService:
                 _send_message(connection, response.to_metadata(), response.value,
                               deadline=deadline)
         except (OSError, TimeoutError, RpcProtocolError, ValueError, TypeError, RuntimeError):
-            # Invalid framing or metadata is closed without running any command.
             return
 
     @staticmethod
@@ -510,25 +478,19 @@ class ControlService:
             else:
                 self._inflight[request.command_id] = fingerprint
         if refusal is not None:
-            # Built outside the lock: the reply reads the node's context.
             return self._reply(request, ControlStatus.ERROR, error=refusal)
         response = None
         try:
             response = self._run(request, request_deadline)
         except Exception as error:
-            # The type name is enough for the caller; details could expose local paths.
-            # A put may have committed before the failure, so say its outcome is unknown.
             suffix = COMPLETION_UNKNOWN_SUFFIX if request.command == "put" else ""
             response = self._reply(request, ControlStatus.ERROR,
                                    error=f"INTERNAL_ERROR {type(error).__name__}{suffix}")
         finally:
             with self._memory:
                 self._inflight.pop(request.command_id, None)
-                # A command that never started is not remembered, so a retry can run.
                 if (response is not None and request.command in ("put", "get")
                         and response.error != NOT_STARTED_ERROR):
-                    # Value-free metadata only. Bounded: once 256 newer commands have
-                    # finished, an old ID is forgotten and could run again.
                     self._finished[request.command_id] = (
                         fingerprint, replace(response, value=b""))
                     while len(self._finished) > MAX_REMEMBERED_COMMANDS:
@@ -536,7 +498,6 @@ class ControlService:
         return response
 
     def _run_transition(self, request: ControlRequest) -> ControlResponse:
-        """Mode-change commands and the node-to-node transition messages (KD-16)."""
         manager = getattr(self.runtime, "transition", None)
         if manager is None:
             return self._reply(request, ControlStatus.ERROR, error="mode changes are not available")
@@ -557,7 +518,6 @@ class ControlService:
                            detail=json.dumps(detail, sort_keys=True))
 
     def _run_admin(self, request: ControlRequest, request_deadline: float) -> ControlResponse:
-        """list_mem_ids, liststore, getfromreplica's read, and multiput (KD-14)."""
         command = request.command
         if command == "list_mem_ids":
             rows = [{"vm": vm, "ring_id": ring_id_hex(ring), "status": status.value,
@@ -603,13 +563,12 @@ class ControlService:
             status, detail, error = manager.participant_message(
                 command, request.key, request.value)
             return self._reply(request, status, error=error, detail=json.dumps(detail))
-        try:  # command == "multiput", the initiating VM
+        try:
             vms = json.loads(request.value.decode("utf-8")).get("vms")
             if not isinstance(vms, list) or not all(isinstance(vm, str) for vm in vms):
                 raise ValueError("vms must be a list of VM names")
         except (UnicodeError, ValueError, AttributeError) as error:
             return self._reply(request, ControlStatus.ERROR, error=f"bad multiput payload: {error}")
-        # A multiput may never outlive the request that carries it, or the report is lost.
         available = request_deadline - REPLY_MARGIN_SECONDS - time.monotonic()
         if available < MULTIPUT_MIN_BUDGET:
             return self._reply(request, ControlStatus.TIMEOUT, error=NOT_STARTED_ERROR)
@@ -625,7 +584,6 @@ class ControlService:
                            detail=json.dumps(detail, sort_keys=True))
 
     def _read_replica(self, request: ControlRequest, request_deadline: float) -> ControlResponse:
-        """One schema-1 local read of exactly one named replica; never any repair."""
         key_id = ring_id_hex(key_position(request.key))
         try:
             target = json.loads(request.value.decode("utf-8")).get("target")
@@ -663,9 +621,6 @@ class ControlService:
             return self._run_admin(request, request_deadline)
         context = self.runtime.context
         if request.command == "status":
-            # Read-only benchmark preflight must verify the quorums actually loaded
-            # by this process, rather than trusting only the controller's launch
-            # environment. Keep the existing status command and wire schema.
             return self._reply(
                 request, ControlStatus.OK,
                 detail=json.dumps({"read_quorum": self.runtime.read_quorum,
@@ -679,14 +634,11 @@ class ControlService:
                                error="TRANSITIONING: the cluster is changing consistency "
                                      "mode; retry shortly")
         now = time.monotonic()
-        # The command may never outlive the request, or its reply could not be sent.
         available = request_deadline - REPLY_MARGIN_SECONDS - now
         deadline = now + min(self.command_timeout, available)
         mode = context.mode
         if mode in (ConsistencyMode.EVENTUAL_NO_RR, ConsistencyMode.EVENTUAL_RR) \
                 and request.command == "put":
-            # An Eventual PUT runs its own 5-second foreground window, so it is judged
-            # by the time left in the request, not by the command timeout.
             enough = available >= EVENTUAL_PUT_BUDGET_SECONDS
         else:
             enough = deadline - now >= REPLY_MARGIN_SECONDS
@@ -707,7 +659,6 @@ class ControlService:
                       else self.runtime.eventual_rr_get(request.key, deadline=deadline))
         error = result.error
         if result.completion_unknown:
-            # Shorten the base text first so the completion-unknown marker survives.
             base = (error or "operation incomplete")[
                 :MAX_RESPONSE_ERROR_CHARS - len(COMPLETION_UNKNOWN_SUFFIX)]
             error = base + COMPLETION_UNKNOWN_SUFFIX
@@ -719,7 +670,6 @@ class ControlService:
             value=result.value if request.command == "get" and result.value is not None else b"")
 
     def stop(self, *, timeout: float | None = None) -> ShutdownReport:
-        """Stop admission, drain accepted requests within `timeout`, then report."""
         if (self._stopped and self._last_shutdown.workers_joined
                 and self._last_shutdown.incomplete_requests == 0):
             return self._last_shutdown
@@ -772,11 +722,6 @@ class ControlService:
 def send_command(manifest: Manifest, vm_id: str, command: str, key: str = "",
                  value: bytes = b"", *, timeout: float = DEFAULT_CLIENT_TIMEOUT,
                  command_id: str | None = None) -> ControlResponse:
-    """Send one command to `vm_id`'s control endpoint and return its validated reply.
-
-    Raises ControlError if the node is unreachable, too slow, or replies invalidly.
-    The command is never retried; a timeout leaves the outcome unknown to the caller.
-    """
     node = manifest.node(vm_id)
     deadline = time.monotonic() + timeout
     request = ControlRequest(command_id or new_operation_id(), manifest.fingerprint, vm_id,

@@ -1,10 +1,3 @@
-"""User-facing `put` and `get`, run through the local node's control endpoint (KD-14).
-
-The CLI is a short-lived client: it reads or writes the local file, sends one command
-to its own node, and prints one JSON result. Files are capped at 1 MiB, and a `get`
-replaces its destination atomically and only on success.
-"""
-
 from __future__ import annotations
 
 import json
@@ -23,9 +16,6 @@ from .ring import Manifest, key_position, ring_id_hex
 
 
 def read_value_file(path: str) -> bytes:
-    """Read a local file as the PUT value; refuse anything over 1 MiB."""
-    # O_NONBLOCK keeps a pipe from blocking the open; fstat on the opened descriptor
-    # (not a separate stat) closes the window where a file is swapped for a pipe.
     descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -41,7 +31,6 @@ def read_value_file(path: str) -> bytes:
 
 
 def check_destination(path: str) -> None:
-    """Refuse an output path that exists but is not a regular file (or a link to one)."""
     try:
         mode = os.stat(path).st_mode
     except FileNotFoundError:
@@ -51,11 +40,6 @@ def check_destination(path: str) -> None:
 
 
 def write_value_file_atomic(path: str, data: bytes) -> None:
-    """Replace `path` with `data` only after a complete, flushed temporary write.
-
-    The result keeps an existing file's permissions, or the usual umask default for a
-    new file. A symbolic link at `path` is replaced, not written through.
-    """
     check_destination(path)
     directory = os.path.dirname(os.path.abspath(path))
     try:
@@ -82,7 +66,6 @@ def write_value_file_atomic(path: str, data: bytes) -> None:
 
 
 def _sync_directory(directory: str) -> None:
-    """Best-effort fsync of the directory so the rename survives a crash."""
     try:
         descriptor = os.open(directory, os.O_RDONLY)
     except OSError:
@@ -108,7 +91,6 @@ def _summary(command: str, key: str, response: ControlResponse) -> dict:
 
 
 def vm_name(label: str) -> str:
-    """'VM3', 'vm3' or 'vm03' -> 'vm03'."""
     match = re.fullmatch(r"(?i)vm0?([1-9]|10)", label)
     if match is None:
         raise ValueError(f"{label!r} is not a VM name (VM1 to VM10)")
@@ -116,7 +98,6 @@ def vm_name(label: str) -> str:
 
 
 def resolve_replica(manifest: Manifest, text: str) -> str:
-    """A VM name, a configured KV address `host:port`, or a host that is unique -> VM name."""
     try:
         return vm_name(text)
     except ValueError:
@@ -134,8 +115,7 @@ def resolve_replica(manifest: Manifest, text: str) -> str:
 
 
 def run_ls(manifest: Manifest, key: str) -> tuple[int, dict]:
-    """Where `key` lives: its ring ID and its five owners, from the manifest alone."""
-    owners = manifest.owners(key)  # fixed by hashing; no liveness or storage is consulted
+    owners = manifest.owners(key)
     return 0, {"status": "OK", "command": "ls", "key": key,
                "key_id": ring_id_hex(key_position(key)),
                "owners": [{"vm": node.vm_id, "ring_id": ring_id_hex(node.ring_id),
@@ -143,7 +123,6 @@ def run_ls(manifest: Manifest, key: str) -> tuple[int, dict]:
 
 
 def _json(text: str) -> dict:
-    """A reply's JSON text as a dict; anything else is a ValueError, never a traceback."""
     data = json.loads(text or "{}")
     if not isinstance(data, dict):
         raise ValueError("the reply detail is not a JSON object")
@@ -151,7 +130,6 @@ def _json(text: str) -> dict:
 
 
 def run_list_mem_ids(manifest: Manifest, vm_id: str) -> tuple[int, dict]:
-    """The membership list with each node's ring ID, sorted by ring ID."""
     try:
         reply = send_command(manifest, vm_id, "list_mem_ids")
     except ControlError as error:
@@ -171,10 +149,8 @@ def run_list_mem_ids(manifest: Manifest, vm_id: str) -> tuple[int, dict]:
 
 def run_liststore(manifest: Manifest, vm_id: str, emit: Callable[[dict], None]
                   ) -> tuple[int, dict]:
-    """Print each key stored on this VM with its ring ID, one bounded page at a time."""
     cursor, total, node_ring = None, 0, None
     while True:
-        # The cursor travels in the body: a key can be too long for the metadata field.
         body = b"" if cursor is None else json.dumps({"after": cursor}).encode("utf-8")
         try:
             reply = send_command(manifest, vm_id, "liststore", "", body)
@@ -208,7 +184,6 @@ def run_liststore(manifest: Manifest, vm_id: str, emit: Callable[[dict], None]
 
 def run_getfromreplica(manifest: Manifest, vm_id: str, address: str, key: str,
                        path: str) -> tuple[int, dict]:
-    """Read one named replica's own copy of `key` into `path`; no quorum, no repair."""
     try:
         target = resolve_replica(manifest, address)
         check_destination(path)
@@ -236,7 +211,6 @@ def run_getfromreplica(manifest: Manifest, vm_id: str, address: str, key: str,
 
 
 def run_multiput(manifest: Manifest, vm_id: str, key: str, labels) -> tuple[int, dict]:
-    """Put to `key` from each named VM at the same moment; one row per VM is reported."""
     try:
         names = [vm_name(label) for label in labels]
         reply = send_command(manifest, vm_id, "multiput", key,
@@ -257,7 +231,6 @@ def run_multiput(manifest: Manifest, vm_id: str, key: str, labels) -> tuple[int,
 
 
 def run_mode(manifest: Manifest, vm_id: str, mode: str) -> tuple[int, dict]:
-    """Ask the cluster to switch to `mode`; success needs all ten nodes to confirm."""
     try:
         response = send_command(manifest, vm_id, "mode", mode, timeout=MODE_CLIENT_TIMEOUT)
     except ControlError as error:
@@ -274,7 +247,6 @@ def run_mode(manifest: Manifest, vm_id: str, mode: str) -> tuple[int, dict]:
 
 
 def run_put(manifest: Manifest, vm_id: str, key: str, path: str) -> tuple[int, dict]:
-    """Store the file at `path` under `key`; return (exit code, JSON-ready result)."""
     try:
         value = read_value_file(path)
     except (OSError, ValueError) as error:
@@ -287,7 +259,6 @@ def run_put(manifest: Manifest, vm_id: str, key: str, path: str) -> tuple[int, d
 
 
 def run_get(manifest: Manifest, vm_id: str, key: str, path: str) -> tuple[int, dict]:
-    """Fetch `key` into the file at `path`; a missing key leaves the file untouched."""
     try:
         check_destination(path)
     except ValueError as error:

@@ -1,5 +1,3 @@
-"""Deterministic ten-node manifest and fixed SHA-256 ownership ring (KD-02/C1)."""
-
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
@@ -31,13 +29,11 @@ def _canonical_json(value: object) -> bytes:
 
 
 def node_position(vm_id: str) -> int:
-    """SHA-256 of the approved node prefix and stable UTF-8 VM label."""
     _validate_vm_id(vm_id)
     return int.from_bytes(hashlib.sha256(b"mp3/node/" + vm_id.encode("utf-8")).digest(), "big")
 
 
 def key_position(key: str) -> int:
-    """SHA-256 of the approved key prefix and strict UTF-8 key, without normalization."""
     if not isinstance(key, str):
         raise TypeError("key must be a string")
     try:
@@ -96,8 +92,6 @@ class Node:
 
 @dataclass(frozen=True)
 class RingNode:
-    """Generic already-computed ring point, useful for pure successor tests."""
-
     node_id: str
     position: int
 
@@ -105,7 +99,6 @@ class RingNode:
 def select_successors(nodes: Iterable[RingNode], key_id: int, *,
                       count: int = REPLICATION_FACTOR,
                       include_equal: bool) -> tuple[RingNode, ...]:
-    """Select distinct clockwise owners with an explicit equality policy."""
     nodes = tuple(nodes)
     if type(key_id) is not int or key_id < 0:
         raise ValueError("key_id must be a nonnegative integer")
@@ -123,6 +116,7 @@ def select_successors(nodes: Iterable[RingNode], key_id: int, *,
     ordered = sorted(nodes, key=lambda node: node.position)
     positions = [node.position for node in ordered]
     locate = bisect_left if include_equal else bisect_right
+    # walk clockwise from the key and wrap around
     start = locate(positions, key_id)
     return tuple(ordered[(start + offset) % len(ordered)] for offset in range(count))
 
@@ -133,8 +127,6 @@ def _endpoint_to_dict(endpoint: Endpoint) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class Manifest:
-    """Immutable complete ten-VM membership and fixed ring configuration."""
-
     nodes: tuple[Node, ...]
     fingerprint: str = field(init=False)
     _by_id: Mapping[str, Node] = field(init=False, repr=False, compare=False)
@@ -203,7 +195,6 @@ class Manifest:
 
     @classmethod
     def from_endpoints(cls, endpoints: Mapping[str, Mapping[str, Endpoint]]) -> "Manifest":
-        """Build the canonical manifest from three explicit service endpoints per VM."""
         if set(endpoints) != {f"vm{i:02d}" for i in range(1, 11)}:
             raise ValueError("endpoints must specify vm01 through vm10 exactly")
         nodes = []
@@ -232,7 +223,6 @@ class Manifest:
         return tuple(self._by_id[node.node_id] for node in selected)
 
     def owners(self, key: str) -> tuple[Node, ...]:
-        """Return exactly five prescribed owners, without consulting liveness."""
         return self.owners_for_id(key_position(key))
 
 

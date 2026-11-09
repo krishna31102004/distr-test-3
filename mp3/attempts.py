@@ -1,5 +1,3 @@
-"""Bounded lifetime primitives shared by Eventual PUT and read-repair attempts (KD-08/12/13/14)."""
-
 from __future__ import annotations
 
 import math
@@ -8,22 +6,11 @@ import time
 
 
 class AttemptCancelled(Exception):
-    """A lease was explicitly canceled before its current deadline."""
+    pass
 
 
 class AttemptLease:
-    """One operation's mutable attempt deadline with a fixed hard lifetime.
-
-    The client foreground collector uses ``foreground_deadline``. Network attempts
-    use ``current_deadline`` so accepted work can continue briefly after the client
-    result without resetting or exceeding the admission-based hard deadline.
-    """
-
-    def __init__(self, *, admitted_at: float | None = None,
-                 foreground_seconds: float = 5.0,
-                 continuation_seconds: float = 10.0,
-                 max_lifetime: float = 15.0,
-                 clock=time.monotonic):
+    def __init__(self, *, admitted_at: float | None = None,foreground_seconds: float = 5.0, continuation_seconds: float = 10.0, max_lifetime: float = 15.0,clock=time.monotonic):
         for value, label in ((foreground_seconds, "foreground_seconds"),
                              (continuation_seconds, "continuation_seconds"),
                              (max_lifetime, "max_lifetime")):
@@ -48,7 +35,6 @@ class AttemptLease:
         self._cancelled = False
 
     def finish_foreground(self, completed_at: float | None = None) -> float:
-        """Begin the one permitted continuation window; reject repeated calls."""
         when = self._clock() if completed_at is None else completed_at
         if type(when) not in (int, float) or not math.isfinite(when):
             raise ValueError("completed_at must be a finite monotonic timestamp")
@@ -63,14 +49,12 @@ class AttemptLease:
             return self._continuation_deadline
 
     def current_deadline(self) -> float:
-        """Return the current socket/attempt deadline under the lease lock."""
         with self._lock:
             if self._continuation_deadline is None:
                 return self.hard_deadline
             return min(self._continuation_deadline, self.hard_deadline)
 
     def check(self) -> float:
-        """Return remaining seconds or raise cancellation/timeout."""
         with self._lock:
             if self._cancelled:
                 raise AttemptCancelled("attempt lease canceled")
@@ -92,7 +76,6 @@ class AttemptLease:
             return self._foreground_finished
 
     def cancel(self) -> bool:
-        """Cancel accepted attempts; return False if already canceled/expired."""
         with self._lock:
             if self._cancelled or self._clock() >= (
                     self.hard_deadline if self._continuation_deadline is None

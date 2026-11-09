@@ -1,9 +1,3 @@
-"""Strong multi-writer ABD operations built on the shared node/RPC foundation.
-
-This module implements per-key Strong PUT and GET only. It does not provide
-Eventual consistency, client CLI integration, or a second networking framework.
-"""
-
 from __future__ import annotations
 
 from concurrent.futures import Future
@@ -27,17 +21,14 @@ if TYPE_CHECKING:
 
 
 QUORUM_SIZE = 3
-PHASE_RESERVATION_SIZE = 10  # five query RPCs and five possible writeback RPCs
+PHASE_RESERVATION_SIZE = 10
 
 
 class StrongCoordinator:
-    """Run synchronous, bounded Strong ABD operations through one NodeRuntime."""
-
     def __init__(self, runtime: "NodeRuntime"):
         self.runtime = runtime
 
     def strong_put(self, key: str, value: bytes, *, deadline: float) -> ProtocolResult:
-        """Query five owners, allocate a durable tag, then install to a majority."""
         fallback_id = new_operation_id()
         if not isinstance(value, bytes) or len(value) > MAX_VALUE_BYTES:
             return self._result(OperationStatus.ERROR, fallback_id,
@@ -59,12 +50,9 @@ class StrongCoordinator:
         try:
             return future.result()
         except Exception as error:
-            # A cancelled queued Future has not begun any operation. The worker
-            # catches protocol-stage errors itself and records write uncertainty.
             return self._result(OperationStatus.ERROR, fallback_id, error=str(error))
 
     def strong_get(self, key: str, *, deadline: float) -> ProtocolResult:
-        """Query a majority and durably write back its maximum before returning."""
         fallback_id = new_operation_id()
         invalid = self._validate_operation(key, deadline, fallback_id)
         if invalid is not None:
@@ -133,6 +121,7 @@ class StrongCoordinator:
 
         write_phase_started = False
         try:
+            # phase 1: ask a majority for the latest version
             query_calls = self._dispatch_phase(
                 admission, owners, reservation, RpcOperation.READ_LOCAL, key,
                 "strong_query", None, b"")
@@ -167,6 +156,7 @@ class StrongCoordinator:
                 record = selected
                 phase = "strong_readback"
 
+            # phase 2: write to a majority (a get writes back what it read)
             write_phase_started = True
             install_calls = self._dispatch_phase(
                 admission, owners, reservation, RpcOperation.INSTALL_IF_NEWER,
@@ -209,9 +199,6 @@ class StrongCoordinator:
                     operation_id=admission.operation_id, version=version,
                     value=value, admission=admission)
             except Exception as error:
-                # Keep one explicit terminal failure per prescribed owner so the
-                # collector can determine whether Q=3 is still possible. This is
-                # a local failure record, not a fabricated network response.
                 membership = self.runtime.membership_runtime.table.snapshot()
                 member = next(row for row in membership if row.vm_id == owner.vm_id)
                 request = new_request(
@@ -243,9 +230,6 @@ class StrongCoordinator:
 
     @staticmethod
     def _write_completion_unknown(collection) -> bool:
-        # Incomplete installs may have reached the replica even if their result is
-        # still in flight. A durable qualifying reply proves at least a partial
-        # effect when the overall quorum did not complete.
         return (collection.completion_unknown or bool(collection.continuing)
                 or bool(collection.qualifying))
 
